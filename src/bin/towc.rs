@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use image::GrayImage;
 use reqwest::cookie::CookieStore;
-use reqwest::header::{ORIGIN, REFERER};
+use reqwest::header::{ORIGIN, REFERER, USER_AGENT};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use std::io::{self, Write};
@@ -15,35 +16,30 @@ use tcp_over_websocket::{
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
-#[cfg(target_os = "windows")]
-use winit::{
-    application::ApplicationHandler,
-    dpi::{LogicalPosition, LogicalSize, PhysicalSize},
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
-};
-#[cfg(target_os = "windows")]
-use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
-
-#[cfg(target_os = "windows")]
-use windows::Win32::{
-    Foundation::HWND,
-    UI::WindowsAndMessaging::{DestroyWindow, SW_HIDE, ShowWindow},
-};
-#[cfg(target_os = "windows")]
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const WEBVPN_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/login";
 const WEBVPN_TICKET_COOKIE_NAME: &str = "wengine_vpn_ticketwebvpn_szut_edu_cn";
 const WEBVPN_CAS_HASH: &str = "77726476706e69737468656265737421f3f652d2342a7d44300d8db9d6562d";
 const WEBVPN_CAS_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421f3f652d2342a7d44300d8db9d6562d/cas/login?service=https%3A%2F%2Fwebvpn.szut.edu.cn%2Flogin%3Fcas_login%3Dtrue";
+const WEBVPN_WECHAT_HASH: &str =
+    "77726476706e69737468656265737421ffe7449269276d59660187e289446d36a8d6";
+const WECHAT_APP_ID: &str = "wx16c67d169e7a9290";
+const WECHAT_REDIRECT_URI: &str = "https://cas.szut.edu.cn/cas/login?service=https%3A%2F%2Fwebvpn.szut.edu.cn%2Flogin%3Fcas_login%3Dtrue&client_name=WeiXinClient";
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0";
 const WEBVPN_FINGERPRINT: &str = "5a0b00fe6ae8277a4bfadd4e103f6e1c";
 const WEBVPN_READY_ATTEMPTS: usize = 6;
 const WEBVPN_READY_SETTLE_MS: u64 = 700;
 const WEBVPN_READY_TIMEOUT_MS: u64 = 900;
 const CAS_LOGIN_ATTEMPTS: usize = 2;
 const CAS_LOGIN_RETRY_SETTLE_MS: u64 = 1500;
+const WECHAT_POLL_ATTEMPTS: usize = 180;
+const WECHAT_POLL_TIMEOUT_SECS: u64 = 35;
+const WECHAT_POLL_SETTLE_MS: u64 = 1800;
+const WECHAT_QR_MODULES: u32 = 41;
+const WECHAT_QR_BORDER_PX: u32 = 30;
+const WECHAT_QR_MODULE_PX: u32 = 10;
+const TERMINAL_QR_QUIET_ZONE: u32 = 4;
+const QR_DARK_THRESHOLD: u8 = 160;
 
 enum VerificationLogin {
     Sms { mobile: String },
@@ -64,6 +60,21 @@ struct ResolvedCookie {
 struct WebVpnLoginEntry {
     ticket_cookie: Option<String>,
     cas_login_url: String,
+}
+
+struct WechatPollStatus {
+    errcode: u16,
+    code: String,
+}
+
+enum WechatQrPollResult {
+    Confirmed(String),
+    Expired,
+}
+
+enum QrTheme {
+    Aurora,
+    Expired,
 }
 
 #[tokio::main]
@@ -237,7 +248,7 @@ async fn resolve_cookie(
             should_probe: true,
         }),
         (None, None) => Ok(ResolvedCookie {
-            header: login_and_get_cookie()?,
+            header: login_with_wechat_qr().await?,
             should_probe: true,
         }),
         (Some(_), Some(_)) => unreachable!(),
@@ -293,13 +304,93 @@ async fn probe_webvpn_ready(url: &str, cookie: &str) -> Result<bool> {
     }
 }
 
+fn build_login_client(cookie_jar: Arc<reqwest::cookie::Jar>) -> Result<Client> {
+    Client::builder()
+        .cookie_provider(cookie_jar)
+        .user_agent(BROWSER_USER_AGENT)
+        .build()
+        .context("failed to build WebVPN login HTTP client")
+}
+
+async fn login_with_wechat_qr() -> Result<String> {
+    let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+    let client = build_login_client(Arc::clone(&cookie_jar))?;
+    let login_entry = initialize_webvpn_ticket_cookie(&client, &cookie_jar).await?;
+
+    log_info("client", "fetching WeChat QR login page");
+    let qr_page_url = wechat_qrconnect_url()?;
+    let qr_page = client
+        .get(qr_page_url)
+        .send()
+        .await
+        .context("failed to open WeChat QR login page")?
+        .error_for_status()
+        .context("WeChat QR login page request failed")?
+        .text()
+        .await
+        .context("failed to read WeChat QR login page")?;
+
+    let uuid = extract_wechat_uuid(&qr_page).context("failed to find WeChat QR uuid")?;
+    let qrcode_url = extract_wechat_qrcode_url(&qr_page, &uuid)?;
+    let qrcode = client
+        .get(qrcode_url)
+        .send()
+        .await
+        .context("failed to fetch WeChat QR image")?
+        .error_for_status()
+        .context("WeChat QR image request failed")?
+        .bytes()
+        .await
+        .context("failed to read WeChat QR image")?;
+
+    log_info(
+        "client",
+        "scan the QR code below with WeChat and confirm login",
+    );
+
+    let qr_modules = wechat_qr_modules_from_image(&qrcode)?;
+    print_wechat_qr_modules(&qr_modules, QrTheme::Aurora)?;
+
+    let code = match poll_wechat_qr_code(&client, &uuid).await? {
+        WechatQrPollResult::Confirmed(code) => code,
+        WechatQrPollResult::Expired => {
+            log_warn(
+                "client",
+                "WeChat QR code expired; redrawing the expired QR code below",
+            );
+            print_wechat_qr_modules(&qr_modules, QrTheme::Expired)?;
+            anyhow::bail!("WeChat QR code expired; please restart towc and scan again");
+        }
+    };
+    log_info(
+        "client",
+        "WeChat confirmed login; completing WebVPN authentication",
+    );
+    let response = client
+        .get(wechat_cas_callback_url(&code)?)
+        .header(USER_AGENT, BROWSER_USER_AGENT)
+        .send()
+        .await
+        .context("failed to open CAS WeChat callback")?
+        .error_for_status()
+        .context("CAS WeChat callback request failed")?;
+    let final_url = response.url().to_string();
+
+    let activated_ticket =
+        activate_webvpn_fingerprint_if_needed(&client, &cookie_jar, &final_url).await?;
+    let post_login_ticket = ticket_cookie_from_jar(&cookie_jar);
+    let cookie = activated_ticket
+        .or(post_login_ticket)
+        .or(login_entry.ticket_cookie)
+        .context("WeChat login completed but WebVPN ticket cookie was not found")?;
+
+    log_success("client", "WeChat QR login completed");
+    Ok(cookie)
+}
+
 async fn login_with_verification_code(login: VerificationLogin) -> Result<String> {
     let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
-    let client = Client::builder()
-        .cookie_provider(Arc::clone(&cookie_jar))
-        .user_agent("towc/0.1")
-        .build()
-        .context("failed to build WebVPN login HTTP client")?;
+    let client = build_login_client(Arc::clone(&cookie_jar))?;
 
     let login_entry = initialize_webvpn_ticket_cookie(&client, &cookie_jar).await?;
 
@@ -482,6 +573,20 @@ async fn set_webvpn_fingerprint(client: &Client) -> Result<()> {
     Ok(())
 }
 
+fn wechat_qrconnect_url() -> Result<String> {
+    let mut url = Url::parse(&format!(
+        "https://webvpn.szut.edu.cn/https/{WEBVPN_WECHAT_HASH}/connect/qrconnect"
+    ))
+    .context("failed to build WeChat QR login URL")?;
+    url.query_pairs_mut()
+        .append_pair("appid", WECHAT_APP_ID)
+        .append_pair("redirect_uri", WECHAT_REDIRECT_URI)
+        .append_pair("response_type", "code")
+        .append_pair("self_redirect", "false")
+        .append_pair("scope", "snsapi_login");
+    Ok(url.into())
+}
+
 fn cas_url(path: &str) -> String {
     format!(
         "https://webvpn.szut.edu.cn/https/{WEBVPN_CAS_HASH}/cas/{}",
@@ -493,6 +598,318 @@ fn cas_url_with_query(path: &str, name: &str, value: &str) -> Result<String> {
     let mut url = Url::parse(&cas_url(path)).context("failed to build CAS request URL")?;
     url.query_pairs_mut().append_pair(name, value);
     Ok(url.into())
+}
+
+fn wechat_cas_callback_url(code: &str) -> Result<String> {
+    let mut url = Url::parse(WECHAT_REDIRECT_URI).context("failed to build CAS callback URL")?;
+    url.query_pairs_mut()
+        .append_pair("code", code)
+        .append_pair("state", "");
+    Ok(url.into())
+}
+
+fn wechat_poll_url(uuid: &str, last: Option<u16>) -> Result<String> {
+    let mut url = Url::parse(&format!(
+        "https://webvpn.szut.edu.cn/https/{WEBVPN_WECHAT_HASH}/connect/l/qrconnect"
+    ))
+    .context("failed to build WeChat QR polling URL")?;
+    url.query_pairs_mut().append_pair("uuid", uuid);
+    if let Some(last) = last {
+        url.query_pairs_mut().append_pair("last", &last.to_string());
+    }
+    Ok(url.into())
+}
+
+async fn poll_wechat_qr_code(client: &Client, uuid: &str) -> Result<WechatQrPollResult> {
+    let mut last = None::<u16>;
+    for _ in 1..=WECHAT_POLL_ATTEMPTS {
+        let body = client
+            .get(wechat_poll_url(uuid, last)?)
+            .timeout(Duration::from_secs(WECHAT_POLL_TIMEOUT_SECS))
+            .send()
+            .await
+            .context("failed to poll WeChat QR login status")?
+            .error_for_status()
+            .context("WeChat QR login status request failed")?
+            .text()
+            .await
+            .context("failed to read WeChat QR login status")?;
+
+        let status = parse_wechat_poll_status(&body)
+            .with_context(|| format!("failed to parse WeChat QR login status: {body}"))?;
+        last = Some(status.errcode);
+
+        match status.errcode {
+            405 if !status.code.is_empty() => {
+                return Ok(WechatQrPollResult::Confirmed(status.code));
+            }
+            405 => anyhow::bail!("WeChat confirmed login but did not return a code"),
+            404 => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            408 => {
+                tokio::time::sleep(Duration::from_millis(WECHAT_POLL_SETTLE_MS)).await;
+            }
+            403 => anyhow::bail!("WeChat QR login was canceled"),
+            402 => return Ok(WechatQrPollResult::Expired),
+            500 => {
+                log_warn("client", "WeChat QR polling returned 500, retrying");
+                tokio::time::sleep(Duration::from_millis(WECHAT_POLL_SETTLE_MS)).await;
+            }
+            other => {
+                log_warn(
+                    "client",
+                    format!("unexpected WeChat QR status {other}, retrying"),
+                );
+                tokio::time::sleep(Duration::from_millis(WECHAT_POLL_SETTLE_MS)).await;
+            }
+        }
+    }
+
+    anyhow::bail!("timed out waiting for WeChat QR login")
+}
+
+fn wechat_qr_modules_from_image(bytes: &[u8]) -> Result<Vec<bool>> {
+    let image = image::load_from_memory(bytes)
+        .context("failed to decode WeChat QR image")?
+        .to_luma8();
+    sample_wechat_qr_modules(&image).context("failed to sample WeChat QR modules")
+}
+
+fn print_wechat_qr_modules(modules: &[bool], theme: QrTheme) -> Result<()> {
+    let output_size = WECHAT_QR_MODULES + TERMINAL_QR_QUIET_ZONE * 2;
+
+    println!();
+    for y in (0..output_size).step_by(2) {
+        for x in 0..output_size {
+            let top_dark = rendered_qr_module_dark(modules, x, y, output_size);
+            let bottom_dark =
+                y + 1 < output_size && rendered_qr_module_dark(modules, x, y + 1, output_size);
+            print_qr_half_block(top_dark, bottom_dark, x, y, &theme);
+        }
+        println!("\x1b[0m");
+    }
+    println!("\x1b[0m");
+    io::stdout().flush().context("failed to flush QR code")?;
+    Ok(())
+}
+
+fn sample_wechat_qr_modules(image: &GrayImage) -> Option<Vec<bool>> {
+    let required_size = WECHAT_QR_BORDER_PX * 2 + WECHAT_QR_MODULES * WECHAT_QR_MODULE_PX;
+    if image.width() < required_size || image.height() < required_size {
+        return None;
+    }
+
+    let mut modules = Vec::with_capacity((WECHAT_QR_MODULES * WECHAT_QR_MODULES) as usize);
+
+    for row in 0..WECHAT_QR_MODULES {
+        for col in 0..WECHAT_QR_MODULES {
+            let x = WECHAT_QR_BORDER_PX + col * WECHAT_QR_MODULE_PX + WECHAT_QR_MODULE_PX / 2;
+            let y = WECHAT_QR_BORDER_PX + row * WECHAT_QR_MODULE_PX + WECHAT_QR_MODULE_PX / 2;
+            modules.push(image.get_pixel(x, y)[0] < QR_DARK_THRESHOLD);
+        }
+    }
+
+    Some(modules)
+}
+
+fn rendered_qr_module_dark(modules: &[bool], x: u32, y: u32, output_size: u32) -> bool {
+    if x < TERMINAL_QR_QUIET_ZONE
+        || y < TERMINAL_QR_QUIET_ZONE
+        || x >= output_size - TERMINAL_QR_QUIET_ZONE
+        || y >= output_size - TERMINAL_QR_QUIET_ZONE
+    {
+        return false;
+    }
+
+    let x = x - TERMINAL_QR_QUIET_ZONE;
+    let y = y - TERMINAL_QR_QUIET_ZONE;
+    let index = (y * WECHAT_QR_MODULES + x) as usize;
+    modules.get(index).copied().unwrap_or(false)
+}
+
+#[derive(Clone, Copy)]
+struct Rgb {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl Rgb {
+    const fn new(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+}
+
+fn print_qr_half_block(top_dark: bool, bottom_dark: bool, x: u32, y: u32, theme: &QrTheme) {
+    let foreground = qr_module_color(top_dark, x, y, theme);
+    let background = qr_module_color(bottom_dark, x, y + 1, theme);
+
+    print!(
+        "\x1b[38;2;{};{};{};48;2;{};{};{}m\u{2580}",
+        foreground.red,
+        foreground.green,
+        foreground.blue,
+        background.red,
+        background.green,
+        background.blue
+    );
+}
+
+fn qr_module_color(dark: bool, x: u32, y: u32, theme: &QrTheme) -> Rgb {
+    if !dark {
+        return Rgb::new(250, 248, 239);
+    }
+
+    if matches!(theme, QrTheme::Expired) {
+        return Rgb::new(186, 28, 28);
+    }
+
+    const AURORA: [Rgb; 7] = [
+        Rgb::new(239, 90, 91),
+        Rgb::new(232, 119, 49),
+        Rgb::new(225, 181, 64),
+        Rgb::new(72, 164, 89),
+        Rgb::new(24, 164, 174),
+        Rgb::new(54, 111, 199),
+        Rgb::new(239, 90, 91),
+    ];
+
+    let diagonal = (x + y).saturating_sub(TERMINAL_QR_QUIET_ZONE * 2);
+    let span = (WECHAT_QR_MODULES - 1) * 2;
+    let scaled = diagonal * ((AURORA.len() - 1) as u32) * 256 / span.max(1);
+    let index = (scaled / 256).min((AURORA.len() - 1) as u32) as usize;
+    let next_index = (index + 1).min(AURORA.len() - 1);
+    let amount = smoothstep_byte((scaled % 256) as u8);
+    let hue_shift = ((x * 13 + y * 7 + diagonal * 5) % 17) as i16 - 8;
+    let shifted_amount = offset_byte(amount, hue_shift);
+    let color = blend_rgb(AURORA[index], AURORA[next_index], shifted_amount);
+    let shimmer = 82 + ((x * 17 + y * 11 + diagonal * 3) % 19) as u8;
+
+    scale_rgb(color, shimmer)
+}
+
+fn blend_rgb(start: Rgb, end: Rgb, amount: u8) -> Rgb {
+    let amount = u16::from(amount);
+    let inverse = 255 - amount;
+
+    Rgb::new(
+        (((u16::from(start.red) * inverse) + (u16::from(end.red) * amount)) / 255) as u8,
+        (((u16::from(start.green) * inverse) + (u16::from(end.green) * amount)) / 255) as u8,
+        (((u16::from(start.blue) * inverse) + (u16::from(end.blue) * amount)) / 255) as u8,
+    )
+}
+
+fn smoothstep_byte(value: u8) -> u8 {
+    let value = u16::from(value);
+    ((value * value * (765 - 2 * value)) / (255 * 255)) as u8
+}
+
+fn offset_byte(value: u8, offset: i16) -> u8 {
+    (i16::from(value) + offset).clamp(0, 255) as u8
+}
+
+fn scale_rgb(color: Rgb, percent: u8) -> Rgb {
+    let percent = u16::from(percent);
+
+    Rgb::new(
+        ((u16::from(color.red) * percent) / 100) as u8,
+        ((u16::from(color.green) * percent) / 100) as u8,
+        ((u16::from(color.blue) * percent) / 100) as u8,
+    )
+}
+
+fn extract_wechat_uuid(html: &str) -> Option<String> {
+    extract_js_string_assignment(html, "G")
+        .or_else(|| extract_token_after(html, "uuid="))
+        .or_else(|| extract_token_after(html, "/connect/qrcode/"))
+}
+
+fn extract_wechat_qrcode_url(html: &str, uuid: &str) -> Result<String> {
+    if let Some(src) = html.split('<').find_map(|fragment| {
+        let fragment = fragment.trim_start();
+        if !fragment.starts_with("img") || !fragment.contains("/connect/qrcode/") {
+            return None;
+        }
+        attr_value(fragment, "src")
+    }) {
+        return absolute_webvpn_url(&src);
+    }
+
+    absolute_webvpn_url(&format!(
+        "/https/{WEBVPN_WECHAT_HASH}/connect/qrcode/{uuid}?vpn-1"
+    ))
+}
+
+fn absolute_webvpn_url(value: &str) -> Result<String> {
+    if value.starts_with("https://") || value.starts_with("http://") {
+        return Ok(value.to_string());
+    }
+    if value.starts_with("//") {
+        return Ok(format!("https:{value}"));
+    }
+    if value.starts_with('/') {
+        return Ok(format!("https://webvpn.szut.edu.cn{value}"));
+    }
+
+    Url::parse("https://webvpn.szut.edu.cn/")
+        .and_then(|base| base.join(value))
+        .map(|url| url.into())
+        .context("failed to build absolute WebVPN URL")
+}
+
+fn parse_wechat_poll_status(body: &str) -> Option<WechatPollStatus> {
+    Some(WechatPollStatus {
+        errcode: extract_js_number_assignment(body, "wx_errcode")?,
+        code: extract_js_string_assignment(body, "wx_code").unwrap_or_default(),
+    })
+}
+
+fn extract_js_number_assignment(body: &str, name: &str) -> Option<u16> {
+    let value = assignment_value(body, name)?;
+    let digits: String = value
+        .chars()
+        .skip_while(|ch| ch.is_ascii_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+fn extract_js_string_assignment(body: &str, name: &str) -> Option<String> {
+    let value = assignment_value(body, name)?;
+    let mut chars = value.trim_start().chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+
+    let start = value.find(quote)? + quote.len_utf8();
+    let rest = &value[start..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+fn assignment_value<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let mut offset = 0;
+    while let Some(relative_index) = body[offset..].find(name) {
+        let index = offset + relative_index;
+        let after_name = &body[index + name.len()..];
+        if let Some(after_equals) = after_name.trim_start().strip_prefix('=') {
+            return Some(after_equals.trim_start());
+        }
+        offset = index + name.len();
+    }
+
+    None
+}
+
+fn extract_token_after(body: &str, marker: &str) -> Option<String> {
+    let rest = body.split_once(marker)?.1;
+    let token: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect();
+    if token.is_empty() { None } else { Some(token) }
 }
 
 fn prompt_verification_code(label: &str) -> Result<String> {
@@ -532,8 +949,10 @@ async fn activate_webvpn_fingerprint_if_needed(
     }
 
     log_info("client", "activating WebVPN fingerprint");
+    let activation_url = webvpn_fingerprint_activation_url(final_url)?;
     let response = client
-        .get(final_url)
+        .get(activation_url)
+        .header(REFERER, final_url)
         .send()
         .await
         .context("failed to open WebVPN fingerprint activation")?
@@ -550,6 +969,22 @@ async fn activate_webvpn_fingerprint_if_needed(
     anyhow::bail!(
         "WebVPN fingerprint activation did not complete over HTTP; final URL: {final_activation_url}"
     )
+}
+
+fn webvpn_fingerprint_activation_url(final_url: &str) -> Result<String> {
+    let source = Url::parse(final_url).context("failed to parse WebVPN fingerprint URL")?;
+    let mut url = Url::parse("https://webvpn.szut.edu.cn/set-fingerprint")
+        .context("failed to build WebVPN fingerprint activation URL")?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (name, value) in source.query_pairs() {
+            if name != "fingerprint" {
+                query.append_pair(&name, &value);
+            }
+        }
+        query.append_pair("fingerprint", WEBVPN_FINGERPRINT);
+    }
+    Ok(url.into())
 }
 
 fn is_webvpn_prelogin_fingerprint_url(url: &str) -> bool {
@@ -602,334 +1037,100 @@ fn print_usage() {
         "Usage: towc <server-ip[:port]> [--target <target-ip[:port]|port>] [--cookie <cookie>] [--login <mobile|email>] [--listen 127.0.0.1:9999]"
     );
     eprintln!("       server port defaults to 4489; --target defaults to 127.0.0.1:9999");
+    eprintln!("       when --cookie and --login are omitted, towc uses terminal WeChat QR login");
     eprintln!(
         "       --login sends a verification code by SMS for numeric values, or email when the value contains @"
     );
-    #[cfg(target_os = "windows")]
-    eprintln!(
-        "       on Windows, towc opens {WEBVPN_LOGIN_URL} to fetch the WebVPN cookie when --cookie is omitted"
-    );
-    #[cfg(not(target_os = "windows"))]
-    eprintln!("       on Linux, use --login for verification-code login or pass --cookie manually");
 }
 
-#[cfg(target_os = "windows")]
-fn login_and_get_cookie() -> Result<String> {
-    log_info(
-        "client",
-        format!("opening WebVPN login window: {WEBVPN_LOGIN_URL}"),
-    );
-    log_info(
-        "client",
-        "finish login in the window; it will close automatically",
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let event_loop = EventLoop::<LoginSignal>::with_user_event()
-        .build()
-        .context("failed to create login window event loop")?;
-    let proxy = event_loop.create_proxy();
-    let mut app = LoginApp::new(WEBVPN_LOGIN_URL.to_string(), proxy);
+    #[test]
+    fn parses_wechat_poll_status_from_vpn_eval_wrapper() {
+        let body = "vpn_eval((function(){\nwindow.wx_errcode=408;window.wx_code='';\n\n}\n).toString().slice(12, -2),\"\");";
+        let status = parse_wechat_poll_status(body).unwrap();
 
-    event_loop
-        .run_app(&mut app)
-        .context("login window event loop failed")?;
-
-    if let Some(error) = app.error {
-        anyhow::bail!(error);
+        assert_eq!(status.errcode, 408);
+        assert_eq!(status.code, "");
     }
 
-    app.cookie_header
-        .context("login window closed before WebVPN login completed")
-}
+    #[test]
+    fn parses_wechat_poll_status_with_code() {
+        let body = "window.wx_errcode=405;window.wx_code='0813NDFa1etq0M0SGBGa1X6UNk33NDFz';";
+        let status = parse_wechat_poll_status(body).unwrap();
 
-#[cfg(not(target_os = "windows"))]
-fn login_and_get_cookie() -> Result<String> {
-    anyhow::bail!(
-        "missing --cookie or --login: automatic browser login is only available on Windows"
-    )
-}
-
-#[cfg(target_os = "windows")]
-enum LoginSignal {
-    Navigation(String),
-    PageLoaded(String),
-    Tick,
-}
-
-#[cfg(target_os = "windows")]
-struct LoginApp {
-    login_url: String,
-    proxy: winit::event_loop::EventLoopProxy<LoginSignal>,
-    window: Option<Window>,
-    webview: Option<WebView>,
-    pending_ticket_cookie: Option<String>,
-    cookie_header: Option<String>,
-    saw_login_ticket_redirect: bool,
-    saw_login_success_page: bool,
-    warned_missing_ticket: bool,
-    error: Option<String>,
-}
-
-#[cfg(target_os = "windows")]
-impl LoginApp {
-    fn new(login_url: String, proxy: winit::event_loop::EventLoopProxy<LoginSignal>) -> Self {
-        Self {
-            login_url,
-            proxy,
-            window: None,
-            webview: None,
-            pending_ticket_cookie: None,
-            cookie_header: None,
-            saw_login_ticket_redirect: false,
-            saw_login_success_page: false,
-            warned_missing_ticket: false,
-            error: None,
-        }
+        assert_eq!(status.errcode, 405);
+        assert_eq!(status.code, "0813NDFa1etq0M0SGBGa1X6UNk33NDFz");
     }
 
-    fn observe_url(&mut self, url: &str) {
-        if is_login_ticket_redirect(url) && !self.saw_login_ticket_redirect {
-            self.saw_login_ticket_redirect = true;
-        }
+    #[test]
+    fn extracts_wechat_uuid_and_qrcode_url() {
+        let html = r#"
+            <img class="js_qrcode_img web_qrcode_img" src="/https/77726476706e69737468656265737421ffe7449269276d59660187e289446d36a8d6/connect/qrcode/041mYvVw0hEq100b?vpn-1"/>
+            <script>var U="https://long.open.weixin.qq.com",G="041mYvVw0hEq100b";</script>
+        "#;
 
-        if !self.saw_login_success_page
-            && (is_login_success_page(url)
-                || (self.saw_login_ticket_redirect && is_post_login_url(url)))
-        {
-            self.saw_login_success_page = true;
-        }
+        assert_eq!(extract_wechat_uuid(html).unwrap(), "041mYvVw0hEq100b");
+        assert_eq!(
+            extract_wechat_qrcode_url(html, "041mYvVw0hEq100b").unwrap(),
+            "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421ffe7449269276d59660187e289446d36a8d6/connect/qrcode/041mYvVw0hEq100b?vpn-1"
+        );
     }
 
-    fn check_ticket_cookie(&mut self, event_loop: &ActiveEventLoop) {
-        if self.cookie_header.is_some() {
-            return;
-        }
+    #[test]
+    fn module_sampling_preserves_outer_black_border() {
+        let module_size = WECHAT_QR_MODULE_PX;
+        let border = WECHAT_QR_BORDER_PX;
+        let image_size = border * 2 + WECHAT_QR_MODULES * module_size;
+        let mut image = GrayImage::from_pixel(image_size, image_size, image::Luma([255]));
+        for row in 0..WECHAT_QR_MODULES {
+            for col in 0..WECHAT_QR_MODULES {
+                if row != 0
+                    && row != WECHAT_QR_MODULES - 1
+                    && col != 0
+                    && col != WECHAT_QR_MODULES - 1
+                {
+                    continue;
+                }
 
-        self.capture_ticket_cookie();
-        self.finish_login_if_ready(event_loop);
-    }
-
-    fn capture_ticket_cookie(&mut self) {
-        if self.pending_ticket_cookie.is_some() {
-            return;
-        }
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
-
-        match self.find_ticket_cookie(webview) {
-            Ok(Some(ticket_cookie)) => {
-                self.pending_ticket_cookie = Some(ticket_cookie);
-                log_info("client", "ticket cookie found; waiting for login");
-            }
-            Ok(None) => {
-                if self.saw_login_success_page && !self.warned_missing_ticket {
-                    self.warned_missing_ticket = true;
-                    log_warn("client", "login complete, waiting for ticket cookie");
+                let start_x = border + col * module_size;
+                let start_y = border + row * module_size;
+                for y in start_y..start_y + module_size {
+                    for x in start_x..start_x + module_size {
+                        image.put_pixel(x, y, image::Luma([0]));
+                    }
                 }
             }
-            Err(err) => {
-                log_warn("client", format!("failed to inspect WebVPN cookies: {err}"));
-            }
         }
-    }
+        let modules = sample_wechat_qr_modules(&image).unwrap();
+        let output_size = WECHAT_QR_MODULES + TERMINAL_QR_QUIET_ZONE * 2;
 
-    fn finish_login_if_ready(&mut self, event_loop: &ActiveEventLoop) {
-        if !self.saw_login_success_page {
-            return;
-        }
-
-        let Some(ticket_cookie) = self.pending_ticket_cookie.take() else {
-            return;
-        };
-
-        self.cookie_header = Some(ticket_cookie);
-        self.drop_login_window();
-        event_loop.exit();
-    }
-
-    fn find_ticket_cookie(&self, webview: &WebView) -> wry::Result<Option<String>> {
-        find_webvpn_ticket_cookie(webview)
-    }
-
-    fn drop_login_window(&mut self) {
-        if let Some(window) = self.window.as_ref() {
-            window.set_visible(false);
-        }
-
-        self.webview.take();
-
-        if let Some(window) = self.window.as_ref() {
-            destroy_native_window(window);
-        }
-
-        self.window.take();
-    }
-
-    fn resize_webview_to_window(&self) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
-
-        self.resize_webview(window.inner_size());
-    }
-
-    fn resize_webview(&self, size: PhysicalSize<u32>) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
-        let Some(webview) = self.webview.as_ref() else {
-            return;
-        };
-
-        let size = size.to_logical::<u32>(window.scale_factor());
-        if let Err(err) = webview.set_bounds(Rect {
-            position: LogicalPosition::new(0, 0).into(),
-            size: LogicalSize::new(size.width, size.height).into(),
-        }) {
-            log_warn("client", format!("failed to resize WebView: {err}"));
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl ApplicationHandler<LoginSignal> for LoginApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-
-        let mut attributes = Window::default_attributes();
-        attributes.title = "towc WebVPN Login".to_string();
-        attributes.inner_size = Some(LogicalSize::new(1100, 800).into());
-
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => window,
-            Err(err) => {
-                self.error = Some(format!("failed to create login window: {err}"));
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let proxy = self.proxy.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                if proxy.send_event(LoginSignal::Tick).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let proxy = self.proxy.clone();
-        let nav_proxy = self.proxy.clone();
-        let webview = match WebViewBuilder::new()
-            .with_incognito(true)
-            .with_url(&self.login_url)
-            .with_navigation_handler(move |url| {
-                let _ = nav_proxy.send_event(LoginSignal::Navigation(url));
-                true
-            })
-            .with_on_page_load_handler(move |event, _url| {
-                if matches!(event, PageLoadEvent::Finished) {
-                    let _ = proxy.send_event(LoginSignal::PageLoaded(_url));
-                }
-            })
-            .build_as_child(&window)
-        {
-            Ok(webview) => webview,
-            Err(err) => {
-                self.error = Some(format!("failed to create WebView: {err}"));
-                event_loop.exit();
-                return;
-            }
-        };
-
-        self.window = Some(window);
-        self.webview = Some(webview);
-        self.resize_webview_to_window();
-    }
-
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: LoginSignal) {
-        match event {
-            LoginSignal::Navigation(url) | LoginSignal::PageLoaded(url) => {
-                self.observe_url(&url);
-                self.check_ticket_cookie(event_loop);
-            }
-            LoginSignal::Tick => self.check_ticket_cookie(event_loop),
-        }
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        match event {
-            WindowEvent::Resized(size) => {
-                self.resize_webview(size);
-            }
-            WindowEvent::CloseRequested => {
-                if self.cookie_header.is_none() && self.error.is_none() {
-                    self.error =
-                        Some("login canceled: window closed before login completed".into());
-                }
-                self.drop_login_window();
-                event_loop.exit();
-            }
-            _ => {}
-        }
-    }
-
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.drop_login_window();
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn find_webvpn_ticket_cookie(webview: &WebView) -> wry::Result<Option<String>> {
-    let cookies = webview.cookies_for_url(WEBVPN_LOGIN_URL)?;
-    Ok(cookies
-        .into_iter()
-        .find(|cookie| cookie.name() == WEBVPN_TICKET_COOKIE_NAME)
-        .map(|cookie| format!("{}={}", cookie.name(), cookie.value())))
-}
-
-#[cfg(target_os = "windows")]
-fn is_login_ticket_redirect(url: &str) -> bool {
-    url.contains("ticket=ST-") || (url.contains("/cas/login") && url.contains("code="))
-}
-
-#[cfg(target_os = "windows")]
-fn is_login_success_page(url: &str) -> bool {
-    url.contains("/personal-center")
-}
-
-#[cfg(target_os = "windows")]
-fn is_post_login_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.starts_with("https://webvpn.szut.edu.cn/")
-        && !lower.contains("/login")
-        && !lower.contains("/cas/login")
-        && !lower.contains("/connect/qrconnect")
-        && !lower.contains("ticket=st-")
-}
-
-#[cfg(target_os = "windows")]
-fn destroy_native_window(window: &Window) {
-    let Ok(handle) = window.window_handle() else {
-        return;
-    };
-
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        return;
-    };
-
-    let hwnd = HWND(handle.hwnd.get() as _);
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
-        let _ = DestroyWindow(hwnd);
+        assert!(!rendered_qr_module_dark(&modules, 0, 0, output_size));
+        assert!(rendered_qr_module_dark(
+            &modules,
+            TERMINAL_QR_QUIET_ZONE,
+            TERMINAL_QR_QUIET_ZONE,
+            output_size
+        ));
+        assert!(rendered_qr_module_dark(
+            &modules,
+            output_size - TERMINAL_QR_QUIET_ZONE - 1,
+            TERMINAL_QR_QUIET_ZONE,
+            output_size
+        ));
+        assert!(rendered_qr_module_dark(
+            &modules,
+            TERMINAL_QR_QUIET_ZONE,
+            output_size - TERMINAL_QR_QUIET_ZONE - 1,
+            output_size
+        ));
+        assert!(!rendered_qr_module_dark(
+            &modules,
+            TERMINAL_QR_QUIET_ZONE + 1,
+            TERMINAL_QR_QUIET_ZONE + 1,
+            output_size
+        ));
     }
 }
