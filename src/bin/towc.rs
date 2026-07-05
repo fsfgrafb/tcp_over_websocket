@@ -72,11 +72,6 @@ enum WechatQrPollResult {
     Expired,
 }
 
-enum QrTheme {
-    Aurora,
-    Expired,
-}
-
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -349,16 +344,11 @@ async fn login_with_wechat_qr() -> Result<String> {
     );
 
     let qr_modules = wechat_qr_modules_from_image(&qrcode)?;
-    print_wechat_qr_modules(&qr_modules, QrTheme::Aurora)?;
+    print_wechat_qr_modules(&qr_modules)?;
 
     let code = match poll_wechat_qr_code(&client, &uuid).await? {
         WechatQrPollResult::Confirmed(code) => code,
         WechatQrPollResult::Expired => {
-            log_warn(
-                "client",
-                "WeChat QR code expired; redrawing the expired QR code below",
-            );
-            print_wechat_qr_modules(&qr_modules, QrTheme::Expired)?;
             anyhow::bail!("WeChat QR code expired; please restart towc and scan again");
         }
     };
@@ -676,7 +666,7 @@ fn wechat_qr_modules_from_image(bytes: &[u8]) -> Result<Vec<bool>> {
     sample_wechat_qr_modules(&image).context("failed to sample WeChat QR modules")
 }
 
-fn print_wechat_qr_modules(modules: &[bool], theme: QrTheme) -> Result<()> {
+fn print_wechat_qr_modules(modules: &[bool]) -> Result<()> {
     let output_size = WECHAT_QR_MODULES + TERMINAL_QR_QUIET_ZONE * 2;
 
     println!();
@@ -685,7 +675,7 @@ fn print_wechat_qr_modules(modules: &[bool], theme: QrTheme) -> Result<()> {
             let top_dark = rendered_qr_module_dark(modules, x, y, output_size);
             let bottom_dark =
                 y + 1 < output_size && rendered_qr_module_dark(modules, x, y + 1, output_size);
-            print_qr_half_block(top_dark, bottom_dark, x, y, &theme);
+            print_qr_half_block(top_dark, bottom_dark, x, y);
         }
         println!("\x1b[0m");
     }
@@ -741,9 +731,9 @@ impl Rgb {
     }
 }
 
-fn print_qr_half_block(top_dark: bool, bottom_dark: bool, x: u32, y: u32, theme: &QrTheme) {
-    let foreground = qr_module_color(top_dark, x, y, theme);
-    let background = qr_module_color(bottom_dark, x, y + 1, theme);
+fn print_qr_half_block(top_dark: bool, bottom_dark: bool, x: u32, y: u32) {
+    let foreground = qr_module_color(top_dark, x, y);
+    let background = qr_module_color(bottom_dark, x, y + 1);
 
     print!(
         "\x1b[38;2;{};{};{};48;2;{};{};{}m\u{2580}",
@@ -756,13 +746,9 @@ fn print_qr_half_block(top_dark: bool, bottom_dark: bool, x: u32, y: u32, theme:
     );
 }
 
-fn qr_module_color(dark: bool, x: u32, y: u32, theme: &QrTheme) -> Rgb {
+fn qr_module_color(dark: bool, x: u32, y: u32) -> Rgb {
     if !dark {
         return Rgb::new(250, 248, 239);
-    }
-
-    if matches!(theme, QrTheme::Expired) {
-        return Rgb::new(186, 28, 28);
     }
 
     const AURORA: [Rgb; 7] = [
