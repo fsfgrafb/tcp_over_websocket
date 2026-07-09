@@ -19,11 +19,13 @@ use tokio_tungstenite::{WebSocketStream, accept_hdr_async, connect_async};
 pub const SERVER_LISTEN_ADDR: &str = "0.0.0.0:4489";
 pub const SERVER_LISTEN_HOST: &str = "0.0.0.0";
 pub const DEFAULT_SERVER_PORT: u16 = 4489;
-pub const DEFAULT_LOCAL_LISTEN_ADDR: &str = "127.0.0.1:9999";
+pub const DEFAULT_LOCAL_LISTEN_PORT: u16 = 14489;
+pub const DEFAULT_LOCAL_LISTEN_ADDR: &str = "127.0.0.1:14489";
 pub const DEFAULT_TARGET_HOST: &str = "127.0.0.1";
-pub const DEFAULT_TARGET_PORT: u16 = 9999;
-pub const DEFAULT_TARGET_ADDR: &str = "127.0.0.1:9999";
+pub const DEFAULT_TARGET_PORT: u16 = 22;
+pub const DEFAULT_TARGET_ADDR: &str = "127.0.0.1:22";
 pub const DEFAULT_WEBVPN_WS_HOST: &str = "webvpn.szut.edu.cn";
+pub const TOWS_TARGET_CONNECT_FAILURE_PREFIX: &str = "tows target connect failed";
 
 const WEBVPN_AES_KEY: &[u8; 16] = b"wrdvpnisthebest!";
 const WEBVPN_ENCRYPTED_PREFIX: &str = "77726476706e69737468656265737421";
@@ -52,10 +54,7 @@ impl fmt::Display for ConnectFailure {
                 )
             }
             Self::WebVpnFailed { location } => {
-                write!(
-                    formatter,
-                    "WebVPN returned failed, check whether tows is running and reachable; location: {location}"
-                )
+                write!(formatter, "WebVPN returned failed; location: {location}")
             }
             Self::Other(err) => write!(formatter, "{err:#}"),
         }
@@ -469,12 +468,12 @@ mod tests {
 
     #[test]
     fn builds_webvpn_ws_url_from_server_and_target() {
-        let url = build_webvpn_ws_url("192.0.2.10:4489", Some("22")).unwrap();
+        let url = build_webvpn_ws_url("192.0.2.10:4489", Some("3389")).unwrap();
 
         assert!(
             url.starts_with("wss://webvpn.szut.edu.cn/ws-4489/77726476706e69737468656265737421")
         );
-        assert!(url.ends_with("/tcp/22"));
+        assert!(url.ends_with("/tcp/3389"));
     }
 
     #[test]
@@ -483,6 +482,7 @@ mod tests {
             tcp_target_url_path_from_addr(DEFAULT_TARGET_ADDR).unwrap(),
             "/tcp"
         );
+        assert_eq!(normalize_tcp_target_arg(None).unwrap(), DEFAULT_TARGET_ADDR);
         assert_eq!(
             tcp_target_url_path_from_addr("127.0.0.1:3389").unwrap(),
             "/tcp/3389"

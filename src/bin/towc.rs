@@ -1,21 +1,26 @@
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use image::GrayImage;
 use reqwest::cookie::CookieStore;
 use reqwest::header::{ORIGIN, REFERER, USER_AGENT};
 use reqwest::{Client, Url};
 use serde::Deserialize;
+use std::fs;
 use std::io::{self, Write};
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tcp_over_websocket::{
-    ConnectFailure, DEFAULT_LOCAL_LISTEN_ADDR, DEFAULT_TARGET_HOST, DEFAULT_WEBVPN_WS_HOST,
-    build_webvpn_ws_url, connect_websocket, log_error, log_info, log_success, log_warn,
-    normalize_server_addr, normalize_tcp_target_arg, parse_socket_addr_with_default_host,
-    relay_stream, rsa_encrypt,
+    ConnectFailure, DEFAULT_LOCAL_LISTEN_ADDR, DEFAULT_LOCAL_LISTEN_PORT, DEFAULT_SERVER_PORT,
+    DEFAULT_TARGET_HOST, DEFAULT_TARGET_PORT, DEFAULT_WEBVPN_WS_HOST,
+    TOWS_TARGET_CONNECT_FAILURE_PREFIX, build_webvpn_ws_url, connect_websocket, log_error,
+    log_info, log_success, log_warn, normalize_server_addr, normalize_tcp_target_arg,
+    parse_socket_addr_with_default_host, relay_stream, rsa_encrypt,
 };
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 
 const WEBVPN_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/login";
 const WEBVPN_TICKET_COOKIE_NAME: &str = "wengine_vpn_ticketwebvpn_szut_edu_cn";
@@ -30,6 +35,7 @@ const WEBVPN_FINGERPRINT: &str = "5a0b00fe6ae8277a4bfadd4e103f6e1c";
 const WEBVPN_READY_ATTEMPTS: usize = 6;
 const WEBVPN_READY_SETTLE_MS: u64 = 700;
 const WEBVPN_READY_TIMEOUT_MS: u64 = 900;
+const COOKIE_CACHE_PROBE_TIMEOUT_SECS: u64 = 8;
 const CAS_LOGIN_ATTEMPTS: usize = 2;
 const CAS_LOGIN_RETRY_SETTLE_MS: u64 = 1500;
 const WECHAT_POLL_ATTEMPTS: usize = 180;
@@ -40,7 +46,9 @@ const WECHAT_QR_BORDER_PX: u32 = 30;
 const WECHAT_QR_MODULE_PX: u32 = 10;
 const TERMINAL_QR_QUIET_ZONE: u32 = 4;
 const QR_DARK_THRESHOLD: u8 = 160;
+const COOKIE_CACHE_FILE_NAME: &str = "webvpn.cookie";
 
+#[derive(Debug, PartialEq, Eq)]
 enum VerificationLogin {
     Sms { mobile: String },
     Email { email: String },
@@ -52,9 +60,19 @@ struct PublicKeyResponse {
     exponent: String,
 }
 
-struct ResolvedCookie {
-    header: String,
-    should_probe: bool,
+#[derive(Debug, PartialEq, Eq)]
+struct ClientConfig {
+    server: String,
+    target: Option<String>,
+    listen_addr: String,
+    login: Option<VerificationLogin>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedArgs {
+    Help,
+    Interactive,
+    Run(ClientConfig),
 }
 
 struct WebVpnLoginEntry {
@@ -72,6 +90,116 @@ enum WechatQrPollResult {
     Expired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessFailureKind {
+    CookieExpired,
+    WebVpnFailed,
+    TargetConnectFailed,
+    ResetAfterOpen,
+    ClosedAfterOpen,
+    OpenFailed,
+    ReadFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadinessFailure {
+    CookieExpired { location: String },
+    WebVpnFailed { location: String },
+    TargetConnectFailed { reason: String },
+    ResetAfterOpen,
+    ClosedAfterOpen { reason: Option<String> },
+    OpenFailed { detail: String },
+    ReadFailed { detail: String },
+}
+
+impl ReadinessFailure {
+    fn kind(&self) -> ReadinessFailureKind {
+        match self {
+            Self::CookieExpired { .. } => ReadinessFailureKind::CookieExpired,
+            Self::WebVpnFailed { .. } => ReadinessFailureKind::WebVpnFailed,
+            Self::TargetConnectFailed { .. } => ReadinessFailureKind::TargetConnectFailed,
+            Self::ResetAfterOpen => ReadinessFailureKind::ResetAfterOpen,
+            Self::ClosedAfterOpen { .. } => ReadinessFailureKind::ClosedAfterOpen,
+            Self::OpenFailed { .. } => ReadinessFailureKind::OpenFailed,
+            Self::ReadFailed { .. } => ReadinessFailureKind::ReadFailed,
+        }
+    }
+
+    fn observation_label(&self) -> &'static str {
+        match self {
+            Self::CookieExpired { .. } => "WebVPN redirected to login",
+            Self::WebVpnFailed { .. } => "WebVPN returned /wengine-vpn/failed",
+            Self::TargetConnectFailed { .. } => "tows reported target connect failure",
+            Self::ResetAfterOpen => "WebSocket reset after opening",
+            Self::ClosedAfterOpen { .. } => "WebSocket closed after opening",
+            Self::OpenFailed { .. } => "WebSocket open failed",
+            Self::ReadFailed { .. } => "WebSocket read failed",
+        }
+    }
+
+    fn diagnostic_lines(&self, server_addr: &str, target_addr: &str) -> Vec<String> {
+        match self {
+            Self::CookieExpired { location } => vec![
+                format!("phase: WebVPN redirected readiness check to login; location={location}"),
+                "cause: WebVPN session cookie is expired or was rejected".to_string(),
+                "check: restart towc and log in again".to_string(),
+            ],
+            Self::WebVpnFailed { location } => vec![
+                format!(
+                    "phase: WebVPN rejected the tunnel before tows accepted WebSocket; server={server_addr}; location={location}"
+                ),
+                "likely cause: tows is not running/reachable, server address or port is wrong, firewall blocked it, or WebVPN cannot route to it".to_string(),
+                "check: start tows on the target host and verify the configured server port is reachable through WebVPN".to_string(),
+            ],
+            Self::TargetConnectFailed { reason } => vec![
+                format!(
+                    "phase: tows accepted WebSocket at {server_addr}, then failed to connect target {target_addr}"
+                ),
+                format!("cause: target TCP connection failed; tows reported: {reason}"),
+                "check: on the tows host, verify the target service is listening and --target points to the right port".to_string(),
+            ],
+            Self::ResetAfterOpen => vec![
+                format!(
+                    "phase: WebVPN reached tows at {server_addr}, then the WebSocket reset before data flowed"
+                ),
+                format!(
+                    "likely cause: target {target_addr} is not listening/refused the connection, or tows closed after accepting the tunnel"
+                ),
+                "check: read the tows log; a target connect failed line confirms a target-port problem".to_string(),
+            ],
+            Self::ClosedAfterOpen { reason } => {
+                let mut lines = vec![
+                    format!(
+                        "phase: WebVPN reached tows at {server_addr}, then the tunnel closed before readiness completed"
+                    ),
+                    format!(
+                        "likely cause: target {target_addr} accepted then closed, or tows closed the tunnel early"
+                    ),
+                    "check: verify the target service stays open long enough for a TCP session".to_string(),
+                ];
+                if let Some(reason) = reason {
+                    lines.insert(2, format!("detail: close reason from peer: {reason}"));
+                }
+                lines
+            }
+            Self::OpenFailed { detail } => vec![
+                "phase: towc could not open the readiness WebSocket to WebVPN".to_string(),
+                "likely cause: local network, DNS/TLS, proxy, or WebVPN availability issue".to_string(),
+                format!("detail: {detail}"),
+            ],
+            Self::ReadFailed { detail } => vec![
+                format!(
+                    "phase: readiness WebSocket opened through WebVPN toward {server_addr}, then failed while reading"
+                ),
+                format!(
+                    "likely cause: unstable tunnel, tows closed unexpectedly, or target {target_addr} closed/reset the connection"
+                ),
+                format!("detail: {detail}"),
+            ],
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -85,64 +213,30 @@ async fn run() -> Result<()> {
         .install_default()
         .expect("failed to install rustls ring crypto provider");
 
-    let mut args = std::env::args().skip(1);
-    let mut listen_addr = DEFAULT_LOCAL_LISTEN_ADDR.to_string();
-    let mut server = None::<String>;
-    let mut target = None::<String>;
-    let mut cookie = None::<String>;
-    let mut login = None::<VerificationLogin>;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--listen" => {
-                listen_addr = args.next().context("missing value for --listen")?;
-            }
-            "--target" => {
-                target = Some(args.next().context("missing value for --target")?);
-            }
-            "--cookie" => {
-                cookie = Some(args.next().context("missing value for --cookie")?);
-            }
-            "--login" => {
-                let value = args.next().context("missing value for --login")?;
-                if login.replace(parse_login_identity(&value)?).is_some() {
-                    anyhow::bail!("--login can only be specified once");
-                }
-            }
-            "--help" | "-h" => {
-                print_usage();
-                return Ok(());
-            }
-            other => {
-                if other.starts_with('-') {
-                    return Err(anyhow::anyhow!("unknown argument: {other}"));
-                }
-                if server.replace(other.to_string()).is_some() {
-                    return Err(anyhow::anyhow!("unexpected extra argument: {other}"));
-                }
-            }
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let config = match parse_args(&raw_args)? {
+        ParsedArgs::Help => {
+            print_usage();
+            return Ok(());
         }
-    }
+        ParsedArgs::Interactive => prompt_client_config()?,
+        ParsedArgs::Run(config) => config,
+    };
 
-    let server = server.context("missing required server address, for example 192.0.2.10:4489")?;
-    let url = build_webvpn_ws_url(&server, target.as_deref())?;
-    let server_addr = normalize_server_addr(&server)?;
-    let target_addr = normalize_tcp_target_arg(target.as_deref())?;
-    let cookie = resolve_cookie(cookie, login).await?;
-    let listen_addr = parse_socket_addr_with_default_host(&listen_addr, DEFAULT_TARGET_HOST)?;
-
-    if cookie.should_probe {
-        wait_for_webvpn_ready(&url, &cookie.header).await?;
-    }
+    let url = build_webvpn_ws_url(&config.server, config.target.as_deref())?;
+    let server_addr = normalize_server_addr(&config.server)?;
+    let target_addr = normalize_tcp_target_arg(config.target.as_deref())?;
+    let listen_addr =
+        parse_socket_addr_with_default_host(&config.listen_addr, DEFAULT_TARGET_HOST)?;
+    let cookie = resolve_cookie(&url, &server_addr, &target_addr, config.login).await?;
 
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind local tcp listener on {listen_addr}"))?;
+    let webvpn_endpoint = resolve_webvpn_endpoint_label().await;
     log_success(
         "client",
-        format!(
-            "ready: {listen_addr} -> {DEFAULT_WEBVPN_WS_HOST} -> {server_addr} -> {target_addr}"
-        ),
+        format!("ready: {listen_addr} -> {webvpn_endpoint} -> {server_addr} -> {target_addr}"),
     );
 
     let shutdown = tokio::signal::ctrl_c();
@@ -153,7 +247,7 @@ async fn run() -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, peer_addr) = accepted.context("failed to accept local tcp connection")?;
                 let url = url.clone();
-                let cookie = cookie.header.clone();
+                let cookie = cookie.clone();
 
                 tokio::spawn(async move {
                     log_info("client", format!("tcp {peer_addr} connected"));
@@ -204,6 +298,153 @@ async fn handle_local_connection(
         .map_err(ConnectFailure::Other)
 }
 
+async fn resolve_webvpn_endpoint_label() -> String {
+    match lookup_host((DEFAULT_WEBVPN_WS_HOST, 443)).await {
+        Ok(mut addrs) => webvpn_endpoint_label(addrs.next().map(|addr| addr.ip())),
+        Err(err) => {
+            log_warn(
+                "client",
+                format!("failed to resolve WebVPN IP for link display: {err}"),
+            );
+            webvpn_endpoint_label(None)
+        }
+    }
+}
+
+fn webvpn_endpoint_label(ip: Option<IpAddr>) -> String {
+    match ip {
+        Some(ip) => format!("{DEFAULT_WEBVPN_WS_HOST}[{ip}]"),
+        None => DEFAULT_WEBVPN_WS_HOST.to_string(),
+    }
+}
+
+fn parse_args(args: &[String]) -> Result<ParsedArgs> {
+    if args.is_empty() {
+        return Ok(ParsedArgs::Interactive);
+    }
+
+    if is_help_arg(&args[0]) {
+        return Ok(ParsedArgs::Help);
+    }
+
+    let server = args[0].trim();
+    if server.is_empty() || server.starts_with('-') {
+        anyhow::bail!("missing required <server-ip[:port]> as the first argument");
+    }
+
+    let mut config = ClientConfig {
+        server: server.to_string(),
+        target: None,
+        listen_addr: DEFAULT_LOCAL_LISTEN_ADDR.to_string(),
+        login: None,
+    };
+
+    let mut index = 1;
+    let mut listen_seen = false;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--target" => {
+                if config.target.is_some() {
+                    anyhow::bail!("--target can only be specified once");
+                }
+                config.target = Some(next_flag_value(args, &mut index, "--target")?);
+            }
+            "--listen" => {
+                if listen_seen {
+                    anyhow::bail!("--listen can only be specified once");
+                }
+                listen_seen = true;
+                config.listen_addr = next_flag_value(args, &mut index, "--listen")?;
+            }
+            "--login" => {
+                if config.login.is_some() {
+                    anyhow::bail!("--login can only be specified once");
+                }
+                let value = next_flag_value(args, &mut index, "--login")?;
+                config.login = Some(parse_login_identity(&value)?);
+            }
+            "--help" | "-h" => return Ok(ParsedArgs::Help),
+            other => {
+                if other.starts_with('-') {
+                    anyhow::bail!("unknown argument: {other}");
+                }
+                anyhow::bail!("unexpected extra argument: {other}");
+            }
+        }
+        index += 1;
+    }
+
+    Ok(ParsedArgs::Run(config))
+}
+
+fn next_flag_value(args: &[String], index: &mut usize, name: &str) -> Result<String> {
+    *index += 1;
+    let value = args
+        .get(*index)
+        .with_context(|| format!("missing value for {name}"))?;
+    if value.starts_with('-') {
+        anyhow::bail!("missing value for {name}");
+    }
+
+    Ok(value.to_string())
+}
+
+fn is_help_arg(value: &str) -> bool {
+    value == "--help" || value == "-h"
+}
+
+fn prompt_client_config() -> Result<ClientConfig> {
+    let server = prompt_required(&format!(
+        "tows server <server-ip[:port]> (port default: {DEFAULT_SERVER_PORT}): "
+    ))?;
+    let target = prompt_optional(&format!("target port (default: {DEFAULT_TARGET_PORT}): "))?;
+    let listen_addr = prompt_optional(&format!(
+        "listen port (default: {DEFAULT_LOCAL_LISTEN_PORT}): "
+    ))?
+    .unwrap_or_else(|| DEFAULT_LOCAL_LISTEN_ADDR.to_string());
+    let login = prompt_optional("login mobile/email (default: WeChat QR): ")?
+        .map(|value| parse_login_identity(&value))
+        .transpose()?;
+
+    Ok(ClientConfig {
+        server,
+        target,
+        listen_addr,
+        login,
+    })
+}
+
+fn prompt_required(prompt: &str) -> Result<String> {
+    loop {
+        let Some(value) = prompt_line(prompt)? else {
+            anyhow::bail!("server is required");
+        };
+        if !value.is_empty() {
+            return Ok(value);
+        }
+        eprintln!("server is required");
+    }
+}
+
+fn prompt_optional(prompt: &str) -> Result<Option<String>> {
+    Ok(prompt_line(prompt)?.filter(|value| !value.is_empty()))
+}
+
+fn prompt_line(prompt: &str) -> Result<Option<String>> {
+    print!("{prompt}");
+    io::stdout().flush().context("failed to flush prompt")?;
+
+    let mut value = String::new();
+    let read_size = io::stdin()
+        .read_line(&mut value)
+        .context("failed to read prompt input")?;
+    if read_size == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(value.trim().to_string()))
+}
+
 fn parse_login_identity(value: &str) -> Result<VerificationLogin> {
     let value = value.trim();
     if value.is_empty() {
@@ -226,77 +467,290 @@ fn parse_login_identity(value: &str) -> Result<VerificationLogin> {
 }
 
 async fn resolve_cookie(
-    cookie: Option<String>,
+    url: &str,
+    server_addr: &str,
+    target_addr: &str,
     verification_login: Option<VerificationLogin>,
-) -> Result<ResolvedCookie> {
-    if cookie.is_some() && verification_login.is_some() {
-        anyhow::bail!("--cookie cannot be combined with --login");
+) -> Result<String> {
+    if let Some(cookie) = read_cached_cookie()
+        && cached_cookie_connects(url, &cookie).await
+    {
+        log_success("client", "using cached WebVPN cookie");
+        return Ok(cookie);
     }
 
-    match (cookie, verification_login) {
-        (Some(cookie), None) => Ok(ResolvedCookie {
-            header: cookie,
-            should_probe: false,
-        }),
-        (None, Some(login)) => Ok(ResolvedCookie {
-            header: login_with_verification_code(login).await?,
-            should_probe: true,
-        }),
-        (None, None) => Ok(ResolvedCookie {
-            header: login_with_wechat_qr().await?,
-            should_probe: true,
-        }),
-        (Some(_), Some(_)) => unreachable!(),
+    let header = match verification_login {
+        Some(login) => login_with_verification_code(login).await?,
+        None => login_with_wechat_qr().await?,
+    };
+    wait_for_webvpn_ready(url, &header, server_addr, target_addr).await?;
+    write_cached_cookie(&header);
+
+    Ok(header)
+}
+
+async fn cached_cookie_connects(url: &str, cookie: &str) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_secs(COOKIE_CACHE_PROBE_TIMEOUT_SECS),
+            probe_webvpn_ready(url, cookie),
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+fn read_cached_cookie() -> Option<String> {
+    let path = cookie_cache_path()?;
+    match fs::read_to_string(&path) {
+        Ok(cookie) => {
+            let cookie = cookie.trim();
+            if cookie.is_empty() {
+                None
+            } else {
+                Some(cookie.to_string())
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            log_warn(
+                "client",
+                format!("failed to read cached WebVPN cookie: {err}"),
+            );
+            None
+        }
     }
 }
 
-async fn wait_for_webvpn_ready(url: &str, cookie: &str) -> Result<()> {
+fn write_cached_cookie(cookie: &str) {
+    let Some(path) = cookie_cache_path() else {
+        log_warn("client", "failed to locate WebVPN cookie cache directory");
+        return;
+    };
+
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        log_warn(
+            "client",
+            format!("failed to create WebVPN cookie cache directory: {err}"),
+        );
+        return;
+    }
+
+    if let Err(err) = fs::write(&path, format!("{cookie}\n")) {
+        log_warn(
+            "client",
+            format!(
+                "failed to write WebVPN cookie cache at {}: {err}",
+                path.display()
+            ),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn cookie_cache_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+        .map(PathBuf::from)
+        .map(|path| path.join("tcp_over_websocket").join(COOKIE_CACHE_FILE_NAME))
+}
+
+#[cfg(not(windows))]
+fn cookie_cache_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+
+    Some(base.join("tcp_over_websocket").join(COOKIE_CACHE_FILE_NAME))
+}
+
+async fn wait_for_webvpn_ready(
+    url: &str,
+    cookie: &str,
+    server_addr: &str,
+    target_addr: &str,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    log_info(
+        "client",
+        format!("checking WebVPN tunnel readiness ({WEBVPN_READY_ATTEMPTS} attempts)"),
+    );
+
     for attempt in 1..=WEBVPN_READY_ATTEMPTS {
         match probe_webvpn_ready(url, cookie).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {
-                log_info(
-                    "client",
-                    format!(
-                        "WebVPN tunnel closed during readiness check, retrying ({attempt}/{WEBVPN_READY_ATTEMPTS})"
-                    ),
-                );
+            Ok(()) => {
+                if !failures.is_empty() {
+                    log_success(
+                        "client",
+                        format!(
+                            "WebVPN tunnel ready after {attempt}/{WEBVPN_READY_ATTEMPTS} attempts"
+                        ),
+                    );
+                }
+                return Ok(());
             }
-            Err(err) => {
-                log_warn(
-                    "client",
-                    format!(
-                        "WebVPN readiness check failed, retrying ({attempt}/{WEBVPN_READY_ATTEMPTS}): {err:#}"
-                    ),
-                );
+            Err(failure) => {
+                failures.push(failure);
+                if attempt >= WEBVPN_READY_ATTEMPTS {
+                    continue;
+                }
+
+                if attempt == 1 {
+                    log_warn(
+                        "client",
+                        format!(
+                            "readiness check failed; retrying ({attempt}/{WEBVPN_READY_ATTEMPTS})"
+                        ),
+                    );
+                } else if readiness_failure_kind_changed(&failures) {
+                    let label = failures
+                        .last()
+                        .expect("failure was just recorded")
+                        .observation_label();
+                    log_warn(
+                        "client",
+                        format!(
+                            "readiness failure changed to {label}; retrying ({attempt}/{WEBVPN_READY_ATTEMPTS})"
+                        ),
+                    );
+                }
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(WEBVPN_READY_SETTLE_MS)).await;
+        if attempt < WEBVPN_READY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(WEBVPN_READY_SETTLE_MS)).await;
+        }
     }
 
-    anyhow::bail!("WebVPN tunnel did not become ready after login; please try again")
+    for line in readiness_failure_summary_lines(&failures, server_addr, target_addr) {
+        log_warn("client", line);
+    }
+
+    anyhow::bail!("WebVPN tunnel did not become ready after login; see diagnosis above")
 }
 
-async fn probe_webvpn_ready(url: &str, cookie: &str) -> Result<bool> {
+fn readiness_failure_kind_changed(failures: &[ReadinessFailure]) -> bool {
+    let [.., previous, current] = failures else {
+        return false;
+    };
+
+    previous.kind() != current.kind()
+}
+
+fn readiness_failure_summary_lines(
+    failures: &[ReadinessFailure],
+    server_addr: &str,
+    target_addr: &str,
+) -> Vec<String> {
+    let Some(last_failure) = failures.last() else {
+        return vec!["readiness failed without a captured failure detail".to_string()];
+    };
+
+    let mut lines = vec![format!(
+        "readiness failed after {} attempts: {}",
+        failures.len(),
+        readiness_failure_counts(failures).join(", ")
+    )];
+
+    if failures
+        .iter()
+        .any(|failure| failure.kind() != last_failure.kind())
+    {
+        lines.push(format!(
+            "last readiness failure: {}",
+            last_failure.observation_label()
+        ));
+    }
+
+    lines.extend(last_failure.diagnostic_lines(server_addr, target_addr));
+    lines
+}
+
+fn readiness_failure_counts(failures: &[ReadinessFailure]) -> Vec<String> {
+    let mut counts = Vec::<(ReadinessFailureKind, &'static str, usize)>::new();
+
+    for failure in failures {
+        if let Some((_, _, count)) = counts
+            .iter_mut()
+            .find(|(kind, _, _)| *kind == failure.kind())
+        {
+            *count += 1;
+            continue;
+        }
+
+        counts.push((failure.kind(), failure.observation_label(), 1));
+    }
+
+    counts
+        .into_iter()
+        .map(|(_, label, count)| format!("{label} x{count}"))
+        .collect()
+}
+
+async fn probe_webvpn_ready(url: &str, cookie: &str) -> std::result::Result<(), ReadinessFailure> {
     let mut websocket = connect_websocket(url, cookie)
         .await
-        .map_err(|err| anyhow::anyhow!(err))
-        .context("failed to open readiness WebSocket")?;
+        .map_err(readiness_failure_from_connect_failure)?;
 
     let timeout = tokio::time::sleep(Duration::from_millis(WEBVPN_READY_TIMEOUT_MS));
     tokio::pin!(timeout);
 
-    tokio::select! {
+    let ready = tokio::select! {
         message = websocket.next() => {
             match message {
-                Some(Ok(Message::Close(_))) | None => Ok(false),
-                Some(Ok(_)) => Ok(true),
-                Some(Err(err)) => Err(anyhow::anyhow!(err).context("readiness WebSocket failed")),
+                Some(Ok(Message::Close(frame))) => {
+                    Err(readiness_failure_from_close_reason(
+                        frame.map(|frame| frame.reason.to_string()),
+                    ))
+                }
+                Some(Ok(_)) => Ok(()),
+                Some(Err(err)) => Err(readiness_failure_from_websocket_error(err)),
+                None => Err(ReadinessFailure::ClosedAfterOpen { reason: None }),
             }
         }
-        _ = &mut timeout => Ok(true),
+        _ = &mut timeout => Ok(()),
+    };
+
+    let _ = websocket.send(Message::Close(None)).await;
+    ready
+}
+
+fn readiness_failure_from_connect_failure(err: ConnectFailure) -> ReadinessFailure {
+    match err {
+        ConnectFailure::CookieExpired { location } => ReadinessFailure::CookieExpired { location },
+        ConnectFailure::WebVpnFailed { location } => ReadinessFailure::WebVpnFailed { location },
+        ConnectFailure::Other(err) => ReadinessFailure::OpenFailed {
+            detail: format!("{err:#}"),
+        },
     }
+}
+
+fn readiness_failure_from_websocket_error(err: WebSocketError) -> ReadinessFailure {
+    match err {
+        WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            ReadinessFailure::ResetAfterOpen
+        }
+        err => ReadinessFailure::ReadFailed {
+            detail: err.to_string(),
+        },
+    }
+}
+
+fn readiness_failure_from_close_reason(reason: Option<String>) -> ReadinessFailure {
+    let reason = reason.filter(|reason| !reason.trim().is_empty());
+    if let Some(reason) = reason {
+        if reason.starts_with(TOWS_TARGET_CONNECT_FAILURE_PREFIX) {
+            return ReadinessFailure::TargetConnectFailed { reason };
+        }
+
+        return ReadinessFailure::ClosedAfterOpen {
+            reason: Some(reason),
+        };
+    }
+
+    ReadinessFailure::ClosedAfterOpen { reason: None }
 }
 
 fn build_login_client(cookie_jar: Arc<reqwest::cookie::Jar>) -> Result<Client> {
@@ -1020,10 +1474,13 @@ fn attr_value(fragment: &str, name: &str) -> Option<String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: towc <server-ip[:port]> [--target <target-ip[:port]|port>] [--cookie <cookie>] [--login <mobile|email>] [--listen 127.0.0.1:9999]"
+        "Usage: towc <server-ip[:port]> [--target <port>] [--listen <port>] [--login <mobile|email>]"
     );
-    eprintln!("       server port defaults to 4489; --target defaults to 127.0.0.1:9999");
-    eprintln!("       when --cookie and --login are omitted, towc uses terminal WeChat QR login");
+    eprintln!("       server port defaults to {DEFAULT_SERVER_PORT}");
+    eprintln!(
+        "       --target defaults to {DEFAULT_TARGET_PORT}; --listen defaults to {DEFAULT_LOCAL_LISTEN_PORT}"
+    );
+    eprintln!("       no --login: terminal WeChat QR login; cookies are cached automatically");
     eprintln!(
         "       --login sends a verification code by SMS for numeric values, or email when the value contains @"
     );
@@ -1032,6 +1489,127 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_enters_interactive_mode() {
+        assert_eq!(parse_args(&args(&[])).unwrap(), ParsedArgs::Interactive);
+    }
+
+    #[test]
+    fn parses_server_first_and_options_in_any_order() {
+        let parsed = parse_args(&args(&[
+            "192.0.2.10:4489",
+            "--login",
+            "user@example.com",
+            "--listen",
+            "13389",
+            "--target",
+            "3389",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            ParsedArgs::Run(ClientConfig {
+                server: "192.0.2.10:4489".to_string(),
+                target: Some("3389".to_string()),
+                listen_addr: "13389".to_string(),
+                login: Some(VerificationLogin::Email {
+                    email: "user@example.com".to_string(),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_missing_first_server_argument() {
+        let err = parse_args(&args(&["--target", "3389"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("first argument"));
+    }
+
+    #[test]
+    fn rejects_unknown_argument() {
+        let err = parse_args(&args(&["192.0.2.10", "--unknown", "value"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown argument"));
+    }
+
+    #[test]
+    fn webvpn_endpoint_label_includes_ip_when_resolved() {
+        assert_eq!(
+            webvpn_endpoint_label(Some(IpAddr::from([203, 0, 113, 8]))),
+            "webvpn.szut.edu.cn[203.0.113.8]"
+        );
+    }
+
+    #[test]
+    fn webvpn_endpoint_label_keeps_domain_when_unresolved() {
+        assert_eq!(webvpn_endpoint_label(None), "webvpn.szut.edu.cn");
+    }
+
+    #[test]
+    fn readiness_summary_describes_webvpn_failed_as_tows_endpoint_issue() {
+        let failures = vec![
+            ReadinessFailure::WebVpnFailed {
+                location: "/wengine-vpn/failed".to_string(),
+            };
+            6
+        ];
+
+        let lines = readiness_failure_summary_lines(&failures, "192.0.2.10:4489", "127.0.0.1:22");
+
+        assert_eq!(
+            lines[0],
+            "readiness failed after 6 attempts: WebVPN returned /wengine-vpn/failed x6"
+        );
+        assert!(lines[1].contains("before tows accepted WebSocket"));
+        assert!(lines[2].contains("likely cause: tows is not running/reachable"));
+    }
+
+    #[test]
+    fn readiness_summary_describes_reset_as_probable_target_issue() {
+        let failures = vec![ReadinessFailure::ResetAfterOpen; 6];
+
+        let lines =
+            readiness_failure_summary_lines(&failures, "192.0.2.10:4489", "127.0.0.1:54162");
+
+        assert_eq!(
+            lines[0],
+            "readiness failed after 6 attempts: WebSocket reset after opening x6"
+        );
+        assert!(lines[1].contains("WebVPN reached tows"));
+        assert!(lines[2].contains("likely cause: target 127.0.0.1:54162"));
+    }
+
+    #[test]
+    fn readiness_close_reason_can_confirm_target_connect_failure() {
+        let reason = format!(
+            "{TOWS_TARGET_CONNECT_FAILURE_PREFIX}: 127.0.0.1:54162: Connection refused (os error 111)"
+        );
+
+        let failure = readiness_failure_from_close_reason(Some(reason.clone()));
+
+        assert_eq!(
+            failure,
+            ReadinessFailure::TargetConnectFailed {
+                reason: reason.clone()
+            }
+        );
+
+        let lines =
+            readiness_failure_summary_lines(&[failure], "192.0.2.10:4489", "127.0.0.1:54162");
+        assert!(lines[1].contains("then failed to connect target 127.0.0.1:54162"));
+        assert!(lines[2].contains("cause: target TCP connection failed"));
+    }
 
     #[test]
     fn parses_wechat_poll_status_from_vpn_eval_wrapper() {
