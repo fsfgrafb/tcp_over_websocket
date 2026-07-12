@@ -14,9 +14,10 @@ use std::time::Duration;
 use tcp_over_websocket::{
     ConnectFailure, DEFAULT_LOCAL_LISTEN_ADDR, DEFAULT_LOCAL_LISTEN_PORT, DEFAULT_SERVER_PORT,
     DEFAULT_TARGET_HOST, DEFAULT_TARGET_PORT, DEFAULT_WEBVPN_WS_HOST,
-    TOWS_TARGET_CONNECT_FAILURE_PREFIX, build_webvpn_ws_url, connect_websocket, log_error,
-    log_info, log_success, log_warn, normalize_server_addr, normalize_tcp_target_arg,
-    parse_socket_addr_with_default_host, relay_stream, rsa_encrypt,
+    TOWS_TARGET_CONNECT_FAILURE_PREFIX, WebVpnHeartbeatRole, build_webvpn_keepalive_ws_url,
+    build_webvpn_ws_url, connect_websocket, log_error, log_info, log_success, log_warn,
+    normalize_server_addr, normalize_tcp_target_arg, parse_socket_addr_with_default_host,
+    relay_stream_with_webvpn_heartbeat, rsa_encrypt, run_webvpn_heartbeat_websocket,
 };
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -36,6 +37,7 @@ const WEBVPN_READY_ATTEMPTS: usize = 6;
 const WEBVPN_READY_SETTLE_MS: u64 = 700;
 const WEBVPN_READY_TIMEOUT_MS: u64 = 900;
 const COOKIE_CACHE_PROBE_TIMEOUT_SECS: u64 = 8;
+const WEBVPN_KEEPALIVE_RECONNECT_SECS: u64 = 5;
 const CAS_LOGIN_ATTEMPTS: usize = 2;
 const CAS_LOGIN_RETRY_SETTLE_MS: u64 = 1500;
 const WECHAT_POLL_ATTEMPTS: usize = 180;
@@ -224,6 +226,7 @@ async fn run() -> Result<()> {
     };
 
     let url = build_webvpn_ws_url(&config.server, config.target.as_deref())?;
+    let keepalive_url = build_webvpn_keepalive_ws_url(&config.server)?;
     let server_addr = normalize_server_addr(&config.server)?;
     let target_addr = normalize_tcp_target_arg(config.target.as_deref())?;
     let listen_addr =
@@ -238,6 +241,7 @@ async fn run() -> Result<()> {
         "client",
         format!("ready: {listen_addr} -> {webvpn_endpoint} -> {server_addr} -> {target_addr}"),
     );
+    let _keepalive_task = spawn_webvpn_keepalive(keepalive_url, cookie.clone());
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -293,9 +297,51 @@ async fn handle_local_connection(
     cookie: &str,
 ) -> std::result::Result<(), ConnectFailure> {
     let websocket = connect_websocket(url, cookie).await?;
-    relay_stream(websocket, stream)
+    relay_stream_with_webvpn_heartbeat(websocket, stream, WebVpnHeartbeatRole::Client)
         .await
         .map_err(ConnectFailure::Other)
+}
+
+fn spawn_webvpn_keepalive(url: String, cookie: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        maintain_webvpn_keepalive(url, cookie).await;
+    })
+}
+
+async fn maintain_webvpn_keepalive(url: String, cookie: String) {
+    loop {
+        match connect_websocket(&url, &cookie).await {
+            Ok(websocket) => {
+                log_info("client", "WebVPN keepalive connected");
+                match run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Client).await {
+                    Ok(()) => log_warn("client", "WebVPN keepalive disconnected; reconnecting"),
+                    Err(err) => {
+                        log_warn("client", format!("WebVPN keepalive failed: {err:#}"));
+                    }
+                }
+            }
+            Err(ConnectFailure::CookieExpired { location }) => {
+                log_error(
+                    "client",
+                    format!(
+                        "cookie expired during WebVPN keepalive, please restart towc and log in again; location: {location}"
+                    ),
+                );
+                std::process::exit(1);
+            }
+            Err(ConnectFailure::WebVpnFailed { location }) => {
+                log_warn(
+                    "client",
+                    format!("WebVPN keepalive endpoint failed; reconnecting: {location}"),
+                );
+            }
+            Err(ConnectFailure::Other(err)) => {
+                log_warn("client", format!("WebVPN keepalive open failed: {err:#}"));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(WEBVPN_KEEPALIVE_RECONNECT_SECS)).await;
+    }
 }
 
 async fn resolve_webvpn_endpoint_label() -> String {

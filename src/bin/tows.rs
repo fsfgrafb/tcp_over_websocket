@@ -3,8 +3,10 @@ use futures_util::SinkExt;
 use std::io;
 use tcp_over_websocket::{
     DEFAULT_SERVER_PORT, SERVER_LISTEN_ADDR, SERVER_LISTEN_HOST,
-    TOWS_TARGET_CONNECT_FAILURE_PREFIX, accept_websocket_with_path, log_error, log_info,
-    log_success, parse_socket_addr_with_default_host, parse_tcp_target_path, relay_stream,
+    TOWS_TARGET_CONNECT_FAILURE_PREFIX, WEBVPN_KEEPALIVE_PATH, WebVpnHeartbeatRole,
+    accept_websocket_with_path, log_error, log_info, log_success,
+    parse_socket_addr_with_default_host, parse_tcp_target_path, relay_stream_with_webvpn_heartbeat,
+    run_webvpn_heartbeat_websocket,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -82,6 +84,11 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
     }
 
     let (mut websocket, path) = accept_websocket_with_path(stream).await?;
+    if path == WEBVPN_KEEPALIVE_PATH {
+        log_info("server", "WebVPN keepalive connected");
+        return run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Server).await;
+    }
+
     let target_addr = parse_tcp_target_path(&path)?;
     let target = match TcpStream::connect(&target_addr).await {
         Ok(target) => target,
@@ -102,7 +109,7 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
     };
     log_info("server", format!("{path} -> {target_addr}"));
 
-    relay_stream(websocket, target).await
+    relay_stream_with_webvpn_heartbeat(websocket, target, WebVpnHeartbeatRole::Server).await
 }
 
 fn target_connect_failure_close_reason(target_addr: &str, err: &io::Error) -> String {

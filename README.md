@@ -46,6 +46,7 @@ towc <tows-ip[:port]> [--target <port>] [--listen <port>] [--login <mobile|email
 - `--target` 默认 `22`
 - `--listen` 默认 `14489`
 - WebVPN Cookie 会自动缓存并在启动时校验
+- `towc` 会通过 WebVPN WebSocket 自动发送心跳，空闲时也会维持会话
 
 ## 构建
 
@@ -62,5 +63,5 @@ cargo build --release
 
 - `WebVPN returned /wengine-vpn/failed`：检查 `tows` 是否运行、端口是否正确、防火墙是否放行。
 - `tows reported target connect failure`：检查目标服务是否监听在 `--target` 指定的端口。
-- `cookie expired`：重新启动 `towc` 并登录。
+- `cookie expired`：确认 `tows` 与 `towc` 都已更新到支持 WebVPN 心跳的版本；若仍过期，重新启动 `towc` 并登录。
 - 本地端口占用：换一个 `--listen` 端口。

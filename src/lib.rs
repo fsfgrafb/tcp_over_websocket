@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::Request as ServerRequest;
@@ -26,6 +27,9 @@ pub const DEFAULT_TARGET_PORT: u16 = 22;
 pub const DEFAULT_TARGET_ADDR: &str = "127.0.0.1:22";
 pub const DEFAULT_WEBVPN_WS_HOST: &str = "webvpn.szut.edu.cn";
 pub const TOWS_TARGET_CONNECT_FAILURE_PREFIX: &str = "tows target connect failed";
+pub const WEBVPN_KEEPALIVE_PATH: &str = "/webvpn-keepalive";
+pub const WEBVPN_HEARTBEAT_MESSAGE: &str = "连接成功";
+pub const WEBVPN_HEARTBEAT_INTERVAL_SECS: u64 = 210;
 
 const WEBVPN_AES_KEY: &[u8; 16] = b"wrdvpnisthebest!";
 const WEBVPN_ENCRYPTED_PREFIX: &str = "77726476706e69737468656265737421";
@@ -63,6 +67,22 @@ impl fmt::Display for ConnectFailure {
 
 impl std::error::Error for ConnectFailure {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebVpnHeartbeatRole {
+    Client,
+    Server,
+}
+
+impl WebVpnHeartbeatRole {
+    fn sends_heartbeat(self) -> bool {
+        matches!(self, Self::Client)
+    }
+
+    fn echoes_heartbeat(self) -> bool {
+        matches!(self, Self::Server)
+    }
+}
+
 pub fn parse_tcp_target_path(path: &str) -> Result<String> {
     let target = path
         .strip_prefix("/tcp")
@@ -96,6 +116,16 @@ pub fn build_webvpn_ws_url(server: &str, target: Option<&str>) -> Result<String>
 
     Ok(format!(
         "wss://{DEFAULT_WEBVPN_WS_HOST}/ws-{}/{WEBVPN_ENCRYPTED_PREFIX}{encrypted_host}{target_path}",
+        server.port
+    ))
+}
+
+pub fn build_webvpn_keepalive_ws_url(server: &str) -> Result<String> {
+    let server = parse_host_port(server, DEFAULT_SERVER_PORT, DEFAULT_TARGET_HOST, "server")?;
+    let encrypted_host = encrypt_webvpn_host(&server.host)?;
+
+    Ok(format!(
+        "wss://{DEFAULT_WEBVPN_WS_HOST}/ws-{}/{WEBVPN_ENCRYPTED_PREFIX}{encrypted_host}{WEBVPN_KEEPALIVE_PATH}",
         server.port
     ))
 }
@@ -292,12 +322,48 @@ pub async fn relay_stream<S>(websocket: WebSocketStream<S>, tcp: TcpStream) -> R
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    relay_stream_inner(websocket, tcp, None).await
+}
+
+pub async fn relay_stream_with_webvpn_heartbeat<S>(
+    websocket: WebSocketStream<S>,
+    tcp: TcpStream,
+    heartbeat_role: WebVpnHeartbeatRole,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    relay_stream_inner(websocket, tcp, Some(heartbeat_role)).await
+}
+
+async fn relay_stream_inner<S>(
+    websocket: WebSocketStream<S>,
+    tcp: TcpStream,
+    heartbeat_role: Option<WebVpnHeartbeatRole>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut ws_sink, mut ws_stream) = websocket.split();
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     let mut buffer = vec![0_u8; 16 * 1024];
+    let mut heartbeat_interval =
+        tokio::time::interval(Duration::from_secs(WEBVPN_HEARTBEAT_INTERVAL_SECS));
+    heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
+            _ = heartbeat_interval.tick(), if heartbeat_role.is_some_and(WebVpnHeartbeatRole::sends_heartbeat) => {
+                if let Err(err) = ws_sink
+                    .send(Message::Text(WEBVPN_HEARTBEAT_MESSAGE.into()))
+                    .await
+                {
+                    if is_normal_websocket_close(&err) {
+                        break;
+                    }
+                    return Err(err).context("failed to send WebVPN heartbeat");
+                }
+            }
             read_result = tcp_read.read(&mut buffer) => {
                 let read_size = match read_result {
                     Ok(read_size) => read_size,
@@ -331,6 +397,18 @@ where
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
+                        if text.as_str() == WEBVPN_HEARTBEAT_MESSAGE {
+                            if heartbeat_role.is_some_and(WebVpnHeartbeatRole::echoes_heartbeat)
+                                && let Err(err) = ws_sink.send(Message::Text(text)).await
+                            {
+                                if is_normal_websocket_close(&err) {
+                                    break;
+                                }
+                                return Err(err).context("failed to echo WebVPN heartbeat");
+                            }
+                            continue;
+                        }
+
                         if let Err(err) = tcp_write.write_all(text.as_bytes()).await {
                             if is_normal_connection_close(&err) {
                                 break;
@@ -353,6 +431,65 @@ where
                         let _ = tcp_write.shutdown().await;
                         break;
                     }
+                    Some(Err(err)) => return Err(err.into()),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn run_webvpn_heartbeat_websocket<S>(
+    websocket: WebSocketStream<S>,
+    heartbeat_role: WebVpnHeartbeatRole,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut ws_sink, mut ws_stream) = websocket.split();
+    let mut heartbeat_interval =
+        tokio::time::interval(Duration::from_secs(WEBVPN_HEARTBEAT_INTERVAL_SECS));
+    heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = heartbeat_interval.tick(), if heartbeat_role.sends_heartbeat() => {
+                if let Err(err) = ws_sink
+                    .send(Message::Text(WEBVPN_HEARTBEAT_MESSAGE.into()))
+                    .await
+                {
+                    if is_normal_websocket_close(&err) {
+                        break;
+                    }
+                    return Err(err).context("failed to send WebVPN heartbeat");
+                }
+            }
+            message_result = ws_stream.next() => {
+                match message_result {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.as_str() == WEBVPN_HEARTBEAT_MESSAGE
+                            && heartbeat_role.echoes_heartbeat()
+                            && let Err(err) = ws_sink.send(Message::Text(text)).await
+                        {
+                            if is_normal_websocket_close(&err) {
+                                break;
+                            }
+                            return Err(err).context("failed to echo WebVPN heartbeat");
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if let Err(err) = ws_sink.send(Message::Pong(payload)).await {
+                            if is_normal_websocket_close(&err) {
+                                break;
+                            }
+                            return Err(err).context("failed to reply to websocket ping");
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    Some(Err(err)) if is_normal_websocket_close(&err) => break,
                     Some(Err(err)) => return Err(err.into()),
                     None => break,
                 }
@@ -474,6 +611,16 @@ mod tests {
             url.starts_with("wss://webvpn.szut.edu.cn/ws-4489/77726476706e69737468656265737421")
         );
         assert!(url.ends_with("/tcp/3389"));
+    }
+
+    #[test]
+    fn builds_webvpn_keepalive_ws_url_from_server() {
+        let url = build_webvpn_keepalive_ws_url("192.0.2.10:4489").unwrap();
+
+        assert!(
+            url.starts_with("wss://webvpn.szut.edu.cn/ws-4489/77726476706e69737468656265737421")
+        );
+        assert!(url.ends_with(WEBVPN_KEEPALIVE_PATH));
     }
 
     #[test]
