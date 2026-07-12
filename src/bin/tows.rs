@@ -5,7 +5,7 @@ use tcp_over_websocket::{
     DEFAULT_SERVER_PORT, SERVER_LISTEN_ADDR, SERVER_LISTEN_HOST,
     TOWS_TARGET_CONNECT_FAILURE_PREFIX, WEBVPN_KEEPALIVE_PATH, WebVpnHeartbeatRole,
     accept_websocket_with_path, log_error, log_info, log_success,
-    parse_socket_addr_with_default_host, parse_tcp_target_path, relay_stream_with_webvpn_heartbeat,
+    parse_socket_addr_with_default_host, parse_tcp_target_path, relay_stream,
     run_webvpn_heartbeat_websocket,
 };
 use tokio::io::AsyncWriteExt;
@@ -21,6 +21,7 @@ const MAX_WEBSOCKET_CLOSE_REASON_BYTES: usize = 123;
 
 #[tokio::main]
 async fn main() {
+    log_info("server", format!("tows v{}", env!("CARGO_PKG_VERSION")));
     if let Err(err) = run().await {
         log_error("server", format!("{err:#}"));
         std::process::exit(1);
@@ -85,6 +86,7 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
 
     let (mut websocket, path) = accept_websocket_with_path(stream).await?;
     if path == WEBVPN_KEEPALIVE_PATH {
+        log_info("server", "WebVPN keepalive connected");
         return run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Server).await;
     }
 
@@ -108,7 +110,7 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
     };
     log_info("server", format!("{path} -> {target_addr}"));
 
-    relay_stream_with_webvpn_heartbeat(websocket, target, WebVpnHeartbeatRole::Server).await
+    relay_stream(websocket, target, WebVpnHeartbeatRole::Server).await
 }
 
 fn target_connect_failure_close_reason(target_addr: &str, err: &io::Error) -> String {

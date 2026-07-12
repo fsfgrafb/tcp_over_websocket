@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::Request as ServerRequest;
 use tokio_tungstenite::tungstenite::http::header::{COOKIE, HeaderValue};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, http::header::LOCATION};
-use tokio_tungstenite::{WebSocketStream, accept_hdr_async, connect_async};
+use tokio_tungstenite::{WebSocketStream, accept_hdr_async, connect_async_with_config};
 
 pub const SERVER_LISTEN_ADDR: &str = "0.0.0.0:4489";
 pub const SERVER_LISTEN_HOST: &str = "0.0.0.0";
@@ -318,14 +318,7 @@ pub fn log_error(scope: &str, message: impl AsRef<str>) {
     eprintln!("{RED}[{scope}]{RESET} {}", message.as_ref());
 }
 
-pub async fn relay_stream<S>(websocket: WebSocketStream<S>, tcp: TcpStream) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    relay_stream_inner(websocket, tcp, None).await
-}
-
-pub async fn relay_stream_with_webvpn_heartbeat<S>(
+pub async fn relay_stream<S>(
     websocket: WebSocketStream<S>,
     tcp: TcpStream,
     heartbeat_role: WebVpnHeartbeatRole,
@@ -333,17 +326,8 @@ pub async fn relay_stream_with_webvpn_heartbeat<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    relay_stream_inner(websocket, tcp, Some(heartbeat_role)).await
-}
-
-async fn relay_stream_inner<S>(
-    websocket: WebSocketStream<S>,
-    tcp: TcpStream,
-    heartbeat_role: Option<WebVpnHeartbeatRole>,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+    tcp.set_nodelay(true)
+        .context("failed to enable TCP_NODELAY on relay stream")?;
     let (mut ws_sink, mut ws_stream) = websocket.split();
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     let mut buffer = vec![0_u8; 16 * 1024];
@@ -353,7 +337,7 @@ where
 
     loop {
         tokio::select! {
-            _ = heartbeat_interval.tick(), if heartbeat_role.is_some_and(WebVpnHeartbeatRole::sends_heartbeat) => {
+            _ = heartbeat_interval.tick(), if heartbeat_role.sends_heartbeat() => {
                 if let Err(err) = ws_sink
                     .send(Message::Text(WEBVPN_HEARTBEAT_MESSAGE.into()))
                     .await
@@ -398,7 +382,7 @@ where
                     }
                     Some(Ok(Message::Text(text))) => {
                         if text.as_str() == WEBVPN_HEARTBEAT_MESSAGE {
-                            if heartbeat_role.is_some_and(WebVpnHeartbeatRole::echoes_heartbeat)
+                            if heartbeat_role.echoes_heartbeat()
                                 && let Err(err) = ws_sink.send(Message::Text(text)).await
                             {
                                 if is_normal_websocket_close(&err) {
@@ -536,7 +520,7 @@ pub async fn connect_websocket(
         })?,
     );
 
-    let (websocket, _) = match connect_async(request).await {
+    let (websocket, _) = match connect_async_with_config(request, None, true).await {
         Ok(result) => result,
         Err(WebSocketError::Http(response)) => {
             let location = response
@@ -577,6 +561,9 @@ pub async fn connect_websocket(
 pub async fn accept_websocket_with_path(
     stream: TcpStream,
 ) -> Result<(WebSocketStream<TcpStream>, String)> {
+    stream
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY on websocket stream")?;
     let requested_path = Arc::new(Mutex::new(None::<String>));
     let requested_path_for_callback = Arc::clone(&requested_path);
 

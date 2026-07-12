@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use image::GrayImage;
 use reqwest::cookie::CookieStore;
 use reqwest::header::{ORIGIN, REFERER, USER_AGENT};
 use reqwest::{Client, Url};
@@ -9,19 +8,22 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tcp_over_websocket::{
     ConnectFailure, DEFAULT_LOCAL_LISTEN_ADDR, DEFAULT_LOCAL_LISTEN_PORT, DEFAULT_SERVER_PORT,
     DEFAULT_TARGET_HOST, DEFAULT_TARGET_PORT, DEFAULT_WEBVPN_WS_HOST,
     TOWS_TARGET_CONNECT_FAILURE_PREFIX, WebVpnHeartbeatRole, build_webvpn_keepalive_ws_url,
     build_webvpn_ws_url, connect_websocket, log_error, log_info, log_success, log_warn,
     normalize_server_addr, normalize_tcp_target_arg, parse_socket_addr_with_default_host,
-    relay_stream_with_webvpn_heartbeat, rsa_encrypt, run_webvpn_heartbeat_websocket,
+    relay_stream, rsa_encrypt, run_webvpn_heartbeat_websocket,
 };
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
+
+#[path = "towc/qr.rs"]
+mod qr;
 
 const WEBVPN_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/login";
 const WEBVPN_TICKET_COOKIE_NAME: &str = "wengine_vpn_ticketwebvpn_szut_edu_cn";
@@ -38,16 +40,13 @@ const WEBVPN_READY_SETTLE_MS: u64 = 700;
 const WEBVPN_READY_TIMEOUT_MS: u64 = 900;
 const COOKIE_CACHE_PROBE_TIMEOUT_SECS: u64 = 8;
 const WEBVPN_KEEPALIVE_RECONNECT_SECS: u64 = 5;
+const WEBVPN_COOKIE_REFRESH_INTERVAL_SECS: u64 = 180;
+const WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS: u64 = 8;
 const CAS_LOGIN_ATTEMPTS: usize = 2;
 const CAS_LOGIN_RETRY_SETTLE_MS: u64 = 1500;
 const WECHAT_POLL_ATTEMPTS: usize = 180;
 const WECHAT_POLL_TIMEOUT_SECS: u64 = 35;
 const WECHAT_POLL_SETTLE_MS: u64 = 1800;
-const WECHAT_QR_MODULES: u32 = 41;
-const WECHAT_QR_BORDER_PX: u32 = 30;
-const WECHAT_QR_MODULE_PX: u32 = 10;
-const TERMINAL_QR_QUIET_ZONE: u32 = 4;
-const QR_DARK_THRESHOLD: u8 = 160;
 const COOKIE_CACHE_FILE_NAME: &str = "webvpn.cookie";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -78,7 +77,7 @@ enum ParsedArgs {
 }
 
 struct WebVpnLoginEntry {
-    ticket_cookie: Option<String>,
+    cookie_header: Option<String>,
     cas_login_url: String,
 }
 
@@ -204,6 +203,7 @@ impl ReadinessFailure {
 
 #[tokio::main]
 async fn main() {
+    log_info("client", format!("towc v{}", env!("CARGO_PKG_VERSION")));
     if let Err(err) = run().await {
         log_error("client", format!("{err:#}"));
         std::process::exit(1);
@@ -232,6 +232,7 @@ async fn run() -> Result<()> {
     let listen_addr =
         parse_socket_addr_with_default_host(&config.listen_addr, DEFAULT_TARGET_HOST)?;
     let cookie = resolve_cookie(&url, &server_addr, &target_addr, config.login).await?;
+    let cookie = Arc::new(Mutex::new(cookie));
 
     let listener = TcpListener::bind(listen_addr)
         .await
@@ -241,7 +242,9 @@ async fn run() -> Result<()> {
         "client",
         format!("ready: {listen_addr} -> {webvpn_endpoint} -> {server_addr} -> {target_addr}"),
     );
-    let _keepalive_task = spawn_webvpn_keepalive(keepalive_url, cookie.clone());
+    log_info("client", "starting WebVPN keepalive websocket");
+    let _keepalive_task = spawn_webvpn_keepalive(keepalive_url, Arc::clone(&cookie));
+    let _cookie_refresh_task = spawn_webvpn_cookie_refresh(Arc::clone(&cookie));
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -251,7 +254,7 @@ async fn run() -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, peer_addr) = accepted.context("failed to accept local tcp connection")?;
                 let url = url.clone();
-                let cookie = cookie.clone();
+                let cookie = current_cookie(&cookie);
 
                 tokio::spawn(async move {
                     log_info("client", format!("tcp {peer_addr} connected"));
@@ -297,24 +300,34 @@ async fn handle_local_connection(
     cookie: &str,
 ) -> std::result::Result<(), ConnectFailure> {
     let websocket = connect_websocket(url, cookie).await?;
-    relay_stream_with_webvpn_heartbeat(websocket, stream, WebVpnHeartbeatRole::Client)
+    relay_stream(websocket, stream, WebVpnHeartbeatRole::Client)
         .await
         .map_err(ConnectFailure::Other)
 }
 
-fn spawn_webvpn_keepalive(url: String, cookie: String) -> tokio::task::JoinHandle<()> {
+fn current_cookie(cookie: &Arc<Mutex<String>>) -> String {
+    cookie.lock().expect("WebVPN cookie mutex poisoned").clone()
+}
+
+fn replace_current_cookie(cookie: &Arc<Mutex<String>>, value: String) {
+    *cookie.lock().expect("WebVPN cookie mutex poisoned") = value;
+}
+
+fn spawn_webvpn_keepalive(url: String, cookie: Arc<Mutex<String>>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         maintain_webvpn_keepalive(url, cookie).await;
     })
 }
 
-async fn maintain_webvpn_keepalive(url: String, cookie: String) {
+async fn maintain_webvpn_keepalive(url: String, cookie: Arc<Mutex<String>>) {
     loop {
-        match connect_websocket(&url, &cookie).await {
+        let cookie_snapshot = current_cookie(&cookie);
+        match connect_websocket(&url, &cookie_snapshot).await {
             Ok(websocket) => {
+                log_info("client", "WebVPN keepalive connected");
                 match run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Client).await {
-                    Ok(()) => {}
-                    Err(_) => {}
+                    Ok(()) => log_warn("client", "WebVPN keepalive disconnected; reconnecting"),
+                    Err(err) => log_warn("client", format!("WebVPN keepalive failed: {err:#}")),
                 }
             }
             Err(ConnectFailure::CookieExpired { location }) => {
@@ -326,12 +339,107 @@ async fn maintain_webvpn_keepalive(url: String, cookie: String) {
                 );
                 std::process::exit(1);
             }
-            Err(ConnectFailure::WebVpnFailed { .. }) => {}
-            Err(ConnectFailure::Other(_)) => {}
+            Err(ConnectFailure::WebVpnFailed { location }) => {
+                log_warn(
+                    "client",
+                    format!("WebVPN keepalive endpoint failed; reconnecting: {location}"),
+                );
+            }
+            Err(ConnectFailure::Other(err)) => {
+                log_warn("client", format!("WebVPN keepalive open failed: {err:#}"));
+            }
         }
 
         tokio::time::sleep(Duration::from_secs(WEBVPN_KEEPALIVE_RECONNECT_SECS)).await;
     }
+}
+
+fn spawn_webvpn_cookie_refresh(cookie: Arc<Mutex<String>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        maintain_webvpn_cookie_refresh(cookie).await;
+    })
+}
+
+async fn maintain_webvpn_cookie_refresh(cookie: Arc<Mutex<String>>) {
+    let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
+    seed_webvpn_cookie_jar(&cookie_jar, &current_cookie(&cookie));
+
+    let client = match build_login_client(Arc::clone(&cookie_jar)) {
+        Ok(client) => client,
+        Err(err) => {
+            log_warn(
+                "client",
+                format!("WebVPN cookie refresh disabled; failed to build client: {err:#}"),
+            );
+            return;
+        }
+    };
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(WEBVPN_COOKIE_REFRESH_INTERVAL_SECS)).await;
+
+        let refresh_result = tokio::time::timeout(
+            Duration::from_secs(WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS),
+            refresh_webvpn_cookie_once(&client, &cookie_jar),
+        )
+        .await;
+
+        match refresh_result {
+            Ok(Ok(refreshed_cookie)) => {
+                replace_current_cookie(&cookie, refreshed_cookie.clone());
+                write_cached_cookie(&refreshed_cookie);
+            }
+            Ok(Err(err)) => {
+                log_warn("client", format!("WebVPN cookie refresh failed: {err:#}"));
+            }
+            Err(_) => {
+                log_warn("client", "WebVPN cookie refresh timed out");
+            }
+        }
+    }
+}
+
+async fn refresh_webvpn_cookie_once(
+    client: &Client,
+    cookie_jar: &reqwest::cookie::Jar,
+) -> Result<String> {
+    client
+        .get(webvpn_cookie_refresh_url()?)
+        .header(REFERER, "https://webvpn.szut.edu.cn/")
+        .send()
+        .await
+        .context("failed to send WebVPN cookie refresh request")?
+        .error_for_status()
+        .context("WebVPN cookie refresh request failed")?;
+
+    let cookie = webvpn_cookie_header_from_jar(cookie_jar)
+        .context("WebVPN cookie refresh completed without WebVPN cookies")?;
+    if ticket_cookie_from_header(&cookie).is_none() {
+        anyhow::bail!("WebVPN cookie refresh response did not retain ticket cookie");
+    }
+
+    Ok(cookie)
+}
+
+fn webvpn_cookie_refresh_url() -> Result<String> {
+    let mut url = Url::parse("https://webvpn.szut.edu.cn/wengine-vpn/cookie")
+        .context("failed to build WebVPN cookie refresh URL")?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("method", "get");
+        query.append_pair("host", "cas.szut.edu.cn");
+        query.append_pair("scheme", "https");
+        query.append_pair("path", "/personal-center");
+        query.append_pair("vpn_timestamp", &unix_timestamp_millis().to_string());
+    }
+    Ok(url.into())
+}
+
+fn unix_timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 async fn resolve_webvpn_endpoint_label() -> String {
@@ -431,9 +539,11 @@ fn is_help_arg(value: &str) -> bool {
 
 fn prompt_client_config() -> Result<ClientConfig> {
     let server = prompt_required("tows address <ip[:port]>: ")?;
-    let target = prompt_optional(&format!("target port (default: {DEFAULT_TARGET_PORT}): "))?;
+    let target = prompt_optional(&format!(
+        "target address/port (default: {DEFAULT_TARGET_PORT}): "
+    ))?;
     let listen_addr = prompt_optional(&format!(
-        "listen port (default: {DEFAULT_LOCAL_LISTEN_PORT}): "
+        "listen address/port (default: {DEFAULT_LOCAL_LISTEN_PORT}): "
     ))?
     .unwrap_or_else(|| DEFAULT_LOCAL_LISTEN_ADDR.to_string());
     let login = prompt_optional("login mobile/email (default: WeChat QR): ")?
@@ -828,8 +938,7 @@ async fn login_with_wechat_qr() -> Result<String> {
         "scan the QR code below with WeChat and confirm login",
     );
 
-    let qr_modules = wechat_qr_modules_from_image(&qrcode)?;
-    print_wechat_qr_modules(&qr_modules)?;
+    qr::print(&qrcode)?;
 
     let code = match poll_wechat_qr_code(&client, &uuid).await? {
         WechatQrPollResult::Confirmed(code) => code,
@@ -849,13 +958,13 @@ async fn login_with_wechat_qr() -> Result<String> {
         .context("CAS WeChat callback request failed")?;
     let final_url = response.url().to_string();
 
-    let activated_ticket =
+    let activated_cookie =
         activate_webvpn_fingerprint_if_needed(&client, &cookie_jar, &final_url).await?;
-    let post_login_ticket = ticket_cookie_from_jar(&cookie_jar);
-    let cookie = activated_ticket
-        .or(post_login_ticket)
-        .or(login_entry.ticket_cookie)
-        .context("WeChat login completed but WebVPN ticket cookie was not found")?;
+    let post_login_cookie = webvpn_cookie_header_from_jar(&cookie_jar);
+    let cookie = activated_cookie
+        .or(post_login_cookie)
+        .or(login_entry.cookie_header)
+        .context("WeChat login completed but WebVPN cookie header was not found")?;
 
     log_success("client", "WeChat QR login completed");
     Ok(cookie)
@@ -970,14 +1079,14 @@ async fn login_with_verification_code(login: VerificationLogin) -> Result<String
     }
     let final_url = final_url.context("CAS login was not accepted")?;
 
-    let activated_ticket =
+    let activated_cookie =
         activate_webvpn_fingerprint_if_needed(&client, &cookie_jar, &final_url).await?;
-    let post_login_ticket = ticket_cookie_from_jar(&cookie_jar);
+    let post_login_cookie = webvpn_cookie_header_from_jar(&cookie_jar);
 
-    let cookie = activated_ticket
-        .or(post_login_ticket)
-        .or(login_entry.ticket_cookie)
-        .context("login completed but WebVPN ticket cookie was not found")?;
+    let cookie = activated_cookie
+        .or(post_login_cookie)
+        .or(login_entry.cookie_header)
+        .context("login completed but WebVPN cookie header was not found")?;
     log_success("client", "verification login completed");
     Ok(cookie)
 }
@@ -1008,8 +1117,12 @@ async fn initialize_webvpn_ticket_cookie(
         final_url = response.url().to_string();
     }
 
-    let ticket_cookie = ticket_cookie_from_jar(cookie_jar);
-    if ticket_cookie.is_some() {
+    let cookie_header = webvpn_cookie_header_from_jar(cookie_jar);
+    if cookie_header
+        .as_deref()
+        .and_then(ticket_cookie_from_header)
+        .is_some()
+    {
         log_info("client", "WebVPN ticket cookie initialized");
     } else {
         log_warn(
@@ -1025,7 +1138,7 @@ async fn initialize_webvpn_ticket_cookie(
     };
 
     Ok(WebVpnLoginEntry {
-        ticket_cookie,
+        cookie_header,
         cas_login_url,
     })
 }
@@ -1142,152 +1255,6 @@ async fn poll_wechat_qr_code(client: &Client, uuid: &str) -> Result<WechatQrPoll
     anyhow::bail!("timed out waiting for WeChat QR login")
 }
 
-fn wechat_qr_modules_from_image(bytes: &[u8]) -> Result<Vec<bool>> {
-    let image = image::load_from_memory(bytes)
-        .context("failed to decode WeChat QR image")?
-        .to_luma8();
-    sample_wechat_qr_modules(&image).context("failed to sample WeChat QR modules")
-}
-
-fn print_wechat_qr_modules(modules: &[bool]) -> Result<()> {
-    let output_size = WECHAT_QR_MODULES + TERMINAL_QR_QUIET_ZONE * 2;
-
-    println!();
-    for y in (0..output_size).step_by(2) {
-        for x in 0..output_size {
-            let top_dark = rendered_qr_module_dark(modules, x, y, output_size);
-            let bottom_dark =
-                y + 1 < output_size && rendered_qr_module_dark(modules, x, y + 1, output_size);
-            print_qr_half_block(top_dark, bottom_dark, x, y);
-        }
-        println!("\x1b[0m");
-    }
-    println!("\x1b[0m");
-    io::stdout().flush().context("failed to flush QR code")?;
-    Ok(())
-}
-
-fn sample_wechat_qr_modules(image: &GrayImage) -> Option<Vec<bool>> {
-    let required_size = WECHAT_QR_BORDER_PX * 2 + WECHAT_QR_MODULES * WECHAT_QR_MODULE_PX;
-    if image.width() < required_size || image.height() < required_size {
-        return None;
-    }
-
-    let mut modules = Vec::with_capacity((WECHAT_QR_MODULES * WECHAT_QR_MODULES) as usize);
-
-    for row in 0..WECHAT_QR_MODULES {
-        for col in 0..WECHAT_QR_MODULES {
-            let x = WECHAT_QR_BORDER_PX + col * WECHAT_QR_MODULE_PX + WECHAT_QR_MODULE_PX / 2;
-            let y = WECHAT_QR_BORDER_PX + row * WECHAT_QR_MODULE_PX + WECHAT_QR_MODULE_PX / 2;
-            modules.push(image.get_pixel(x, y)[0] < QR_DARK_THRESHOLD);
-        }
-    }
-
-    Some(modules)
-}
-
-fn rendered_qr_module_dark(modules: &[bool], x: u32, y: u32, output_size: u32) -> bool {
-    if x < TERMINAL_QR_QUIET_ZONE
-        || y < TERMINAL_QR_QUIET_ZONE
-        || x >= output_size - TERMINAL_QR_QUIET_ZONE
-        || y >= output_size - TERMINAL_QR_QUIET_ZONE
-    {
-        return false;
-    }
-
-    let x = x - TERMINAL_QR_QUIET_ZONE;
-    let y = y - TERMINAL_QR_QUIET_ZONE;
-    let index = (y * WECHAT_QR_MODULES + x) as usize;
-    modules.get(index).copied().unwrap_or(false)
-}
-
-#[derive(Clone, Copy)]
-struct Rgb {
-    red: u8,
-    green: u8,
-    blue: u8,
-}
-
-impl Rgb {
-    const fn new(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
-    }
-}
-
-fn print_qr_half_block(top_dark: bool, bottom_dark: bool, x: u32, y: u32) {
-    let foreground = qr_module_color(top_dark, x, y);
-    let background = qr_module_color(bottom_dark, x, y + 1);
-
-    print!(
-        "\x1b[38;2;{};{};{};48;2;{};{};{}m\u{2580}",
-        foreground.red,
-        foreground.green,
-        foreground.blue,
-        background.red,
-        background.green,
-        background.blue
-    );
-}
-
-fn qr_module_color(dark: bool, x: u32, y: u32) -> Rgb {
-    if !dark {
-        return Rgb::new(250, 248, 239);
-    }
-
-    const AURORA: [Rgb; 7] = [
-        Rgb::new(239, 90, 91),
-        Rgb::new(232, 119, 49),
-        Rgb::new(225, 181, 64),
-        Rgb::new(72, 164, 89),
-        Rgb::new(24, 164, 174),
-        Rgb::new(54, 111, 199),
-        Rgb::new(239, 90, 91),
-    ];
-
-    let diagonal = (x + y).saturating_sub(TERMINAL_QR_QUIET_ZONE * 2);
-    let span = (WECHAT_QR_MODULES - 1) * 2;
-    let scaled = diagonal * ((AURORA.len() - 1) as u32) * 256 / span.max(1);
-    let index = (scaled / 256).min((AURORA.len() - 1) as u32) as usize;
-    let next_index = (index + 1).min(AURORA.len() - 1);
-    let amount = smoothstep_byte((scaled % 256) as u8);
-    let hue_shift = ((x * 13 + y * 7 + diagonal * 5) % 17) as i16 - 8;
-    let shifted_amount = offset_byte(amount, hue_shift);
-    let color = blend_rgb(AURORA[index], AURORA[next_index], shifted_amount);
-    let shimmer = 82 + ((x * 17 + y * 11 + diagonal * 3) % 19) as u8;
-
-    scale_rgb(color, shimmer)
-}
-
-fn blend_rgb(start: Rgb, end: Rgb, amount: u8) -> Rgb {
-    let amount = u16::from(amount);
-    let inverse = 255 - amount;
-
-    Rgb::new(
-        (((u16::from(start.red) * inverse) + (u16::from(end.red) * amount)) / 255) as u8,
-        (((u16::from(start.green) * inverse) + (u16::from(end.green) * amount)) / 255) as u8,
-        (((u16::from(start.blue) * inverse) + (u16::from(end.blue) * amount)) / 255) as u8,
-    )
-}
-
-fn smoothstep_byte(value: u8) -> u8 {
-    let value = u16::from(value);
-    ((value * value * (765 - 2 * value)) / (255 * 255)) as u8
-}
-
-fn offset_byte(value: u8, offset: i16) -> u8 {
-    (i16::from(value) + offset).clamp(0, 255) as u8
-}
-
-fn scale_rgb(color: Rgb, percent: u8) -> Rgb {
-    let percent = u16::from(percent);
-
-    Rgb::new(
-        ((u16::from(color.red) * percent) / 100) as u8,
-        ((u16::from(color.green) * percent) / 100) as u8,
-        ((u16::from(color.blue) * percent) / 100) as u8,
-    )
-}
-
 fn extract_wechat_uuid(html: &str) -> Option<String> {
     extract_js_string_assignment(html, "G")
         .or_else(|| extract_token_after(html, "uuid="))
@@ -1398,14 +1365,33 @@ fn prompt_verification_code(label: &str) -> Result<String> {
     Ok(code.to_string())
 }
 
-fn ticket_cookie_from_jar(cookie_jar: &reqwest::cookie::Jar) -> Option<String> {
+fn webvpn_cookie_header_from_jar(cookie_jar: &reqwest::cookie::Jar) -> Option<String> {
     let url = Url::parse("https://webvpn.szut.edu.cn/").ok()?;
-    let header = cookie_jar.cookies(&url)?.to_str().ok()?.to_string();
+    let header = cookie_jar.cookies(&url)?.to_str().ok()?.trim().to_string();
+    if header.is_empty() {
+        None
+    } else {
+        Some(header)
+    }
+}
+
+fn seed_webvpn_cookie_jar(cookie_jar: &reqwest::cookie::Jar, header: &str) {
+    let url = Url::parse("https://webvpn.szut.edu.cn/")
+        .expect("static WebVPN cookie jar URL must be valid");
+    for cookie in header
+        .split(';')
+        .map(str::trim)
+        .filter(|cookie| !cookie.is_empty())
+    {
+        cookie_jar.add_cookie_str(cookie, &url);
+    }
+}
+
+fn ticket_cookie_from_header(header: &str) -> Option<&str> {
     header
         .split(';')
         .map(str::trim)
         .find(|cookie| cookie.starts_with(&format!("{WEBVPN_TICKET_COOKIE_NAME}=")))
-        .map(str::to_string)
 }
 
 async fn activate_webvpn_fingerprint_if_needed(
@@ -1430,8 +1416,8 @@ async fn activate_webvpn_fingerprint_if_needed(
 
     let final_activation_url = response.url().to_string();
     if !is_webvpn_fingerprint_url(&final_activation_url) {
-        return ticket_cookie_from_jar(cookie_jar)
-            .context("WebVPN fingerprint activation completed without ticket cookie")
+        return webvpn_cookie_header_from_jar(cookie_jar)
+            .context("WebVPN fingerprint activation completed without WebVPN cookies")
             .map(Some);
     }
 
@@ -1503,7 +1489,7 @@ fn attr_value(fragment: &str, name: &str) -> Option<String> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: towc <server-ip[:port]> [--target <port>] [--listen <port>] [--login <mobile|email>]"
+        "Usage: towc <server-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [--login <mobile|email>]"
     );
     eprintln!("       server port defaults to {DEFAULT_SERVER_PORT}");
     eprintln!(
@@ -1659,6 +1645,16 @@ mod tests {
     }
 
     #[test]
+    fn detects_ticket_cookie_inside_full_webvpn_cookie_header() {
+        let header = "heartbeat=abc; wengine_vpn_ticketwebvpn_szut_edu_cn=ticket; refresh=xyz";
+
+        assert_eq!(
+            ticket_cookie_from_header(header),
+            Some("wengine_vpn_ticketwebvpn_szut_edu_cn=ticket")
+        );
+    }
+
+    #[test]
     fn extracts_wechat_uuid_and_qrcode_url() {
         let html = r#"
             <img class="js_qrcode_img web_qrcode_img" src="/https/77726476706e69737468656265737421ffe7449269276d59660187e289446d36a8d6/connect/qrcode/041mYvVw0hEq100b?vpn-1"/>
@@ -1670,60 +1666,5 @@ mod tests {
             extract_wechat_qrcode_url(html, "041mYvVw0hEq100b").unwrap(),
             "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421ffe7449269276d59660187e289446d36a8d6/connect/qrcode/041mYvVw0hEq100b?vpn-1"
         );
-    }
-
-    #[test]
-    fn module_sampling_preserves_outer_black_border() {
-        let module_size = WECHAT_QR_MODULE_PX;
-        let border = WECHAT_QR_BORDER_PX;
-        let image_size = border * 2 + WECHAT_QR_MODULES * module_size;
-        let mut image = GrayImage::from_pixel(image_size, image_size, image::Luma([255]));
-        for row in 0..WECHAT_QR_MODULES {
-            for col in 0..WECHAT_QR_MODULES {
-                if row != 0
-                    && row != WECHAT_QR_MODULES - 1
-                    && col != 0
-                    && col != WECHAT_QR_MODULES - 1
-                {
-                    continue;
-                }
-
-                let start_x = border + col * module_size;
-                let start_y = border + row * module_size;
-                for y in start_y..start_y + module_size {
-                    for x in start_x..start_x + module_size {
-                        image.put_pixel(x, y, image::Luma([0]));
-                    }
-                }
-            }
-        }
-        let modules = sample_wechat_qr_modules(&image).unwrap();
-        let output_size = WECHAT_QR_MODULES + TERMINAL_QR_QUIET_ZONE * 2;
-
-        assert!(!rendered_qr_module_dark(&modules, 0, 0, output_size));
-        assert!(rendered_qr_module_dark(
-            &modules,
-            TERMINAL_QR_QUIET_ZONE,
-            TERMINAL_QR_QUIET_ZONE,
-            output_size
-        ));
-        assert!(rendered_qr_module_dark(
-            &modules,
-            output_size - TERMINAL_QR_QUIET_ZONE - 1,
-            TERMINAL_QR_QUIET_ZONE,
-            output_size
-        ));
-        assert!(rendered_qr_module_dark(
-            &modules,
-            TERMINAL_QR_QUIET_ZONE,
-            output_size - TERMINAL_QR_QUIET_ZONE - 1,
-            output_size
-        ));
-        assert!(!rendered_qr_module_dark(
-            &modules,
-            TERMINAL_QR_QUIET_ZONE + 1,
-            TERMINAL_QR_QUIET_ZONE + 1,
-            output_size
-        ));
     }
 }
