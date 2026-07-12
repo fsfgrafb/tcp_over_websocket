@@ -85,7 +85,6 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
 
     let (mut websocket, path) = accept_websocket_with_path(stream).await?;
     if path == WEBVPN_KEEPALIVE_PATH {
-        log_info("server", "WebVPN keepalive connected");
         return run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Server).await;
     }
 

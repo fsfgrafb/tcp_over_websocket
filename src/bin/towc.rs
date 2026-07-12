@@ -150,7 +150,7 @@ impl ReadinessFailure {
                 format!(
                     "phase: WebVPN rejected the tunnel before tows accepted WebSocket; server={server_addr}; location={location}"
                 ),
-                "likely cause: tows is not running/reachable, server address or port is wrong, firewall blocked it, or WebVPN cannot route to it".to_string(),
+                "likely cause: tows is not running/reachable, tows address or port is wrong, firewall blocked it, or WebVPN cannot route to it".to_string(),
                 "check: start tows on the target host and verify the configured server port is reachable through WebVPN".to_string(),
             ],
             Self::TargetConnectFailed { reason } => vec![
@@ -312,12 +312,9 @@ async fn maintain_webvpn_keepalive(url: String, cookie: String) {
     loop {
         match connect_websocket(&url, &cookie).await {
             Ok(websocket) => {
-                log_info("client", "WebVPN keepalive connected");
                 match run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Client).await {
-                    Ok(()) => log_warn("client", "WebVPN keepalive disconnected; reconnecting"),
-                    Err(err) => {
-                        log_warn("client", format!("WebVPN keepalive failed: {err:#}"));
-                    }
+                    Ok(()) => {}
+                    Err(_) => {}
                 }
             }
             Err(ConnectFailure::CookieExpired { location }) => {
@@ -329,15 +326,8 @@ async fn maintain_webvpn_keepalive(url: String, cookie: String) {
                 );
                 std::process::exit(1);
             }
-            Err(ConnectFailure::WebVpnFailed { location }) => {
-                log_warn(
-                    "client",
-                    format!("WebVPN keepalive endpoint failed; reconnecting: {location}"),
-                );
-            }
-            Err(ConnectFailure::Other(err)) => {
-                log_warn("client", format!("WebVPN keepalive open failed: {err:#}"));
-            }
+            Err(ConnectFailure::WebVpnFailed { .. }) => {}
+            Err(ConnectFailure::Other(_)) => {}
         }
 
         tokio::time::sleep(Duration::from_secs(WEBVPN_KEEPALIVE_RECONNECT_SECS)).await;
@@ -440,9 +430,7 @@ fn is_help_arg(value: &str) -> bool {
 }
 
 fn prompt_client_config() -> Result<ClientConfig> {
-    let server = prompt_required(&format!(
-        "tows server <server-ip[:port]> (port default: {DEFAULT_SERVER_PORT}): "
-    ))?;
+    let server = prompt_required("tows address <ip[:port]>: ")?;
     let target = prompt_optional(&format!("target port (default: {DEFAULT_TARGET_PORT}): "))?;
     let listen_addr = prompt_optional(&format!(
         "listen port (default: {DEFAULT_LOCAL_LISTEN_PORT}): "
@@ -619,10 +607,7 @@ async fn wait_for_webvpn_ready(
     target_addr: &str,
 ) -> Result<()> {
     let mut failures = Vec::new();
-    log_info(
-        "client",
-        format!("checking WebVPN tunnel readiness ({WEBVPN_READY_ATTEMPTS} attempts)"),
-    );
+    log_info("client", "checking WebVPN tunnel readiness");
 
     for attempt in 1..=WEBVPN_READY_ATTEMPTS {
         match probe_webvpn_ready(url, cookie).await {
@@ -852,10 +837,8 @@ async fn login_with_wechat_qr() -> Result<String> {
             anyhow::bail!("WeChat QR code expired; please restart towc and scan again");
         }
     };
-    log_info(
-        "client",
-        "WeChat confirmed login; completing WebVPN authentication",
-    );
+    log_success("client", "WeChat confirmed login");
+    log_info("client", "completing WebVPN authentication");
     let response = client
         .get(wechat_cas_callback_url(&code)?)
         .header(USER_AGENT, BROWSER_USER_AGENT)
