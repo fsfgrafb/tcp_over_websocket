@@ -20,13 +20,15 @@ use tcp_over_websocket::{
 };
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 #[path = "towc/qr.rs"]
 mod qr;
 
 const WEBVPN_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/login";
-const WEBVPN_TICKET_COOKIE_NAME: &str = "wengine_vpn_ticketwebvpn_szut_edu_cn";
+const WEBVPN_TICKET_COOKIE_PREFIX: &str = "wengine_vpn_ticketwebvpn_szut_edu_cn=";
 const WEBVPN_CAS_HASH: &str = "77726476706e69737468656265737421f3f652d2342a7d44300d8db9d6562d";
 const WEBVPN_CAS_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421f3f652d2342a7d44300d8db9d6562d/cas/login?service=https%3A%2F%2Fwebvpn.szut.edu.cn%2Flogin%3Fcas_login%3Dtrue";
 const WEBVPN_WECHAT_HASH: &str =
@@ -38,7 +40,7 @@ const WEBVPN_FINGERPRINT: &str = "5a0b00fe6ae8277a4bfadd4e103f6e1c";
 const WEBVPN_READY_ATTEMPTS: usize = 6;
 const WEBVPN_READY_SETTLE_MS: u64 = 700;
 const WEBVPN_READY_TIMEOUT_MS: u64 = 900;
-const COOKIE_CACHE_PROBE_TIMEOUT_SECS: u64 = 8;
+const CACHED_LOGIN_TIMEOUT_SECS: u64 = 8;
 const WEBVPN_KEEPALIVE_RECONNECT_SECS: u64 = 5;
 const WEBVPN_COOKIE_REFRESH_INTERVAL_SECS: u64 = 180;
 const WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS: u64 = 8;
@@ -67,6 +69,45 @@ struct ClientConfig {
     target: Option<String>,
     listen_addr: String,
     login: Option<VerificationLogin>,
+}
+
+struct InteractiveForwardingConfig {
+    target: Option<String>,
+    listen_addr: String,
+}
+
+type WebVpnClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct CachedWebVpnLogin {
+    cookie: String,
+    keepalive_websocket: Option<WebVpnClientWebSocket>,
+}
+
+struct WebVpnSession {
+    cookie: Arc<Mutex<String>>,
+    keepalive_task: tokio::task::JoinHandle<()>,
+    cookie_refresh_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WebVpnSession {
+    fn drop(&mut self) {
+        self.keepalive_task.abort();
+        self.cookie_refresh_task.abort();
+    }
+}
+
+enum LoginFallback {
+    Interactive,
+    Configured(Option<VerificationLogin>),
+}
+
+impl LoginFallback {
+    fn resolve(self) -> Result<Option<VerificationLogin>> {
+        match self {
+            Self::Interactive => prompt_login_identity(),
+            Self::Configured(login) => Ok(login),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -216,23 +257,27 @@ async fn run() -> Result<()> {
         .expect("failed to install rustls ring crypto provider");
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let config = match parse_args(&raw_args)? {
+    let parsed_args = parse_args(&raw_args)?;
+    let (config, session) = match parsed_args {
         ParsedArgs::Help => {
             print_usage();
             return Ok(());
         }
-        ParsedArgs::Interactive => prompt_client_config()?,
-        ParsedArgs::Run(config) => config,
+        ParsedArgs::Interactive => prepare_interactive_startup().await?,
+        ParsedArgs::Run(mut config) => {
+            let keepalive_url = build_webvpn_keepalive_ws_url(&config.server)?;
+            let fallback = LoginFallback::Configured(config.login.take());
+            let session = start_webvpn_session(keepalive_url, fallback).await?;
+            (config, session)
+        }
     };
 
     let url = build_webvpn_ws_url(&config.server, config.target.as_deref())?;
-    let keepalive_url = build_webvpn_keepalive_ws_url(&config.server)?;
     let server_addr = normalize_server_addr(&config.server)?;
     let target_addr = normalize_tcp_target_arg(config.target.as_deref())?;
     let listen_addr =
         parse_socket_addr_with_default_host(&config.listen_addr, DEFAULT_TARGET_HOST)?;
-    let cookie = resolve_cookie(&url, &server_addr, &target_addr, config.login).await?;
-    let cookie = Arc::new(Mutex::new(cookie));
+    wait_for_webvpn_ready(&url, &session.cookie, &server_addr, &target_addr).await?;
 
     let listener = TcpListener::bind(listen_addr)
         .await
@@ -242,9 +287,7 @@ async fn run() -> Result<()> {
         "client",
         format!("ready: {listen_addr} -> {webvpn_endpoint} -> {server_addr} -> {target_addr}"),
     );
-    log_info("client", "starting WebVPN keepalive websocket");
-    let _keepalive_task = spawn_webvpn_keepalive(keepalive_url, Arc::clone(&cookie));
-    let _cookie_refresh_task = spawn_webvpn_cookie_refresh(Arc::clone(&cookie));
+    let cookie = Arc::clone(&session.cookie);
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -254,10 +297,10 @@ async fn run() -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, peer_addr) = accepted.context("failed to accept local tcp connection")?;
                 let url = url.clone();
-                let cookie = current_cookie(&cookie);
+                let cookie = Arc::clone(&cookie);
 
                 tokio::spawn(async move {
-                    log_info("client", format!("tcp {peer_addr} connected"));
+                    log_success("client", format!("tcp {peer_addr} connected"));
                     match handle_local_connection(stream, &url, &cookie).await {
                         Ok(()) => {
                             log_info("client", format!("tcp {peer_addr} closed"));
@@ -294,15 +337,73 @@ async fn run() -> Result<()> {
     }
 }
 
+async fn prepare_interactive_startup() -> Result<(ClientConfig, WebVpnSession)> {
+    let server = prompt_required("tows address <ip[:port]>: ")?;
+    let keepalive_url = build_webvpn_keepalive_ws_url(&server)?;
+    let session = start_webvpn_session(keepalive_url, LoginFallback::Interactive).await?;
+    let forwarding = prompt_interactive_forwarding_config().await?;
+
+    Ok((
+        ClientConfig {
+            server,
+            target: forwarding.target,
+            listen_addr: forwarding.listen_addr,
+            login: None,
+        },
+        session,
+    ))
+}
+
+async fn prompt_interactive_forwarding_config() -> Result<InteractiveForwardingConfig> {
+    tokio::task::spawn_blocking(prompt_interactive_forwarding_config_blocking)
+        .await
+        .context("interactive forwarding parameter task failed")?
+}
+
+fn prompt_interactive_forwarding_config_blocking() -> Result<InteractiveForwardingConfig> {
+    let target = prompt_optional(&format!(
+        "target address/port (default: {DEFAULT_TARGET_PORT}): "
+    ))?;
+    let listen_addr = prompt_optional(&format!(
+        "listen address/port (default: {DEFAULT_LOCAL_LISTEN_PORT}): "
+    ))?
+    .unwrap_or_else(|| DEFAULT_LOCAL_LISTEN_ADDR.to_string());
+
+    Ok(InteractiveForwardingConfig {
+        target,
+        listen_addr,
+    })
+}
+
 async fn handle_local_connection(
     stream: TcpStream,
     url: &str,
-    cookie: &str,
+    cookie: &Arc<Mutex<String>>,
 ) -> std::result::Result<(), ConnectFailure> {
-    let websocket = connect_websocket(url, cookie).await?;
+    let websocket = connect_websocket_with_current_cookie(url, cookie).await?;
     relay_stream(websocket, stream, WebVpnHeartbeatRole::Client)
         .await
         .map_err(ConnectFailure::Other)
+}
+
+async fn connect_websocket_with_current_cookie(
+    url: &str,
+    cookie: &Arc<Mutex<String>>,
+) -> std::result::Result<WebVpnClientWebSocket, ConnectFailure> {
+    loop {
+        let cookie_snapshot = current_cookie(cookie);
+        match connect_websocket(url, &cookie_snapshot).await {
+            Err(ConnectFailure::CookieExpired { .. })
+                if current_cookie(cookie) != cookie_snapshot =>
+            {
+                log_info(
+                    "client",
+                    "WebVPN cookie changed while opening a connection; retrying with the refreshed cookie",
+                );
+            }
+            result => return result,
+        }
+    }
 }
 
 fn current_cookie(cookie: &Arc<Mutex<String>>) -> String {
@@ -313,18 +414,31 @@ fn replace_current_cookie(cookie: &Arc<Mutex<String>>, value: String) {
     *cookie.lock().expect("WebVPN cookie mutex poisoned") = value;
 }
 
-fn spawn_webvpn_keepalive(url: String, cookie: Arc<Mutex<String>>) -> tokio::task::JoinHandle<()> {
+fn spawn_webvpn_keepalive(
+    url: String,
+    cookie: Arc<Mutex<String>>,
+    initial_websocket: Option<WebVpnClientWebSocket>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        maintain_webvpn_keepalive(url, cookie).await;
+        maintain_webvpn_keepalive(url, cookie, initial_websocket).await;
     })
 }
 
-async fn maintain_webvpn_keepalive(url: String, cookie: Arc<Mutex<String>>) {
+async fn maintain_webvpn_keepalive(
+    url: String,
+    cookie: Arc<Mutex<String>>,
+    mut initial_websocket: Option<WebVpnClientWebSocket>,
+) {
     loop {
-        let cookie_snapshot = current_cookie(&cookie);
-        match connect_websocket(&url, &cookie_snapshot).await {
+        let connection = if let Some(websocket) = initial_websocket.take() {
+            Ok(websocket)
+        } else {
+            connect_websocket_with_current_cookie(&url, &cookie).await
+        };
+
+        match connection {
             Ok(websocket) => {
-                log_info("client", "WebVPN keepalive connected");
+                log_success("client", "WebVPN keepalive connected");
                 match run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Client).await {
                     Ok(()) => log_warn("client", "WebVPN keepalive disconnected; reconnecting"),
                     Err(err) => log_warn("client", format!("WebVPN keepalive failed: {err:#}")),
@@ -537,25 +651,19 @@ fn is_help_arg(value: &str) -> bool {
     value == "--help" || value == "-h"
 }
 
-fn prompt_client_config() -> Result<ClientConfig> {
-    let server = prompt_required("tows address <ip[:port]>: ")?;
-    let target = prompt_optional(&format!(
-        "target address/port (default: {DEFAULT_TARGET_PORT}): "
-    ))?;
-    let listen_addr = prompt_optional(&format!(
-        "listen address/port (default: {DEFAULT_LOCAL_LISTEN_PORT}): "
-    ))?
-    .unwrap_or_else(|| DEFAULT_LOCAL_LISTEN_ADDR.to_string());
-    let login = prompt_optional("login mobile/email (default: WeChat QR): ")?
-        .map(|value| parse_login_identity(&value))
-        .transpose()?;
+fn prompt_login_identity() -> Result<Option<VerificationLogin>> {
+    loop {
+        let Some(value) =
+            prompt_optional("login method: enter mobile/email, or press Enter for WeChat QR: ")?
+        else {
+            return Ok(None);
+        };
 
-    Ok(ClientConfig {
-        server,
-        target,
-        listen_addr,
-        login,
-    })
+        match parse_login_identity(&value) {
+            Ok(login) => return Ok(Some(login)),
+            Err(err) => log_warn("input", err.to_string()),
+        }
+    }
 }
 
 fn prompt_required(prompt: &str) -> Result<String> {
@@ -566,7 +674,7 @@ fn prompt_required(prompt: &str) -> Result<String> {
         if !value.is_empty() {
             return Ok(value);
         }
-        eprintln!("server is required");
+        log_warn("input", "server address is required");
     }
 }
 
@@ -607,41 +715,109 @@ fn parse_login_identity(value: &str) -> Result<VerificationLogin> {
         });
     }
 
-    anyhow::bail!("invalid --login value: use a numeric mobile number or an email address")
+    anyhow::bail!("invalid login value: use a numeric mobile number or an email address")
 }
 
-async fn resolve_cookie(
-    url: &str,
-    server_addr: &str,
-    target_addr: &str,
-    verification_login: Option<VerificationLogin>,
-) -> Result<String> {
-    if let Some(cookie) = read_cached_cookie()
-        && cached_cookie_connects(url, &cookie).await
-    {
-        log_success("client", "using cached WebVPN cookie");
-        return Ok(cookie);
+async fn start_webvpn_session(
+    keepalive_url: String,
+    fallback: LoginFallback,
+) -> Result<WebVpnSession> {
+    let cached_login = try_cached_webvpn_login(&keepalive_url).await?;
+    let (cookie, initial_websocket) = match cached_login {
+        Some(cached_login) => (cached_login.cookie, cached_login.keepalive_websocket),
+        None => {
+            let cookie = match fallback.resolve()? {
+                Some(login) => login_with_verification_code(login).await?,
+                None => login_with_wechat_qr().await?,
+            };
+            if ticket_cookie_from_header(&cookie).is_none() {
+                anyhow::bail!("WebVPN login completed without a ticket cookie");
+            }
+            write_cached_cookie(&cookie);
+            (cookie, None)
+        }
+    };
+
+    let cookie = Arc::new(Mutex::new(cookie));
+    log_info("client", "starting WebVPN keepalive in the background");
+    let keepalive_task =
+        spawn_webvpn_keepalive(keepalive_url, Arc::clone(&cookie), initial_websocket);
+    let cookie_refresh_task = spawn_webvpn_cookie_refresh(Arc::clone(&cookie));
+
+    // Give both background tasks a chance to start before interactive mode
+    // waits for more input on a blocking thread.
+    tokio::task::yield_now().await;
+
+    Ok(WebVpnSession {
+        cookie,
+        keepalive_task,
+        cookie_refresh_task,
+    })
+}
+
+async fn try_cached_webvpn_login(keepalive_url: &str) -> Result<Option<CachedWebVpnLogin>> {
+    let Some(cookie) = read_cached_cookie() else {
+        log_info("client", "no cached WebVPN cookie found; login is required");
+        return Ok(None);
+    };
+
+    if ticket_cookie_from_header(&cookie).is_none() {
+        log_warn(
+            "client",
+            "cached WebVPN cookie has no ticket; login is required",
+        );
+        return Ok(None);
     }
 
-    let header = match verification_login {
-        Some(login) => login_with_verification_code(login).await?,
-        None => login_with_wechat_qr().await?,
-    };
-    wait_for_webvpn_ready(url, &header, server_addr, target_addr).await?;
-    write_cached_cookie(&header);
+    if HeaderValue::from_bytes(cookie.as_bytes()).is_err() {
+        log_warn(
+            "client",
+            "cached WebVPN cookie is malformed; login is required",
+        );
+        return Ok(None);
+    }
 
-    Ok(header)
-}
-
-async fn cached_cookie_connects(url: &str, cookie: &str) -> bool {
-    matches!(
-        tokio::time::timeout(
-            Duration::from_secs(COOKIE_CACHE_PROBE_TIMEOUT_SECS),
-            probe_webvpn_ready(url, cookie),
-        )
-        .await,
-        Ok(Ok(()))
+    log_info("client", "trying cached WebVPN login");
+    match tokio::time::timeout(
+        Duration::from_secs(CACHED_LOGIN_TIMEOUT_SECS),
+        connect_websocket(keepalive_url, &cookie),
     )
+    .await
+    {
+        Ok(Ok(websocket)) => {
+            log_success("client", "cached WebVPN login succeeded");
+            Ok(Some(CachedWebVpnLogin {
+                cookie,
+                keepalive_websocket: Some(websocket),
+            }))
+        }
+        Ok(Err(ConnectFailure::CookieExpired { location })) => {
+            log_warn(
+                "client",
+                format!("cached WebVPN cookie expired; login is required; location: {location}"),
+            );
+            Ok(None)
+        }
+        Ok(Err(ConnectFailure::WebVpnFailed { location })) => {
+            log_success("client", "cached WebVPN login succeeded");
+            log_warn(
+                "client",
+                format!(
+                    "WebVPN accepted the cached cookie but the keepalive endpoint failed; reconnecting in the background: {location}"
+                ),
+            );
+            Ok(Some(CachedWebVpnLogin {
+                cookie,
+                keepalive_websocket: None,
+            }))
+        }
+        Ok(Err(ConnectFailure::Other(err))) => {
+            Err(err).context("failed to verify cached WebVPN login")
+        }
+        Err(_) => anyhow::bail!(
+            "timed out while verifying cached WebVPN login; check the network and try again"
+        ),
+    }
 }
 
 fn read_cached_cookie() -> Option<String> {
@@ -712,7 +888,7 @@ fn cookie_cache_path() -> Option<PathBuf> {
 
 async fn wait_for_webvpn_ready(
     url: &str,
-    cookie: &str,
+    cookie: &Arc<Mutex<String>>,
     server_addr: &str,
     target_addr: &str,
 ) -> Result<()> {
@@ -722,14 +898,12 @@ async fn wait_for_webvpn_ready(
     for attempt in 1..=WEBVPN_READY_ATTEMPTS {
         match probe_webvpn_ready(url, cookie).await {
             Ok(()) => {
-                if !failures.is_empty() {
-                    log_success(
-                        "client",
-                        format!(
-                            "WebVPN tunnel ready after {attempt}/{WEBVPN_READY_ATTEMPTS} attempts"
-                        ),
-                    );
-                }
+                let message = if failures.is_empty() {
+                    "WebVPN tunnel ready".to_string()
+                } else {
+                    format!("WebVPN tunnel ready after {attempt}/{WEBVPN_READY_ATTEMPTS} attempts")
+                };
+                log_success("client", message);
                 return Ok(());
             }
             Err(failure) => {
@@ -765,11 +939,18 @@ async fn wait_for_webvpn_ready(
         }
     }
 
-    for line in readiness_failure_summary_lines(&failures, server_addr, target_addr) {
-        log_warn("client", line);
+    for (index, line) in readiness_failure_summary_lines(&failures, server_addr, target_addr)
+        .into_iter()
+        .enumerate()
+    {
+        if index == 0 {
+            log_error("client", line);
+        } else {
+            log_warn("client", line);
+        }
     }
 
-    anyhow::bail!("WebVPN tunnel did not become ready after login; see diagnosis above")
+    anyhow::bail!("WebVPN tunnel did not become ready after authentication; see diagnosis above")
 }
 
 fn readiness_failure_kind_changed(failures: &[ReadinessFailure]) -> bool {
@@ -830,8 +1011,11 @@ fn readiness_failure_counts(failures: &[ReadinessFailure]) -> Vec<String> {
         .collect()
 }
 
-async fn probe_webvpn_ready(url: &str, cookie: &str) -> std::result::Result<(), ReadinessFailure> {
-    let mut websocket = connect_websocket(url, cookie)
+async fn probe_webvpn_ready(
+    url: &str,
+    cookie: &Arc<Mutex<String>>,
+) -> std::result::Result<(), ReadinessFailure> {
+    let mut websocket = connect_websocket_with_current_cookie(url, cookie)
         .await
         .map_err(readiness_failure_from_connect_failure)?;
 
@@ -1123,7 +1307,7 @@ async fn initialize_webvpn_ticket_cookie(
         .and_then(ticket_cookie_from_header)
         .is_some()
     {
-        log_info("client", "WebVPN ticket cookie initialized");
+        log_success("client", "WebVPN ticket cookie initialized");
     } else {
         log_warn(
             "client",
@@ -1388,10 +1572,11 @@ fn seed_webvpn_cookie_jar(cookie_jar: &reqwest::cookie::Jar, header: &str) {
 }
 
 fn ticket_cookie_from_header(header: &str) -> Option<&str> {
-    header
-        .split(';')
-        .map(str::trim)
-        .find(|cookie| cookie.starts_with(&format!("{WEBVPN_TICKET_COOKIE_NAME}=")))
+    header.split(';').map(str::trim).find(|cookie| {
+        cookie
+            .strip_prefix(WEBVPN_TICKET_COOKIE_PREFIX)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 async fn activate_webvpn_fingerprint_if_needed(
@@ -1488,16 +1673,19 @@ fn attr_value(fragment: &str, name: &str) -> Option<String> {
 }
 
 fn print_usage() {
-    eprintln!(
-        "Usage: towc <server-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [--login <mobile|email>]"
+    println!(
+        "Usage: towc\n       towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [--login <mobile|email>]"
     );
-    eprintln!("       server port defaults to {DEFAULT_SERVER_PORT}");
-    eprintln!(
+    println!("       server port defaults to {DEFAULT_SERVER_PORT}");
+    println!(
         "       --target defaults to {DEFAULT_TARGET_PORT}; --listen defaults to {DEFAULT_LOCAL_LISTEN_PORT}"
     );
-    eprintln!("       no --login: terminal WeChat QR login; cookies are cached automatically");
-    eprintln!(
-        "       --login sends a verification code by SMS for numeric values, or email when the value contains @"
+    println!(
+        "       cached login is always tried first; --login is used only when the cache is missing, malformed, or expired"
+    );
+    println!("       without cached login or --login, towc uses terminal WeChat QR login");
+    println!(
+        "       --login sends a verification code by SMS for numeric values, or by email when the value contains @"
     );
 }
 
@@ -1652,6 +1840,13 @@ mod tests {
             ticket_cookie_from_header(header),
             Some("wengine_vpn_ticketwebvpn_szut_edu_cn=ticket")
         );
+    }
+
+    #[test]
+    fn rejects_empty_ticket_cookie() {
+        let header = "heartbeat=abc; wengine_vpn_ticketwebvpn_szut_edu_cn=; refresh=xyz";
+
+        assert_eq!(ticket_cookie_from_header(header), None);
     }
 
     #[test]

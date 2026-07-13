@@ -41,6 +41,25 @@ const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl LogLevel {
+    const fn color(self) -> &'static str {
+        match self {
+            Self::Info => CYAN,
+            Self::Success => GREEN,
+            Self::Warning => YELLOW,
+            Self::Error => RED,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ConnectFailure {
     CookieExpired { location: String },
@@ -303,19 +322,27 @@ fn parse_port(value: &str) -> Result<u16> {
 }
 
 pub fn log_info(scope: &str, message: impl AsRef<str>) {
-    eprintln!("{CYAN}[{scope}]{RESET} {}", message.as_ref());
+    log_message(LogLevel::Info, scope, message.as_ref());
 }
 
 pub fn log_success(scope: &str, message: impl AsRef<str>) {
-    eprintln!("{GREEN}[{scope}]{RESET} {}", message.as_ref());
+    log_message(LogLevel::Success, scope, message.as_ref());
 }
 
 pub fn log_warn(scope: &str, message: impl AsRef<str>) {
-    eprintln!("{YELLOW}[{scope}]{RESET} {}", message.as_ref());
+    log_message(LogLevel::Warning, scope, message.as_ref());
 }
 
 pub fn log_error(scope: &str, message: impl AsRef<str>) {
-    eprintln!("{RED}[{scope}]{RESET} {}", message.as_ref());
+    log_message(LogLevel::Error, scope, message.as_ref());
+}
+
+fn log_message(level: LogLevel, scope: &str, message: &str) {
+    eprintln!("{}", format_log_message(level, scope, message));
+}
+
+fn format_log_message(level: LogLevel, scope: &str, message: &str) -> String {
+    format!("{}[{scope}]{RESET} {message}", level.color())
 }
 
 pub async fn relay_stream<S>(
@@ -647,6 +674,26 @@ mod tests {
         assert_eq!(
             encrypted,
             "1aa6cdb463265bdf0927564d3ca7160be772ebcbc71d96eb74c18bb0c2955f361c49be02c908f8387736a845214217e0a6b67c5a8b56caf2bfcec4645b49eecd"
+        );
+    }
+
+    #[test]
+    fn log_levels_color_the_prefix_by_semantics() {
+        assert_eq!(
+            format_log_message(LogLevel::Success, "client", "ready"),
+            "\x1b[32m[client]\x1b[0m ready"
+        );
+        assert_eq!(
+            format_log_message(LogLevel::Info, "client", "starting"),
+            "\x1b[36m[client]\x1b[0m starting"
+        );
+        assert_eq!(
+            format_log_message(LogLevel::Warning, "client", "retrying"),
+            "\x1b[33m[client]\x1b[0m retrying"
+        );
+        assert_eq!(
+            format_log_message(LogLevel::Error, "client", "failed"),
+            "\x1b[31m[client]\x1b[0m failed"
         );
     }
 }

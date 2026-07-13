@@ -75,8 +75,8 @@ async fn run() -> Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("Usage: tows [port]");
-    eprintln!("       default port: {DEFAULT_SERVER_PORT}");
+    println!("Usage: tows [port]");
+    println!("       default port: {DEFAULT_SERVER_PORT}");
 }
 
 async fn handle_connection(stream: TcpStream) -> Result<()> {
@@ -86,7 +86,7 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
 
     let (mut websocket, path) = accept_websocket_with_path(stream).await?;
     if path == WEBVPN_KEEPALIVE_PATH {
-        log_info("server", "WebVPN keepalive connected");
+        log_success("server", "WebVPN keepalive connected");
         return run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Server).await;
     }
 
@@ -108,7 +108,7 @@ async fn handle_connection(stream: TcpStream) -> Result<()> {
             );
         }
     };
-    log_info("server", format!("{path} -> {target_addr}"));
+    log_success("server", format!("{path} -> {target_addr}"));
 
     relay_stream(websocket, target, WebVpnHeartbeatRole::Server).await
 }
