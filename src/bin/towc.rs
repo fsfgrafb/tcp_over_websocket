@@ -19,6 +19,7 @@ use tcp_over_websocket::{
     relay_stream, rsa_encrypt, run_webvpn_heartbeat_websocket,
 };
 use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
@@ -50,6 +51,11 @@ const WECHAT_POLL_ATTEMPTS: usize = 180;
 const WECHAT_POLL_TIMEOUT_SECS: u64 = 35;
 const WECHAT_POLL_SETTLE_MS: u64 = 1800;
 const COOKIE_CACHE_FILE_NAME: &str = "webvpn.cookie";
+const INTERACTIVE_DEFAULTS_CACHE_FILE_NAME: &str = "interactive.defaults";
+const INTERACTIVE_DEFAULTS_CACHE_VERSION: &str = "1";
+const LOGIN_METHOD_PROMPT: &str =
+    "login method (enter mobile/email, or press Enter for WeChat QR): ";
+const WEBVPN_KEEPALIVE_STARTING_MESSAGE: &str = "starting WebVPN keepalive";
 
 #[derive(Debug, PartialEq, Eq)]
 enum VerificationLogin {
@@ -72,7 +78,14 @@ struct ClientConfig {
 }
 
 struct InteractiveForwardingConfig {
-    target: Option<String>,
+    target: String,
+    listen_addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InteractiveDefaults {
+    server: String,
+    target: String,
     listen_addr: String,
 }
 
@@ -267,7 +280,7 @@ async fn run() -> Result<()> {
         ParsedArgs::Run(mut config) => {
             let keepalive_url = build_webvpn_keepalive_ws_url(&config.server)?;
             let fallback = LoginFallback::Configured(config.login.take());
-            let session = start_webvpn_session(keepalive_url, fallback).await?;
+            let session = start_webvpn_session(keepalive_url, fallback, false).await?;
             (config, session)
         }
     };
@@ -338,15 +351,44 @@ async fn run() -> Result<()> {
 }
 
 async fn prepare_interactive_startup() -> Result<(ClientConfig, WebVpnSession)> {
-    let server = prompt_required("tows address <ip[:port]>: ")?;
+    let cached_defaults = read_cached_interactive_defaults();
+    let server = match &cached_defaults {
+        Some(defaults) => prompt_with_default(
+            &format!("tows address <ip[:port]> (default: {}): ", defaults.server),
+            &defaults.server,
+        )?,
+        None => prompt_required("tows address <ip[:port]>: ")?,
+    };
     let keepalive_url = build_webvpn_keepalive_ws_url(&server)?;
-    let session = start_webvpn_session(keepalive_url, LoginFallback::Interactive).await?;
-    let forwarding = prompt_interactive_forwarding_config().await?;
+    log_info(
+        "client",
+        format!("WebVPN location: {}", webvpn_location(&keepalive_url)?),
+    );
+    let session = start_webvpn_session(keepalive_url, LoginFallback::Interactive, true).await?;
+    let built_in_target_default = DEFAULT_TARGET_PORT.to_string();
+    let built_in_listen_default = DEFAULT_LOCAL_LISTEN_PORT.to_string();
+    let target_default = cached_defaults
+        .as_ref()
+        .map(|defaults| defaults.target.as_str())
+        .unwrap_or(&built_in_target_default);
+    let listen_default = cached_defaults
+        .as_ref()
+        .map(|defaults| defaults.listen_addr.as_str())
+        .unwrap_or(&built_in_listen_default);
+    let forwarding = prompt_interactive_forwarding_config(target_default, listen_default).await?;
+
+    let defaults = InteractiveDefaults {
+        server: server.clone(),
+        target: forwarding.target.clone(),
+        listen_addr: forwarding.listen_addr.clone(),
+    };
+    validate_interactive_defaults(&defaults)?;
+    write_cached_interactive_defaults(&defaults);
 
     Ok((
         ClientConfig {
             server,
-            target: forwarding.target,
+            target: Some(forwarding.target),
             listen_addr: forwarding.listen_addr,
             login: None,
         },
@@ -354,20 +396,31 @@ async fn prepare_interactive_startup() -> Result<(ClientConfig, WebVpnSession)> 
     ))
 }
 
-async fn prompt_interactive_forwarding_config() -> Result<InteractiveForwardingConfig> {
-    tokio::task::spawn_blocking(prompt_interactive_forwarding_config_blocking)
-        .await
-        .context("interactive forwarding parameter task failed")?
+async fn prompt_interactive_forwarding_config(
+    target_default: &str,
+    listen_default: &str,
+) -> Result<InteractiveForwardingConfig> {
+    let target_default = target_default.to_string();
+    let listen_default = listen_default.to_string();
+    tokio::task::spawn_blocking(move || {
+        prompt_interactive_forwarding_config_blocking(&target_default, &listen_default)
+    })
+    .await
+    .context("interactive forwarding parameter task failed")?
 }
 
-fn prompt_interactive_forwarding_config_blocking() -> Result<InteractiveForwardingConfig> {
-    let target = prompt_optional(&format!(
-        "target address/port (default: {DEFAULT_TARGET_PORT}): "
-    ))?;
-    let listen_addr = prompt_optional(&format!(
-        "listen address/port (default: {DEFAULT_LOCAL_LISTEN_PORT}): "
-    ))?
-    .unwrap_or_else(|| DEFAULT_LOCAL_LISTEN_ADDR.to_string());
+fn prompt_interactive_forwarding_config_blocking(
+    target_default: &str,
+    listen_default: &str,
+) -> Result<InteractiveForwardingConfig> {
+    let target = prompt_with_default(
+        &format!("target address/port (default: {target_default}): "),
+        target_default,
+    )?;
+    let listen_addr = prompt_with_default(
+        &format!("listen address/port (default: {listen_default}): "),
+        listen_default,
+    )?;
 
     Ok(InteractiveForwardingConfig {
         target,
@@ -418,9 +471,10 @@ fn spawn_webvpn_keepalive(
     url: String,
     cookie: Arc<Mutex<String>>,
     initial_websocket: Option<WebVpnClientWebSocket>,
+    first_connected: oneshot::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        maintain_webvpn_keepalive(url, cookie, initial_websocket).await;
+        maintain_webvpn_keepalive(url, cookie, initial_websocket, first_connected).await;
     })
 }
 
@@ -428,7 +482,9 @@ async fn maintain_webvpn_keepalive(
     url: String,
     cookie: Arc<Mutex<String>>,
     mut initial_websocket: Option<WebVpnClientWebSocket>,
+    first_connected: oneshot::Sender<()>,
 ) {
+    let mut first_connected = Some(first_connected);
     loop {
         let connection = if let Some(websocket) = initial_websocket.take() {
             Ok(websocket)
@@ -439,6 +495,7 @@ async fn maintain_webvpn_keepalive(
         match connection {
             Ok(websocket) => {
                 log_success("client", "WebVPN keepalive connected");
+                notify_first_keepalive_connected(&mut first_connected);
                 match run_webvpn_heartbeat_websocket(websocket, WebVpnHeartbeatRole::Client).await {
                     Ok(()) => log_warn("client", "WebVPN keepalive disconnected; reconnecting"),
                     Err(err) => log_warn("client", format!("WebVPN keepalive failed: {err:#}")),
@@ -465,6 +522,12 @@ async fn maintain_webvpn_keepalive(
         }
 
         tokio::time::sleep(Duration::from_secs(WEBVPN_KEEPALIVE_RECONNECT_SECS)).await;
+    }
+}
+
+fn notify_first_keepalive_connected(first_connected: &mut Option<oneshot::Sender<()>>) {
+    if let Some(first_connected) = first_connected.take() {
+        let _ = first_connected.send(());
     }
 }
 
@@ -653,9 +716,7 @@ fn is_help_arg(value: &str) -> bool {
 
 fn prompt_login_identity() -> Result<Option<VerificationLogin>> {
     loop {
-        let Some(value) =
-            prompt_optional("login method: enter mobile/email, or press Enter for WeChat QR: ")?
-        else {
+        let Some(value) = prompt_optional(LOGIN_METHOD_PROMPT)? else {
             return Ok(None);
         };
 
@@ -682,6 +743,10 @@ fn prompt_optional(prompt: &str) -> Result<Option<String>> {
     Ok(prompt_line(prompt)?.filter(|value| !value.is_empty()))
 }
 
+fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
+    Ok(prompt_optional(prompt)?.unwrap_or_else(|| default.to_string()))
+}
+
 fn prompt_line(prompt: &str) -> Result<Option<String>> {
     print!("{prompt}");
     io::stdout().flush().context("failed to flush prompt")?;
@@ -695,6 +760,13 @@ fn prompt_line(prompt: &str) -> Result<Option<String>> {
     }
 
     Ok(Some(value.trim().to_string()))
+}
+
+fn webvpn_location(url: &str) -> Result<String> {
+    Ok(Url::parse(url)
+        .context("failed to parse generated WebVPN URL")?
+        .path()
+        .to_string())
 }
 
 fn parse_login_identity(value: &str) -> Result<VerificationLogin> {
@@ -721,6 +793,7 @@ fn parse_login_identity(value: &str) -> Result<VerificationLogin> {
 async fn start_webvpn_session(
     keepalive_url: String,
     fallback: LoginFallback,
+    wait_until_keepalive_connected: bool,
 ) -> Result<WebVpnSession> {
     let cached_login = try_cached_webvpn_login(&keepalive_url).await?;
     let (cookie, initial_websocket) = match cached_login {
@@ -739,20 +812,28 @@ async fn start_webvpn_session(
     };
 
     let cookie = Arc::new(Mutex::new(cookie));
-    log_info("client", "starting WebVPN keepalive in the background");
-    let keepalive_task =
-        spawn_webvpn_keepalive(keepalive_url, Arc::clone(&cookie), initial_websocket);
+    log_info("client", WEBVPN_KEEPALIVE_STARTING_MESSAGE);
+    let (first_connected, first_connected_rx) = oneshot::channel();
+    let keepalive_task = spawn_webvpn_keepalive(
+        keepalive_url,
+        Arc::clone(&cookie),
+        initial_websocket,
+        first_connected,
+    );
     let cookie_refresh_task = spawn_webvpn_cookie_refresh(Arc::clone(&cookie));
-
-    // Give both background tasks a chance to start before interactive mode
-    // waits for more input on a blocking thread.
-    tokio::task::yield_now().await;
-
-    Ok(WebVpnSession {
+    let session = WebVpnSession {
         cookie,
         keepalive_task,
         cookie_refresh_task,
-    })
+    };
+
+    if wait_until_keepalive_connected {
+        first_connected_rx
+            .await
+            .context("WebVPN keepalive stopped before its first connection")?;
+    }
+
+    Ok(session)
 }
 
 async fn try_cached_webvpn_login(keepalive_url: &str) -> Result<Option<CachedWebVpnLogin>> {
@@ -791,11 +872,8 @@ async fn try_cached_webvpn_login(keepalive_url: &str) -> Result<Option<CachedWeb
                 keepalive_websocket: Some(websocket),
             }))
         }
-        Ok(Err(ConnectFailure::CookieExpired { location })) => {
-            log_warn(
-                "client",
-                format!("cached WebVPN cookie expired; login is required; location: {location}"),
-            );
+        Ok(Err(ConnectFailure::CookieExpired { .. })) => {
+            log_warn("client", "cached WebVPN cookie expired; login is required");
             Ok(None)
         }
         Ok(Err(ConnectFailure::WebVpnFailed { location })) => {
@@ -803,7 +881,7 @@ async fn try_cached_webvpn_login(keepalive_url: &str) -> Result<Option<CachedWeb
             log_warn(
                 "client",
                 format!(
-                    "WebVPN accepted the cached cookie but the keepalive endpoint failed; reconnecting in the background: {location}"
+                    "WebVPN accepted the cached cookie but the keepalive endpoint failed; reconnecting: {location}"
                 ),
             );
             Ok(Some(CachedWebVpnLogin {
@@ -817,6 +895,115 @@ async fn try_cached_webvpn_login(keepalive_url: &str) -> Result<Option<CachedWeb
         Err(_) => anyhow::bail!(
             "timed out while verifying cached WebVPN login; check the network and try again"
         ),
+    }
+}
+
+fn validate_interactive_defaults(defaults: &InteractiveDefaults) -> Result<()> {
+    normalize_server_addr(&defaults.server).context("invalid tows address")?;
+    normalize_tcp_target_arg(Some(&defaults.target)).context("invalid target address")?;
+    parse_socket_addr_with_default_host(&defaults.listen_addr, DEFAULT_TARGET_HOST)
+        .context("invalid listen address")?;
+    Ok(())
+}
+
+fn format_interactive_defaults(defaults: &InteractiveDefaults) -> String {
+    format!(
+        "version={INTERACTIVE_DEFAULTS_CACHE_VERSION}\nserver={}\ntarget={}\nlisten={}\n",
+        defaults.server, defaults.target, defaults.listen_addr
+    )
+}
+
+fn parse_interactive_defaults(contents: &str) -> Result<InteractiveDefaults> {
+    let mut version = None;
+    let mut server = None;
+    let mut target = None;
+    let mut listen_addr = None;
+
+    for line in contents.lines() {
+        if let Some(value) = line.strip_prefix("version=") {
+            version = Some(value);
+        } else if let Some(value) = line.strip_prefix("server=") {
+            server = Some(value);
+        } else if let Some(value) = line.strip_prefix("target=") {
+            target = Some(value);
+        } else if let Some(value) = line.strip_prefix("listen=") {
+            listen_addr = Some(value);
+        }
+    }
+
+    if version != Some(INTERACTIVE_DEFAULTS_CACHE_VERSION) {
+        anyhow::bail!("unsupported interactive defaults cache version");
+    }
+
+    let required_value = |value: Option<&str>, name: &str| -> Result<String> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .with_context(|| format!("missing {name} in interactive defaults cache"))
+    };
+    let defaults = InteractiveDefaults {
+        server: required_value(server, "server")?,
+        target: required_value(target, "target")?,
+        listen_addr: required_value(listen_addr, "listen")?,
+    };
+    validate_interactive_defaults(&defaults).context("invalid interactive defaults cache")?;
+    Ok(defaults)
+}
+
+fn read_cached_interactive_defaults() -> Option<InteractiveDefaults> {
+    let path = interactive_defaults_cache_path()?;
+    match fs::read_to_string(&path) {
+        Ok(contents) => match parse_interactive_defaults(&contents) {
+            Ok(defaults) => Some(defaults),
+            Err(err) => {
+                log_warn(
+                    "client",
+                    format!(
+                        "cached interactive defaults are invalid; using built-in defaults: {err:#}"
+                    ),
+                );
+                None
+            }
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            log_warn(
+                "client",
+                format!("failed to read cached interactive defaults: {err}"),
+            );
+            None
+        }
+    }
+}
+
+fn write_cached_interactive_defaults(defaults: &InteractiveDefaults) {
+    let Some(path) = interactive_defaults_cache_path() else {
+        log_warn(
+            "client",
+            "failed to locate interactive defaults cache directory",
+        );
+        return;
+    };
+
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        log_warn(
+            "client",
+            format!("failed to create interactive defaults cache directory: {err}"),
+        );
+        return;
+    }
+
+    if let Err(err) = fs::write(&path, format_interactive_defaults(defaults)) {
+        log_warn(
+            "client",
+            format!(
+                "failed to write interactive defaults cache at {}: {err}",
+                path.display()
+            ),
+        );
     }
 }
 
@@ -870,20 +1057,28 @@ fn write_cached_cookie(cookie: &str) {
 }
 
 #[cfg(windows)]
-fn cookie_cache_path() -> Option<PathBuf> {
+fn cache_file_path(file_name: &str) -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
-        .map(|path| path.join("tcp_over_websocket").join(COOKIE_CACHE_FILE_NAME))
+        .map(|path| path.join("tcp_over_websocket").join(file_name))
 }
 
 #[cfg(not(windows))]
-fn cookie_cache_path() -> Option<PathBuf> {
+fn cache_file_path(file_name: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
 
-    Some(base.join("tcp_over_websocket").join(COOKIE_CACHE_FILE_NAME))
+    Some(base.join("tcp_over_websocket").join(file_name))
+}
+
+fn cookie_cache_path() -> Option<PathBuf> {
+    cache_file_path(COOKIE_CACHE_FILE_NAME)
+}
+
+fn interactive_defaults_cache_path() -> Option<PathBuf> {
+    cache_file_path(INTERACTIVE_DEFAULTS_CACHE_FILE_NAME)
 }
 
 async fn wait_for_webvpn_ready(
@@ -1861,5 +2056,83 @@ mod tests {
             extract_wechat_qrcode_url(html, "041mYvVw0hEq100b").unwrap(),
             "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421ffe7449269276d59660187e289446d36a8d6/connect/qrcode/041mYvVw0hEq100b?vpn-1"
         );
+    }
+
+    #[test]
+    fn interactive_defaults_cache_round_trips_all_addresses() {
+        let defaults = InteractiveDefaults {
+            server: "192.0.2.10:54489".to_string(),
+            target: "10.0.0.8:3389".to_string(),
+            listen_addr: "127.0.0.1:13389".to_string(),
+        };
+
+        assert_eq!(
+            parse_interactive_defaults(&format_interactive_defaults(&defaults)).unwrap(),
+            defaults
+        );
+    }
+
+    #[test]
+    fn invalid_interactive_defaults_cache_is_rejected() {
+        assert!(
+            parse_interactive_defaults("version=2\nserver=192.0.2.10\ntarget=22\nlisten=14489\n")
+                .is_err()
+        );
+        assert!(parse_interactive_defaults("version=1\nserver=192.0.2.10\ntarget=22\n").is_err());
+        assert!(
+            parse_interactive_defaults("version=1\nserver=192.0.2.10:0\ntarget=22\nlisten=14489\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn interactive_defaults_cache_accepts_built_in_port_shorthand() {
+        assert_eq!(
+            parse_interactive_defaults("version=1\nserver=192.0.2.10\ntarget=22\nlisten=14489\n")
+                .unwrap(),
+            InteractiveDefaults {
+                server: "192.0.2.10".to_string(),
+                target: "22".to_string(),
+                listen_addr: "14489".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn generated_webvpn_location_exposes_encoded_tows_address() {
+        let url = build_webvpn_keepalive_ws_url("192.0.2.10:4489").unwrap();
+        let location = webvpn_location(&url).unwrap();
+
+        assert!(location.starts_with("/ws-4489/77726476706e69737468656265737421"));
+        assert!(location.ends_with("/webvpn-keepalive"));
+    }
+
+    #[test]
+    fn interactive_messages_use_consistent_prompt_style() {
+        assert_eq!(LOGIN_METHOD_PROMPT.matches(':').count(), 1);
+        assert_eq!(
+            LOGIN_METHOD_PROMPT,
+            "login method (enter mobile/email, or press Enter for WeChat QR): "
+        );
+        assert_eq!(
+            WEBVPN_KEEPALIVE_STARTING_MESSAGE,
+            "starting WebVPN keepalive"
+        );
+        assert!(!WEBVPN_KEEPALIVE_STARTING_MESSAGE.contains("background"));
+    }
+
+    #[tokio::test]
+    async fn first_keepalive_connection_notifies_the_interactive_gate_once() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut sender = Some(sender);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        notify_first_keepalive_connected(&mut sender);
+
+        receiver.await.unwrap();
+        assert!(sender.is_none());
     }
 }
