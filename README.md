@@ -29,7 +29,7 @@ ssh -p 14489 user@localhost
 towc <tows-ip> --target 3389 --listen 13389
 ```
 
-不带参数运行 `towc` 会进入交互模式。客户端读取 `tows` 地址后立即输出对应的 WebVPN location，随即尝试缓存认证；成功时跳过登录方式。缓存缺失、格式无效或明确过期时才询问登录方式：输入手机号/邮箱使用验证码，或直接回车使用终端微信扫码。认证完成后客户端启动 WebSocket 保活，并等到首次保活连接成功、输出连接成功日志后才询问目标地址和本地监听地址。新登录取得的 Cookie 会立即写入本地缓存。网络或 TLS 故障无法证明 Cookie 已失效，此时客户端会保留缓存并直接报告连接错误。
+不带参数运行 `towc` 会进入交互模式。程序先依次读取 `tows`、目标和本地监听地址，参数确认并缓存后自动尝试已有 Cookie。仅当缓存缺失、格式无效或明确过期时，才询问登录方式：输入手机号/邮箱使用验证码，或直接回车使用终端微信扫码。新登录取得的 Cookie 会立即写入本地缓存。登录会话只依赖 WebVPN 门户，不要求 `tows` 已经可达；隧道启动后再独立检查 `tows` 和目标服务。
 
 交互模式会把本次实际采用的 `tows`、目标和本地监听地址分别缓存；下次启动时，这三个值会显示为新的默认选项，直接回车即可复用。此配置缓存与 WebVPN Cookie 缓存相互独立。
 
@@ -49,20 +49,67 @@ towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [-
 - `tows` 端口默认 `4489`。
 - 目标地址默认 `127.0.0.1:22`。
 - 本地监听地址默认 `127.0.0.1:14489`。
-- 交互模式首次运行时 `tows` 地址必填，目标和监听端口使用内置默认值；已有交互缓存时，三项提示中的默认值会替换为上次采用的值。
+- 交互模式首次运行时 `tows` 地址必填，目标和监听端口使用内置默认值；已有交互缓存时，三项提示中的默认值会替换为上次采用的值。登录方式始终在这三项参数输入完成且缓存 Cookie 验证失败后才询问。
 - 带参数启动时也会优先尝试缓存认证。`--login` 仅是缓存缺失、格式无效或明确过期时的验证码登录后备方式；未提供 `--login` 时回退到终端微信扫码，因此认证过程仍可能要求输入验证码或扫码。
-- 启动日志会输出程序名和版本，例如 `towc v0.4.0`。
+- 启动日志会输出程序名和版本，例如 `towc v0.5.0`。
 
-## 会话保活
+## 会话与隧道
 
-`towc` 同时维护两种互补的保活机制：
+`towc` 将登录会话和转发隧道作为两个独立生命周期：
 
-1. WebSocket 活性保活：连接建立后立即发送一次 `连接成功`，之后每 `210` 秒发送一次；`tows` 原样回显。独立保活连接和正在使用的数据隧道都会执行该心跳，避免空闲 WebSocket 被关闭。
-2. WebVPN Cookie 续期：每 `180` 秒请求 WebVPN Cookie 接口，并将响应中的最新 Cookie 更新到内存和本地缓存。后续创建的新隧道使用更新后的 Cookie。
+1. 会话层每 `180` 秒访问 WebVPN 门户 Cookie 接口，将最新 Cookie 更新到内存和缓存。它不访问任何 `tows`。
+2. 每条实际建立的数据连接由 `relay_stream` 每 `210` 秒发送一次 `连接成功` 心跳，由 `tows` 回显，避免空闲 WebSocket 被关闭。
 
-缓存或新登录确认后，这两项任务会立即启动；独立 WebSocket 建连后立即发送首个心跳，Cookie 续期任务的首次 HTTP 刷新在 `180` 秒后执行。交互模式会等待独立保活首次连接成功，再读取目标与监听参数；连接失败时每 `5` 秒重试，期间不会提前显示后续输入提示。缓存认证使用独立保活连接，不以目标 TCP 服务是否可用为条件；参数确定后，`towc` 再单独检查所选 `tows`/目标隧道，因此认证成功并不代表目标隧道必然就绪。
+`tows` 不可达只会让对应隧道进入重试，不会退出登录。Cookie 过期时会话回到未登录状态，隧道保留配置并等待重新登录。停止全部隧道也不会主动退出会话。
 
-第一种机制维持现有连接，第二种机制保证空闲一段时间后仍能创建新连接，二者不能互相替代。周期性成功信息不会重复写入日志；连接建立、断线重连、刷新失败和 Cookie 失效仍会记录。
+Cookie 续期保证空闲一段时间后仍能创建新连接，WebSocket 心跳维持现有连接，二者不能互相替代。周期性成功信息不会重复写入日志；连接建立、断线重连、刷新失败和 Cookie 失效仍会记录。
+
+## 作为库使用
+
+客户端能力通过 `tcp_over_websocket::towc` 导出。GUI 可分别持有 `SessionManager` 和 `TunnelManager`，通过 `EmbeddedClientUi` 接收分层事件并提供验证码：
+
+```rust,no_run
+use std::sync::Arc;
+use tcp_over_websocket::towc::{SessionManager, TunnelConfig, TunnelManager};
+
+# fn build_ui() -> Arc<dyn tcp_over_websocket::towc::EmbeddedClientUi> { todo!() }
+# async fn example() -> anyhow::Result<()> {
+let ui = build_ui();
+let session = SessionManager::new(Arc::clone(&ui));
+let tunnels = TunnelManager::new(session.clone(), ui);
+let id = tunnels.add(TunnelConfig {
+    server: "192.0.2.10:4489".into(),
+    target: "127.0.0.1:22".into(),
+    listen_addr: "127.0.0.1:14489".into(),
+})?;
+tunnels.start(id).await?; // 未登录时进入 PendingAuth
+# Ok(())
+# }
+```
+
+登录成功后，所有处于 `PendingAuth` 的隧道会各自继续探测并启动。`run_embedded_client` 保留为单隧道便捷入口。
+
+服务端通过 `tcp_over_websocket::tows` 导出。`TowsServer` 可订阅监听状态，由宿主传入关闭信号；连接建立、HTTP 探测、兼容保活和数据隧道分别产生结构化事件：
+
+```rust,no_run
+use std::{net::SocketAddr, sync::Arc};
+use tcp_over_websocket::tows::{TowsEventSink, TowsServer, TowsServerConfig};
+
+# fn build_sink() -> Arc<dyn TowsEventSink> { todo!() }
+# async fn example() -> anyhow::Result<()> {
+let server = TowsServer::new(build_sink());
+let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+server
+    .run(
+        TowsServerConfig {
+            listen_addr: SocketAddr::from(([0, 0, 0, 0], 4489)),
+        },
+        shutdown_rx,
+    )
+    .await?;
+# Ok(())
+# }
+```
 
 ## 网络性能
 
@@ -125,9 +172,11 @@ schtasks /Create /TN "tows" /SC ONSTART /RL HIGHEST /TR "C:\Tools\tcp_over_webso
 
 ```text
 src/lib.rs          WebVPN 地址生成、加密、WebSocket 握手、心跳和双向转发
-src/bin/towc.rs     客户端参数、登录、Cookie 生命周期和本地隧道
+src/towc.rs         可导入的登录会话、Cookie 生命周期、隧道管理和客户端实现
+src/tows.rs         可导入的服务端监听、连接事件和目标转发实现
+src/bin/towc.rs     towc 命令行薄入口
 src/bin/towc/qr.rs  微信二维码解码与终端渲染
-src/bin/tows.rs     服务端监听、探测响应和目标 TCP 连接
+src/bin/tows.rs     tows 命令行薄入口
 ```
 
 ## 排障
@@ -135,5 +184,5 @@ src/bin/tows.rs     服务端监听、探测响应和目标 TCP 连接
 - `WebVPN returned /wengine-vpn/failed`：检查 `tows` 是否运行、端口是否正确、防火墙是否放行。
 - `tows reported target connect failure`：检查目标服务是否监听在 `--target` 指定的地址。
 - `cookie expired`：确认两端版本一致；若 Cookie 刷新此前持续失败，重新启动 `towc` 并登录。
-- `WebVPN keepalive failed`：检查 `towc` 到 WebVPN、WebVPN 到 `tows` 的网络连通性；客户端会每 5 秒尝试重连。
+- 隧道持续处于 `Retrying`：检查 `towc` 到 WebVPN、WebVPN 到 `tows` 及 `tows` 到目标服务的连通性。
 - 本地端口占用：使用其他 `--listen` 端口。
