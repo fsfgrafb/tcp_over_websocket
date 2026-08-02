@@ -442,12 +442,7 @@ impl SessionManager {
         &self,
         server: &str,
     ) -> Result<Option<SessionHandle>> {
-        let keepalive_url = build_webvpn_keepalive_ws_url(server)?;
-        *self
-            .inner
-            .keepalive_url
-            .lock()
-            .expect("session keepalive URL poisoned") = Some(keepalive_url);
+        self.configure_keepalive_server(server)?;
         let _login_guard = self.inner.login_lock.lock().await;
         if let Some(handle) = self.handle() {
             return Ok(Some(handle));
@@ -478,6 +473,16 @@ impl SessionManager {
             return Ok(None);
         }
         Ok(Some(self.activate_session(cookie)))
+    }
+
+    fn configure_keepalive_server(&self, server: &str) -> Result<()> {
+        let keepalive_url = build_webvpn_keepalive_ws_url(server)?;
+        *self
+            .inner
+            .keepalive_url
+            .lock()
+            .expect("session keepalive URL poisoned") = Some(keepalive_url);
+        Ok(())
     }
 
     /// Cancels refresh and transitions the session to logged out.
@@ -998,6 +1003,12 @@ struct InteractiveForwardingConfig {
     listen_addr: String,
 }
 
+#[cfg(feature = "cli")]
+struct InteractiveStartup {
+    config: ClientConfig,
+    cached_cookie_preflight: JoinHandle<Result<CachedCookieCheck>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(feature = "cli")]
 struct InteractiveDefaults {
@@ -1306,19 +1317,22 @@ pub async fn run_cli() -> Result<()> {
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let parsed_args = parse_args(&raw_args)?;
-    let (config, mut login_method) = match parsed_args {
+    let (config, mut login_method, cached_cookie_preflight) = match parsed_args {
         ParsedArgs::Help => {
             print_usage();
             return Ok(());
         }
-        ParsedArgs::Interactive => (prepare_interactive_startup().await?, None),
+        ParsedArgs::Interactive => {
+            let startup = prepare_interactive_startup().await?;
+            (startup.config, None, Some(startup.cached_cookie_preflight))
+        }
         ParsedArgs::Run(config) => {
             let login = config
                 .login
                 .clone()
                 .map(login_method_from_verification)
                 .unwrap_or(LoginMethod::WechatQr);
-            (config, Some(login))
+            (config, Some(login), None)
         }
     };
     let tunnel_config = TunnelConfig {
@@ -1330,11 +1344,26 @@ pub async fn run_cli() -> Result<()> {
     let ui: Arc<dyn EmbeddedClientUi> = Arc::new(TerminalUi::new(&tunnel_config));
     let session = SessionManager::new(Arc::clone(&ui));
     let tunnels = TunnelManager::new(session.clone(), ui);
-    if session
-        .login_with_cached_cookie_for_server(&tunnel_config.server)
-        .await?
-        .is_none()
-    {
+    let cached_session = if let Some(preflight) = cached_cookie_preflight {
+        session.configure_keepalive_server(&tunnel_config.server)?;
+        session.emit(SessionEvent::CheckingCachedCookie);
+        match preflight.await {
+            Ok(Ok(CachedCookieCheck::Ready(cookie))) => Some(session.activate_session(cookie)),
+            Ok(Ok(CachedCookieCheck::Expired)) => {
+                session.emit(SessionEvent::Expired);
+                None
+            }
+            Ok(Ok(CachedCookieCheck::Unavailable)) | Ok(Err(_)) | Err(_) => {
+                session.emit(SessionEvent::CachedCookieUnavailable);
+                None
+            }
+        }
+    } else {
+        session
+            .login_with_cached_cookie_for_server(&tunnel_config.server)
+            .await?
+    };
+    if cached_session.is_none() {
         let login = match login_method.clone() {
             Some(login) => login,
             None => prompt_login_identity()?
@@ -1387,15 +1416,18 @@ pub async fn run_cli() -> Result<()> {
 }
 
 #[cfg(feature = "cli")]
-async fn prepare_interactive_startup() -> Result<ClientConfig> {
+async fn prepare_interactive_startup() -> Result<InteractiveStartup> {
     let cached_defaults = read_cached_interactive_defaults();
     let server = match &cached_defaults {
         Some(defaults) => prompt_with_default(
-            &format!("tows address <ip[:port]> (default: {}): ", defaults.server),
+            &format!("tows address/port (default: {}): ", defaults.server),
             &defaults.server,
         )?,
-        None => prompt_required("tows address <ip[:port]>: ")?,
+        None => prompt_required("tows address/port: ")?,
     };
+    let preflight_server = server.clone();
+    let cached_cookie_preflight =
+        tokio::spawn(async move { try_cached_tunnel_login(&preflight_server).await });
     let built_in_target_default = DEFAULT_TARGET_PORT.to_string();
     let built_in_listen_default = DEFAULT_LOCAL_LISTEN_PORT.to_string();
     let target_default = cached_defaults
@@ -1416,11 +1448,14 @@ async fn prepare_interactive_startup() -> Result<ClientConfig> {
     validate_interactive_defaults(&defaults)?;
     write_cached_interactive_defaults(&defaults);
 
-    Ok(ClientConfig {
-        server,
-        target: Some(forwarding.target),
-        listen_addr: forwarding.listen_addr,
-        login: None,
+    Ok(InteractiveStartup {
+        config: ClientConfig {
+            server,
+            target: Some(forwarding.target),
+            listen_addr: forwarding.listen_addr,
+            login: None,
+        },
+        cached_cookie_preflight,
     })
 }
 
