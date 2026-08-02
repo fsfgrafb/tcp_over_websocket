@@ -60,7 +60,7 @@ towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [-
 `towc` 内部仍将登录会话和转发隧道作为两个独立生命周期：
 
 1. 会话层每 `180` 秒访问 WebVPN 门户 Cookie 接口，将最新 Cookie 更新到内存和缓存。它不访问任何 `tows`。
-2. 每条实际建立的数据连接由 `relay_stream` 在建立后立即发送一次 `连接成功`，之后每 `210` 秒发送并由 `tows` 回显，与 v0.4 的有效行为一致。会话同时维持一条独立的 `/webvpn-keepalive` WebSocket，断开后自动重连。
+2. 每条实际建立的数据连接由 `relay_stream` 在建立后立即发送一次 `连接成功`，之后每 `60` 秒发送并由 `tows` 回显，以避开当前网关约 `160` 秒的数据 WebSocket 空闲回收。会话同时维持一条独立的 `/webvpn-keepalive` WebSocket，沿用 v0.4 的立即发送、之后每 `210` 秒发送策略，断开后自动重连。
 
 `tows` 只有在目标 TCP 连接成功后才发送 readiness 确认；`towc` 收到确认后才开放本地监听。relay 使用内部控制帧传递 TCP 半关闭，确保请求方向 EOF 后，响应方向仍可继续传输。
 readiness 与半关闭属于两端内部协议，部署时应同时更新 `towc` 和 `tows`。

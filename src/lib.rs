@@ -73,8 +73,10 @@ pub const WEBVPN_HEARTBEAT_MESSAGE: &str = "连接成功";
 pub const TOWS_READY_MESSAGE: &str = WEBVPN_HEARTBEAT_MESSAGE;
 /// Control frame indicating that one TCP write direction reached EOF.
 pub const TOWS_TCP_EOF_MESSAGE: &str = "tows-tcp-eof";
-/// Interval between WebVPN heartbeat frames.
+/// Interval between session-level WebVPN keepalive frames.
 pub const WEBVPN_HEARTBEAT_INTERVAL_SECS: u64 = 210;
+/// Interval between heartbeat frames on active data WebSockets.
+pub const WEBVPN_DATA_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// Maximum duration allowed for a client WebSocket handshake.
 pub const WEBSOCKET_CONNECT_TIMEOUT_SECS: u64 = 8;
 
@@ -178,8 +180,8 @@ impl WebVpnHeartbeatRole {
     }
 }
 
-fn webvpn_heartbeat_interval() -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(Duration::from_secs(WEBVPN_HEARTBEAT_INTERVAL_SECS));
+fn webvpn_heartbeat_interval(period_secs: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(period_secs));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     interval
 }
@@ -466,7 +468,7 @@ where
     let (mut ws_sink, mut ws_stream) = websocket.split();
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     let mut buffer = Vec::with_capacity(RELAY_BUFFER_SIZE);
-    let mut heartbeat_interval = webvpn_heartbeat_interval();
+    let mut heartbeat_interval = webvpn_heartbeat_interval(WEBVPN_DATA_HEARTBEAT_INTERVAL_SECS);
     let mut tcp_read_open = true;
     let mut remote_tcp_eof = false;
 
@@ -602,7 +604,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (mut ws_sink, mut ws_stream) = websocket.split();
-    let mut heartbeat_interval = webvpn_heartbeat_interval();
+    let mut heartbeat_interval = webvpn_heartbeat_interval(WEBVPN_HEARTBEAT_INTERVAL_SECS);
 
     loop {
         tokio::select! {
@@ -888,12 +890,22 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_matches_v04_immediate_then_210_second_schedule() {
-        let mut interval = webvpn_heartbeat_interval();
+        let mut interval = webvpn_heartbeat_interval(WEBVPN_HEARTBEAT_INTERVAL_SECS);
 
         assert_eq!(interval.period(), Duration::from_secs(210));
         tokio::time::timeout(Duration::from_millis(50), interval.tick())
             .await
             .expect("the first v0.4-compatible heartbeat must be immediate");
+    }
+
+    #[tokio::test]
+    async fn data_heartbeat_is_immediate_then_every_60_seconds() {
+        let mut interval = webvpn_heartbeat_interval(WEBVPN_DATA_HEARTBEAT_INTERVAL_SECS);
+
+        assert_eq!(interval.period(), Duration::from_secs(60));
+        tokio::time::timeout(Duration::from_millis(50), interval.tick())
+            .await
+            .expect("the first data heartbeat must be immediate");
     }
 
     #[cfg(feature = "client")]
