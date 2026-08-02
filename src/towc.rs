@@ -403,7 +403,7 @@ impl SessionManager {
             }
         };
 
-        Ok(self.activate_session(cookie))
+        Ok(self.activate_session(cookie, None))
     }
 
     /// Validates cached credentials and starts refresh when they are usable.
@@ -430,7 +430,7 @@ impl SessionManager {
         if self.inner.login_epoch.load(Ordering::Acquire) != login_epoch {
             return Ok(None);
         }
-        Ok(Some(self.activate_session(cookie)))
+        Ok(Some(self.activate_session(cookie, None)))
     }
 
     /// Validates cached credentials against the configured `tows` endpoint.
@@ -450,7 +450,8 @@ impl SessionManager {
         let login_epoch = self.inner.login_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.emit(SessionEvent::CheckingCachedCookie);
         let cached_cookie = match try_cached_tunnel_login(server).await {
-            Ok(CachedCookieCheck::Ready(cookie)) => Some(cookie),
+            Ok(CachedCookieCheck::Ready { cookie, websocket }) => Some((cookie, Some(*websocket))),
+            Ok(CachedCookieCheck::EndpointUnavailable(cookie)) => Some((cookie, None)),
             Ok(CachedCookieCheck::Unavailable) => {
                 self.emit(SessionEvent::CachedCookieUnavailable);
                 None
@@ -466,13 +467,13 @@ impl SessionManager {
                 return Err(err);
             }
         };
-        let Some(cookie) = cached_cookie else {
+        let Some((cookie, initial_keepalive)) = cached_cookie else {
             return Ok(None);
         };
         if self.inner.login_epoch.load(Ordering::Acquire) != login_epoch {
             return Ok(None);
         }
-        Ok(Some(self.activate_session(cookie)))
+        Ok(Some(self.activate_session(cookie, initial_keepalive)))
     }
 
     fn configure_keepalive_server(&self, server: &str) -> Result<()> {
@@ -521,7 +522,11 @@ impl SessionManager {
         }
     }
 
-    fn activate_session(&self, cookie: String) -> SessionHandle {
+    fn activate_session(
+        &self,
+        cookie: String,
+        initial_keepalive: Option<WebVpnClientWebSocket>,
+    ) -> SessionHandle {
         let handle = SessionHandle {
             cookie: Arc::new(Mutex::new(cookie)),
         };
@@ -536,6 +541,7 @@ impl SessionManager {
             tokio::spawn(maintain_session_keepalive(
                 url,
                 handle.clone(),
+                initial_keepalive,
                 cancel_rx.clone(),
                 Arc::downgrade(&self.inner),
             ))
@@ -1348,12 +1354,16 @@ pub async fn run_cli() -> Result<()> {
         session.configure_keepalive_server(&tunnel_config.server)?;
         session.emit(SessionEvent::CheckingCachedCookie);
         match preflight.await {
-            Ok(Ok(CachedCookieCheck::Ready(cookie))) => Some(session.activate_session(cookie)),
+            Ok(Ok(CachedCookieCheck::Ready { cookie, websocket })) => {
+                Some(session.activate_session(cookie, Some(*websocket)))
+            }
             Ok(Ok(CachedCookieCheck::Expired)) => {
                 session.emit(SessionEvent::Expired);
                 None
             }
-            Ok(Ok(CachedCookieCheck::Unavailable)) | Ok(Err(_)) | Err(_) => {
+            Ok(Ok(CachedCookieCheck::Unavailable | CachedCookieCheck::EndpointUnavailable(_)))
+            | Ok(Err(_))
+            | Err(_) => {
                 session.emit(SessionEvent::CachedCookieUnavailable);
                 None
             }
@@ -1603,7 +1613,11 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
 enum CachedCookieCheck {
     Unavailable,
     Expired,
-    Ready(String),
+    EndpointUnavailable(String),
+    Ready {
+        cookie: String,
+        websocket: Box<WebVpnClientWebSocket>,
+    },
 }
 
 fn cached_cookie_check_from_failure(
@@ -1615,7 +1629,7 @@ fn cached_cookie_check_from_failure(
         // `/wengine-vpn/failed` is returned after authentication when WebVPN
         // cannot reach tows. The Cookie is valid; tunnel recovery handles the
         // endpoint outage separately.
-        ConnectFailure::WebVpnFailed { .. } => Ok(CachedCookieCheck::Ready(cookie)),
+        ConnectFailure::WebVpnFailed { .. } => Ok(CachedCookieCheck::EndpointUnavailable(cookie)),
         ConnectFailure::Other(err) => {
             Err(err).context("failed to verify cached WebVPN login through tunnel endpoint")
         }
@@ -1641,10 +1655,10 @@ async fn try_cached_tunnel_login(server: &str) -> Result<CachedCookieCheck> {
     .context("timed out while checking cached WebVPN cookie against tunnel endpoint")?;
 
     match result {
-        Ok(mut websocket) => {
-            let _ = websocket.send(Message::Close(None)).await;
-            Ok(CachedCookieCheck::Ready(cookie))
-        }
+        Ok(websocket) => Ok(CachedCookieCheck::Ready {
+            cookie,
+            websocket: Box::new(websocket),
+        }),
         Err(failure) => cached_cookie_check_from_failure(cookie, failure),
     }
 }
@@ -1652,13 +1666,18 @@ async fn try_cached_tunnel_login(server: &str) -> Result<CachedCookieCheck> {
 async fn maintain_session_keepalive(
     url: String,
     session: SessionHandle,
+    mut initial_websocket: Option<WebVpnClientWebSocket>,
     mut cancel: watch::Receiver<bool>,
     manager: Weak<SessionManagerInner>,
 ) {
     loop {
-        let connection = tokio::select! {
-            result = connect_websocket_with_current_cookie(&url, session.cookie()) => result,
-            _ = cancellation_requested(&mut cancel) => return,
+        let connection = if let Some(websocket) = initial_websocket.take() {
+            Ok(websocket)
+        } else {
+            tokio::select! {
+                result = connect_websocket_with_current_cookie(&url, session.cookie()) => result,
+                _ = cancellation_requested(&mut cancel) => return,
+            }
         };
 
         match connection {
@@ -2937,7 +2956,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(result, CachedCookieCheck::Ready(cookie) if cookie == "ticket=cached"));
+        assert!(matches!(
+            result,
+            CachedCookieCheck::EndpointUnavailable(cookie) if cookie == "ticket=cached"
+        ));
     }
 
     #[tokio::test]
