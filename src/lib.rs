@@ -144,13 +144,20 @@ impl fmt::Display for ConnectFailure {
             Self::WebVpnFailed { location } => {
                 write!(formatter, "WebVPN returned failed; location: {location}")
             }
-            Self::Other(err) => write!(formatter, "{err:#}"),
+            Self::Other(err) => write!(formatter, "{err}"),
         }
     }
 }
 
 #[cfg(feature = "client")]
-impl std::error::Error for ConnectFailure {}
+impl std::error::Error for ConnectFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(err) => Some(err.as_ref()),
+            Self::CookieExpired { .. } | Self::WebVpnFailed { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Determines which side sends or echoes the WebVPN application heartbeat.
@@ -169,6 +176,12 @@ impl WebVpnHeartbeatRole {
     fn echoes_heartbeat(self) -> bool {
         matches!(self, Self::Server)
     }
+}
+
+fn webvpn_heartbeat_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(WEBVPN_HEARTBEAT_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
 }
 
 /// Converts a strict `/tcp` or `/tcp/...` path into a TCP target address.
@@ -453,9 +466,7 @@ where
     let (mut ws_sink, mut ws_stream) = websocket.split();
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     let mut buffer = Vec::with_capacity(RELAY_BUFFER_SIZE);
-    let mut heartbeat_interval =
-        tokio::time::interval(Duration::from_secs(WEBVPN_HEARTBEAT_INTERVAL_SECS));
-    heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut heartbeat_interval = webvpn_heartbeat_interval();
     let mut tcp_read_open = true;
     let mut remote_tcp_eof = false;
 
@@ -519,7 +530,9 @@ where
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
-                        if text.as_str() == TOWS_READY_MESSAGE {
+                        if heartbeat_role == WebVpnHeartbeatRole::Client
+                            && text.as_str() == TOWS_READY_MESSAGE
+                        {
                             continue;
                         }
                         if text.as_str() == TOWS_TCP_EOF_MESSAGE {
@@ -569,6 +582,7 @@ where
                         let _ = tcp_write.shutdown().await;
                         break;
                     }
+                    Some(Err(err)) if is_normal_websocket_close(&err) => break,
                     Some(Err(err)) => return Err(err.into()),
                     None => break,
                 }
@@ -588,9 +602,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (mut ws_sink, mut ws_stream) = websocket.split();
-    let mut heartbeat_interval =
-        tokio::time::interval(Duration::from_secs(WEBVPN_HEARTBEAT_INTERVAL_SECS));
-    heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut heartbeat_interval = webvpn_heartbeat_interval();
 
     loop {
         tokio::select! {
@@ -654,7 +666,7 @@ fn is_normal_websocket_close(err: &WebSocketError) -> bool {
     matches!(
         err,
         WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed
-    )
+    ) || matches!(err, WebSocketError::Io(err) if is_normal_connection_close(err))
 }
 
 #[cfg(feature = "client")]
@@ -855,6 +867,35 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(feature = "client")]
+    fn connect_failure_display_does_not_expand_the_same_source_twice() {
+        let failure = ConnectFailure::Other(anyhow!("rustls detail").context("IO error"));
+
+        assert_eq!(failure.to_string(), "IO error");
+        assert!(std::error::Error::source(&failure).is_some());
+    }
+
+    #[test]
+    fn websocket_unexpected_eof_is_a_normal_connection_close() {
+        let error = WebSocketError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        ));
+
+        assert!(is_normal_websocket_close(&error));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_matches_v04_immediate_then_210_second_schedule() {
+        let mut interval = webvpn_heartbeat_interval();
+
+        assert_eq!(interval.period(), Duration::from_secs(210));
+        tokio::time::timeout(Duration::from_millis(50), interval.tick())
+            .await
+            .expect("the first v0.4-compatible heartbeat must be immediate");
+    }
+
     #[cfg(feature = "client")]
     #[tokio::test]
     async fn relay_moves_binary_data_in_both_directions() {
@@ -881,6 +922,14 @@ mod tests {
         let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/tcp"))
             .await
             .unwrap();
+        websocket
+            .send(Message::Text(WEBVPN_HEARTBEAT_MESSAGE.into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            websocket.next().await.unwrap().unwrap(),
+            Message::Text(WEBVPN_HEARTBEAT_MESSAGE.into())
+        );
         websocket
             .send(Message::Binary(b"client-to-target".to_vec().into()))
             .await

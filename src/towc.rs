@@ -2,7 +2,7 @@ use crate::{
     ConnectFailure, DEFAULT_TARGET_HOST, TOWS_READY_MESSAGE, TOWS_TARGET_CONNECT_FAILURE_PREFIX,
     WebVpnHeartbeatRole, build_webvpn_keepalive_ws_url, build_webvpn_ws_url, connect_websocket,
     log_info, log_success, log_warn, normalize_server_addr, normalize_tcp_target_arg,
-    parse_socket_addr_with_default_host, relay_stream, rsa_encrypt,
+    parse_socket_addr_with_default_host, relay_stream, rsa_encrypt, run_webvpn_heartbeat_websocket,
 };
 #[cfg(feature = "cli")]
 use crate::{
@@ -68,6 +68,7 @@ const INTERACTIVE_DEFAULTS_CACHE_VERSION: &str = "1";
 const LOGIN_METHOD_PROMPT: &str =
     "login method (enter mobile/email, or press Enter for WeChat QR): ";
 const TUNNEL_RETRY_INTERVAL_SECS: u64 = 5;
+const WEBVPN_KEEPALIVE_RECONNECT_SECS: u64 = 5;
 
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +276,7 @@ struct SessionManagerInner {
     state_tx: watch::Sender<SessionState>,
     login_lock: tokio::sync::Mutex<()>,
     login_epoch: AtomicU64,
+    keepalive_url: Mutex<Option<String>>,
     runtime: Mutex<Option<SessionRuntime>>,
     ui: Arc<dyn EmbeddedClientUi>,
 }
@@ -282,12 +284,16 @@ struct SessionManagerInner {
 struct SessionRuntime {
     handle: SessionHandle,
     cancel: watch::Sender<bool>,
+    keepalive_task: Option<JoinHandle<()>>,
     refresh_task: JoinHandle<()>,
 }
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
+        if let Some(task) = &self.keepalive_task {
+            task.abort();
+        }
         self.refresh_task.abort();
     }
 }
@@ -304,6 +310,7 @@ impl SessionManager {
                 state_tx,
                 login_lock: tokio::sync::Mutex::new(()),
                 login_epoch: AtomicU64::new(0),
+                keepalive_url: Mutex::new(None),
                 runtime: Mutex::new(None),
                 ui,
             }),
@@ -435,6 +442,12 @@ impl SessionManager {
         &self,
         server: &str,
     ) -> Result<Option<SessionHandle>> {
+        let keepalive_url = build_webvpn_keepalive_ws_url(server)?;
+        *self
+            .inner
+            .keepalive_url
+            .lock()
+            .expect("session keepalive URL poisoned") = Some(keepalive_url);
         let _login_guard = self.inner.login_lock.lock().await;
         if let Some(handle) = self.handle() {
             return Ok(Some(handle));
@@ -508,6 +521,20 @@ impl SessionManager {
             cookie: Arc::new(Mutex::new(cookie)),
         };
         let (cancel, cancel_rx) = watch::channel(false);
+        let keepalive_url = self
+            .inner
+            .keepalive_url
+            .lock()
+            .expect("session keepalive URL poisoned")
+            .clone();
+        let keepalive_task = keepalive_url.map(|url| {
+            tokio::spawn(maintain_session_keepalive(
+                url,
+                handle.clone(),
+                cancel_rx.clone(),
+                Arc::downgrade(&self.inner),
+            ))
+        });
         let refresh_task = tokio::spawn(maintain_session_cookie_refresh(
             handle.clone(),
             cancel_rx,
@@ -516,6 +543,7 @@ impl SessionManager {
         *self.inner.runtime.lock().expect("session runtime poisoned") = Some(SessionRuntime {
             handle: handle.clone(),
             cancel,
+            keepalive_task,
             refresh_task,
         });
         self.set_state(SessionState::Ready);
@@ -1583,6 +1611,44 @@ async fn try_cached_tunnel_login(server: &str) -> Result<CachedCookieCheck> {
             Ok(CachedCookieCheck::Ready(cookie))
         }
         Err(failure) => cached_cookie_check_from_failure(cookie, failure),
+    }
+}
+
+async fn maintain_session_keepalive(
+    url: String,
+    session: SessionHandle,
+    mut cancel: watch::Receiver<bool>,
+    manager: Weak<SessionManagerInner>,
+) {
+    loop {
+        let connection = tokio::select! {
+            result = connect_websocket_with_current_cookie(&url, session.cookie()) => result,
+            _ = cancellation_requested(&mut cancel) => return,
+        };
+
+        match connection {
+            Ok(websocket) => {
+                tokio::select! {
+                    _ = run_webvpn_heartbeat_websocket(
+                        websocket,
+                        WebVpnHeartbeatRole::Client,
+                    ) => {}
+                    _ = cancellation_requested(&mut cancel) => return,
+                }
+            }
+            Err(ConnectFailure::CookieExpired { .. }) => {
+                if let Some(inner) = manager.upgrade() {
+                    SessionManager { inner }.mark_expired_for(&session);
+                }
+                return;
+            }
+            Err(ConnectFailure::WebVpnFailed { .. } | ConnectFailure::Other(_)) => {}
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(WEBVPN_KEEPALIVE_RECONNECT_SECS)) => {}
+            _ = cancellation_requested(&mut cancel) => return,
+        }
     }
 }
 

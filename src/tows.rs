@@ -52,6 +52,8 @@ pub enum TowsConnectionKind {
     Keepalive,
     /// Data tunnel connected to a TCP target.
     Tunnel {
+        /// Actual local endpoint through which this connection reached `tows`.
+        server: SocketAddr,
         /// Normalized target address.
         target: String,
     },
@@ -289,6 +291,10 @@ pub async fn run_tows_server(
 
 struct TerminalEventSink;
 
+fn format_tunnel_ready(server: SocketAddr, target: &str) -> String {
+    format!("ready: WebVPN -> tows {server} -> target {target}")
+}
+
 impl TowsEventSink for TerminalEventSink {
     fn emit(&self, event: TowsEvent) {
         match event {
@@ -296,13 +302,10 @@ impl TowsEventSink for TerminalEventSink {
                 log_success("server", format!("listening on {listen_addr}"));
             }
             TowsEvent::ConnectionReady {
-                connection_id,
-                kind: TowsConnectionKind::Tunnel { target },
-            } => log_success("server", format!("#{connection_id} -> {target}")),
-            TowsEvent::Error {
-                connection_id: Some(id),
-                detail,
-            } => log_error("server", format!("#{id}: {detail}")),
+                kind: TowsConnectionKind::Tunnel { server, target },
+                ..
+            } => log_success("tunnel", format_tunnel_ready(server, &target)),
+            TowsEvent::Error { detail, .. } => log_error("tunnel", detail),
             _ => {}
         }
     }
@@ -349,6 +352,9 @@ async fn handle_connection(
     stream: TcpStream,
     events: Arc<dyn TowsEventSink>,
 ) -> Result<()> {
+    let server_addr = stream
+        .local_addr()
+        .context("failed to read accepted connection local address")?;
     if !is_websocket_upgrade_request(&stream).await? {
         events.emit(TowsEvent::ConnectionReady {
             connection_id,
@@ -405,6 +411,7 @@ async fn handle_connection(
     events.emit(TowsEvent::ConnectionReady {
         connection_id,
         kind: TowsConnectionKind::Tunnel {
+            server: server_addr,
             target: target_addr,
         },
     });
@@ -666,6 +673,14 @@ mod tests {
         assert_eq!(
             target_connect_failure_diagnosis(&err),
             "target service is not listening or refused the connection"
+        );
+    }
+
+    #[test]
+    fn terminal_ready_message_contains_the_complete_server_path() {
+        assert_eq!(
+            format_tunnel_ready(SocketAddr::from(([10, 18, 47, 77], 4489)), "127.0.0.1:22"),
+            "ready: WebVPN -> tows 10.18.47.77:4489 -> target 127.0.0.1:22"
         );
     }
 }
