@@ -29,7 +29,7 @@ ssh -p 14489 user@localhost
 towc <tows-ip> --target 3389 --listen 13389
 ```
 
-不带参数运行 `towc` 会进入交互模式。程序先依次读取 `tows`、目标和本地监听地址，参数确认并缓存后自动尝试已有 Cookie。仅当缓存缺失、格式无效或明确过期时，才询问登录方式：输入手机号/邮箱使用验证码，或直接回车使用终端微信扫码。新登录取得的 Cookie 会立即写入本地缓存。登录会话只依赖 WebVPN 门户，不要求 `tows` 已经可达；隧道启动后再独立检查 `tows` 和目标服务。
+不带参数运行 `towc` 会进入交互模式。程序先依次读取 `tows`、目标和本地监听地址，参数确认并缓存后，通过当前 `tows` 对应的 WebVPN 保活 WebSocket 对已有 Cookie 做一次直接校验。登录重定向会立即判定为过期并进入正常登录流程，不再进行多次 readiness 重试。`tows` 不可达只代表隧道端点故障，不会被误判为 Cookie 过期。仅当缓存缺失、格式无效或明确过期时，才询问登录方式：输入手机号/邮箱使用验证码，或直接回车使用终端微信扫码。新登录取得的 Cookie 会立即写入本地缓存。
 
 交互模式会把本次实际采用的 `tows`、目标和本地监听地址分别缓存；下次启动时，这三个值会显示为新的默认选项，直接回车即可复用。此配置缓存与 WebVPN Cookie 缓存相互独立。
 
@@ -55,39 +55,67 @@ towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [-
 
 ## 会话与隧道
 
-`towc` 将登录会话和转发隧道作为两个独立生命周期：
+每个 `towc` 进程只管理一个登录会话、一组本地监听参数和一条隧道。需要多开隧道时，使用不同的本地监听端口启动多个 `towc`；一个 `tows` 进程可以并发服务多个 `towc`。这种进程边界便于上层软件独立启动、停止和重启每条隧道。
+
+`towc` 内部仍将登录会话和转发隧道作为两个独立生命周期：
 
 1. 会话层每 `180` 秒访问 WebVPN 门户 Cookie 接口，将最新 Cookie 更新到内存和缓存。它不访问任何 `tows`。
 2. 每条实际建立的数据连接由 `relay_stream` 每 `210` 秒发送一次 `连接成功` 心跳，由 `tows` 回显，避免空闲 WebSocket 被关闭。
 
-`tows` 不可达只会让对应隧道进入重试，不会退出登录。Cookie 过期时会话回到未登录状态，隧道保留配置并等待重新登录。停止全部隧道也不会主动退出会话。
+`tows` 只有在目标 TCP 连接成功后才发送 readiness 确认；`towc` 收到确认后才开放本地监听。relay 使用内部控制帧传递 TCP 半关闭，确保请求方向 EOF 后，响应方向仍可继续传输。
+readiness 与半关闭属于两端内部协议，部署时应同时更新 `towc` 和 `tows`。
+
+`tows` 不可达只会让当前隧道进入重试，不会退出登录。Cookie 过期时会话回到未登录状态，隧道保留配置并等待重新登录。停止隧道也不会主动退出会话。
+
+每轮隧道 readiness 只探测一次，不在内部连续重试；非认证类失败交给隧道生命周期按固定间隔重新启动探测，避免一次启动产生重复请求和重复诊断。
+
+隧道进入运行状态时，终端会一次性输出规范化后的完整链路，例如 `local 127.0.0.1:14489 -> WebVPN -> tows 10.18.47.77:4489 -> target 127.0.0.1:22`；中间状态不重复刷屏。
 
 Cookie 续期保证空闲一段时间后仍能创建新连接，WebSocket 心跳维持现有连接，二者不能互相替代。周期性成功信息不会重复写入日志；连接建立、断线重连、刷新失败和 Cookie 失效仍会记录。
 
 ## 作为库使用
 
-客户端能力通过 `tcp_over_websocket::towc` 导出。GUI 可分别持有 `SessionManager` 和 `TunnelManager`，通过 `EmbeddedClientUi` 接收分层事件并提供验证码：
+默认 feature 同时启用客户端、服务端和终端 CLI。只导入其中一端时可关闭默认 feature，避免编译另一端及终端二维码的依赖：
+
+```toml
+# 仅客户端
+tcp_over_websocket = { version = "0.5", default-features = false, features = ["client"] }
+
+# 仅服务端
+tcp_over_websocket = { version = "0.5", default-features = false, features = ["server"] }
+```
+
+客户端能力通过 `tcp_over_websocket::towc` 导出。上层软件可以为每条配置分别调用单隧道入口 `run_embedded_client`，通过 `EmbeddedClientUi` 接收结构化事件并提供验证码：
 
 ```rust,no_run
 use std::sync::Arc;
-use tcp_over_websocket::towc::{SessionManager, TunnelConfig, TunnelManager};
+use tcp_over_websocket::towc::{
+    EmbeddedClientConfig, EmbeddedClientUi, LoginMethod, run_embedded_client,
+};
 
-# fn build_ui() -> Arc<dyn tcp_over_websocket::towc::EmbeddedClientUi> { todo!() }
+# fn build_ui() -> Arc<dyn EmbeddedClientUi> { todo!() }
 # async fn example() -> anyhow::Result<()> {
 let ui = build_ui();
-let session = SessionManager::new(Arc::clone(&ui));
-let tunnels = TunnelManager::new(session.clone(), ui);
-let id = tunnels.add(TunnelConfig {
-    server: "192.0.2.10:4489".into(),
-    target: "127.0.0.1:22".into(),
-    listen_addr: "127.0.0.1:14489".into(),
-})?;
-tunnels.start(id).await?; // 未登录时进入 PendingAuth
+let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+run_embedded_client(
+    EmbeddedClientConfig {
+        server: "192.0.2.10:4489".into(),
+        target: "127.0.0.1:22".into(),
+        listen_addr: "127.0.0.1:14489".into(),
+        login: LoginMethod::WechatQr,
+    },
+    ui,
+    shutdown_rx,
+)
+.await?;
 # Ok(())
 # }
 ```
 
-登录成功后，所有处于 `PendingAuth` 的隧道会各自继续探测并启动。`run_embedded_client` 保留为单隧道便捷入口。
+`TunnelEvent` 中的 `tunnel_id` 作为结构化接口关联字段继续保留，供未来上层管理软件使用；单隧道终端输出不会显示内部编号。
+
+上层为每条隧道创建独立 `towc` 子进程时，可给各进程设置
+`TCP_OVER_WEBSOCKET_CACHE_DIR`，使 Cookie 和交互默认值写入各自目录。未设置时沿用系统缓存目录；跨进程目录分配与生命周期同步由上层负责，库内不引入全局锁。
 
 服务端通过 `tcp_over_websocket::tows` 导出。`TowsServer` 可订阅监听状态，由宿主传入关闭信号；连接建立、HTTP 探测、兼容保活和数据隧道分别产生结构化事件：
 
@@ -175,7 +203,7 @@ src/lib.rs          WebVPN 地址生成、加密、WebSocket 握手、心跳和�
 src/towc.rs         可导入的登录会话、Cookie 生命周期、隧道管理和客户端实现
 src/tows.rs         可导入的服务端监听、连接事件和目标转发实现
 src/bin/towc.rs     towc 命令行薄入口
-src/bin/towc/qr.rs  微信二维码解码与终端渲染
+src/towc/qr.rs      微信二维码解码与终端渲染
 src/bin/tows.rs     tows 命令行薄入口
 ```
 

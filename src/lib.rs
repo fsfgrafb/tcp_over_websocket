@@ -1,8 +1,20 @@
+#![warn(missing_docs)]
+
+//! TCP-over-WebSocket client and server components for SZUT WebVPN.
+//!
+//! Enable the `client` feature for login and local tunnel management, `server`
+//! for the remote forwarding server, and `cli` for terminal integration. All
+//! three are enabled by default for compatibility with the command-line package.
+
+#[cfg(feature = "client")]
 use aes::Aes128;
+#[cfg(feature = "client")]
 use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
+#[cfg(feature = "client")]
 use num_bigint::BigUint;
+#[cfg(feature = "client")]
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -10,32 +22,69 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, MissedTickBehavior};
+#[cfg(feature = "client")]
+use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::Message;
+#[cfg(feature = "client")]
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::Request as ServerRequest;
+#[cfg(feature = "client")]
+use tokio_tungstenite::tungstenite::http::header::LOCATION;
+#[cfg(feature = "client")]
 use tokio_tungstenite::tungstenite::http::header::{COOKIE, HeaderValue};
-use tokio_tungstenite::tungstenite::{Error as WebSocketError, http::header::LOCATION};
-use tokio_tungstenite::{WebSocketStream, accept_hdr_async, connect_async_with_config};
+use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
+#[cfg(feature = "client")]
+/// Client session, login, and local tunnel management.
 pub mod towc;
+#[cfg(feature = "server")]
+/// Remote TCP forwarding server.
 pub mod tows;
 
+/// Default address used by the server CLI.
 pub const SERVER_LISTEN_ADDR: &str = "0.0.0.0:4489";
+/// Default host used when the server CLI receives only a port.
 pub const SERVER_LISTEN_HOST: &str = "0.0.0.0";
+/// Default remote server port.
 pub const DEFAULT_SERVER_PORT: u16 = 4489;
+/// Default local client listener port.
 pub const DEFAULT_LOCAL_LISTEN_PORT: u16 = 14489;
+/// Default local client listener address.
 pub const DEFAULT_LOCAL_LISTEN_ADDR: &str = "127.0.0.1:14489";
+/// Default target host on the server.
 pub const DEFAULT_TARGET_HOST: &str = "127.0.0.1";
+/// Default target port on the server.
 pub const DEFAULT_TARGET_PORT: u16 = 22;
+/// Default target address on the server.
 pub const DEFAULT_TARGET_ADDR: &str = "127.0.0.1:22";
+/// SZUT WebVPN gateway host used by client URL builders.
 pub const DEFAULT_WEBVPN_WS_HOST: &str = "webvpn.szut.edu.cn";
+/// Prefix used in WebSocket close reasons for target connection failures.
 pub const TOWS_TARGET_CONNECT_FAILURE_PREFIX: &str = "tows target connect failed";
+/// WebSocket path reserved for compatibility keepalive connections.
 pub const WEBVPN_KEEPALIVE_PATH: &str = "/webvpn-keepalive";
+/// Text frame used as the WebVPN application heartbeat.
 pub const WEBVPN_HEARTBEAT_MESSAGE: &str = "连接成功";
+/// Control frame sent by `tows` after the requested target TCP connection succeeds.
+///
+/// It intentionally reuses the legacy heartbeat value so older clients consume
+/// the frame instead of forwarding it into the local TCP stream.
+pub const TOWS_READY_MESSAGE: &str = WEBVPN_HEARTBEAT_MESSAGE;
+/// Control frame indicating that one TCP write direction reached EOF.
+pub const TOWS_TCP_EOF_MESSAGE: &str = "tows-tcp-eof";
+/// Interval between WebVPN heartbeat frames.
 pub const WEBVPN_HEARTBEAT_INTERVAL_SECS: u64 = 210;
+/// Maximum duration allowed for a client WebSocket handshake.
+pub const WEBSOCKET_CONNECT_TIMEOUT_SECS: u64 = 8;
 
+const RELAY_BUFFER_SIZE: usize = 64 * 1024;
+
+#[cfg(feature = "client")]
 const WEBVPN_AES_KEY: &[u8; 16] = b"wrdvpnisthebest!";
+#[cfg(feature = "client")]
 const WEBVPN_ENCRYPTED_PREFIX: &str = "77726476706e69737468656265737421";
+#[cfg(feature = "client")]
 const RSA_CHUNK_SIZE: usize = 62;
 
 const RESET: &str = "\x1b[0m";
@@ -63,13 +112,26 @@ impl LogLevel {
     }
 }
 
+#[cfg(feature = "client")]
+#[non_exhaustive]
 #[derive(Debug)]
+/// Failure categories produced while opening a WebVPN WebSocket.
 pub enum ConnectFailure {
-    CookieExpired { location: String },
-    WebVpnFailed { location: String },
+    /// The gateway redirected to login because the session expired.
+    CookieExpired {
+        /// Redirect location returned by the gateway.
+        location: String,
+    },
+    /// The WebVPN gateway rejected or could not reach the tunnel endpoint.
+    WebVpnFailed {
+        /// Failure location returned by the gateway.
+        location: String,
+    },
+    /// Any transport, protocol, or request construction error.
     Other(anyhow::Error),
 }
 
+#[cfg(feature = "client")]
 impl fmt::Display for ConnectFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -87,11 +149,15 @@ impl fmt::Display for ConnectFailure {
     }
 }
 
+#[cfg(feature = "client")]
 impl std::error::Error for ConnectFailure {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Determines which side sends or echoes the WebVPN application heartbeat.
 pub enum WebVpnHeartbeatRole {
+    /// Sends heartbeat frames.
     Client,
+    /// Echoes heartbeat frames.
     Server,
 }
 
@@ -105,11 +171,14 @@ impl WebVpnHeartbeatRole {
     }
 }
 
+/// Converts a strict `/tcp` or `/tcp/...` path into a TCP target address.
 pub fn parse_tcp_target_path(path: &str) -> Result<String> {
-    let target = path
-        .strip_prefix("/tcp")
-        .ok_or_else(|| anyhow!("unsupported path: {path}"))?
-        .trim_start_matches('/');
+    let target = match path {
+        "/tcp" => "",
+        _ => path
+            .strip_prefix("/tcp/")
+            .ok_or_else(|| anyhow!("unsupported path: {path}"))?,
+    };
 
     if target.is_empty() {
         return Ok(DEFAULT_TARGET_ADDR.to_string());
@@ -130,6 +199,8 @@ pub fn parse_tcp_target_path(path: &str) -> Result<String> {
     Ok(format!("{}:{port}", host.trim()))
 }
 
+#[cfg(feature = "client")]
+/// Builds the WebVPN WebSocket URL for a data tunnel.
 pub fn build_webvpn_ws_url(server: &str, target: Option<&str>) -> Result<String> {
     let server = parse_host_port(server, DEFAULT_SERVER_PORT, DEFAULT_TARGET_HOST, "server")?;
     let target_addr = normalize_tcp_target_arg(target)?;
@@ -142,6 +213,8 @@ pub fn build_webvpn_ws_url(server: &str, target: Option<&str>) -> Result<String>
     ))
 }
 
+#[cfg(feature = "client")]
+/// Builds the WebVPN WebSocket URL for a compatibility keepalive connection.
 pub fn build_webvpn_keepalive_ws_url(server: &str) -> Result<String> {
     let server = parse_host_port(server, DEFAULT_SERVER_PORT, DEFAULT_TARGET_HOST, "server")?;
     let encrypted_host = encrypt_webvpn_host(&server.host)?;
@@ -152,11 +225,15 @@ pub fn build_webvpn_keepalive_ws_url(server: &str) -> Result<String> {
     ))
 }
 
+#[cfg(feature = "client")]
+/// Normalizes a server host or host-port value with the default server port.
 pub fn normalize_server_addr(value: &str) -> Result<String> {
     let server = parse_host_port(value, DEFAULT_SERVER_PORT, DEFAULT_TARGET_HOST, "server")?;
     Ok(format!("{}:{}", server.host, server.port))
 }
 
+#[cfg(feature = "client")]
+/// Normalizes an optional TCP target, accepting a port-only shorthand.
 pub fn normalize_tcp_target_arg(value: Option<&str>) -> Result<String> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(DEFAULT_TARGET_ADDR.to_string());
@@ -170,6 +247,8 @@ pub fn normalize_tcp_target_arg(value: Option<&str>) -> Result<String> {
     Ok(format!("{}:{}", target.host, target.port))
 }
 
+#[cfg(feature = "client")]
+/// Performs the RSA encoding required by the SZUT WebVPN login endpoint.
 pub fn rsa_encrypt(plain: &str, modulus_hex: &str, exponent_hex: &str) -> Result<String> {
     let modulus = BigUint::parse_bytes(modulus_hex.as_bytes(), 16)
         .ok_or_else(|| anyhow!("invalid RSA modulus hex"))?;
@@ -198,6 +277,7 @@ pub fn rsa_encrypt(plain: &str, modulus_hex: &str, exponent_hex: &str) -> Result
     Ok(parts.join(" "))
 }
 
+#[cfg(feature = "client")]
 fn tcp_target_url_path_from_addr(target_addr: &str) -> Result<String> {
     if target_addr == DEFAULT_TARGET_ADDR {
         return Ok("/tcp".to_string());
@@ -214,11 +294,13 @@ fn tcp_target_url_path_from_addr(target_addr: &str) -> Result<String> {
     Ok(format!("/tcp/{host}:{port}"))
 }
 
+#[cfg(feature = "client")]
 fn encrypt_webvpn_host(host: &str) -> Result<String> {
     let ciphertext = aes_128_cfb_encrypt(host.as_bytes(), WEBVPN_AES_KEY, WEBVPN_AES_KEY)?;
     Ok(hex_encode(&ciphertext))
 }
 
+#[cfg(feature = "client")]
 fn aes_128_cfb_encrypt(plaintext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Result<Vec<u8>> {
     let cipher = Aes128::new_from_slice(key).context("failed to initialize AES-128 cipher")?;
     let mut feedback = *iv;
@@ -247,6 +329,7 @@ fn aes_128_cfb_encrypt(plaintext: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Resul
     Ok(ciphertext)
 }
 
+#[cfg(feature = "client")]
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -257,11 +340,13 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(feature = "client")]
 struct HostPort {
     host: String,
     port: u16,
 }
 
+#[cfg(feature = "client")]
 fn parse_host_port(
     value: &str,
     default_port: u16,
@@ -298,12 +383,14 @@ fn parse_host_port(
     })
 }
 
+/// Parses a concrete IP socket address.
 pub fn parse_socket_addr(value: &str) -> Result<SocketAddr> {
     value
         .parse::<SocketAddr>()
         .with_context(|| format!("invalid socket address: {value}"))
 }
 
+/// Parses a socket address and expands a port-only value with `default_host`.
 pub fn parse_socket_addr_with_default_host(value: &str, default_host: &str) -> Result<SocketAddr> {
     if let Ok(port) = parse_port(value) {
         return parse_socket_addr(&format!("{default_host}:{port}"));
@@ -324,18 +411,22 @@ fn parse_port(value: &str) -> Result<u16> {
     Ok(port)
 }
 
+/// Writes an informational terminal log message.
 pub fn log_info(scope: &str, message: impl AsRef<str>) {
     log_message(LogLevel::Info, scope, message.as_ref());
 }
 
+/// Writes a successful-operation terminal log message.
 pub fn log_success(scope: &str, message: impl AsRef<str>) {
     log_message(LogLevel::Success, scope, message.as_ref());
 }
 
+/// Writes a warning terminal log message.
 pub fn log_warn(scope: &str, message: impl AsRef<str>) {
     log_message(LogLevel::Warning, scope, message.as_ref());
 }
 
+/// Writes an error terminal log message.
 pub fn log_error(scope: &str, message: impl AsRef<str>) {
     log_message(LogLevel::Error, scope, message.as_ref());
 }
@@ -348,6 +439,7 @@ fn format_log_message(level: LogLevel, scope: &str, message: &str) -> String {
     format!("{}[{scope}]{RESET} {message}", level.color())
 }
 
+/// Relays TCP bytes and WebSocket frames until either side closes.
 pub async fn relay_stream<S>(
     websocket: WebSocketStream<S>,
     tcp: TcpStream,
@@ -360,10 +452,12 @@ where
         .context("failed to enable TCP_NODELAY on relay stream")?;
     let (mut ws_sink, mut ws_stream) = websocket.split();
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut buffer = Vec::with_capacity(RELAY_BUFFER_SIZE);
     let mut heartbeat_interval =
         tokio::time::interval(Duration::from_secs(WEBVPN_HEARTBEAT_INTERVAL_SECS));
     heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut tcp_read_open = true;
+    let mut remote_tcp_eof = false;
 
     loop {
         tokio::select! {
@@ -378,21 +472,35 @@ where
                     return Err(err).context("failed to send WebVPN heartbeat");
                 }
             }
-            read_result = tcp_read.read(&mut buffer) => {
+            read_result = tcp_read.read_buf(&mut buffer), if tcp_read_open => {
                 let read_size = match read_result {
                     Ok(read_size) => read_size,
-                    Err(err) if is_normal_connection_close(&err) => break,
+                    Err(err) if is_normal_connection_close(&err) => 0,
                     Err(err) => return Err(err).context("failed to read from tcp stream"),
                 };
                 if read_size == 0 {
-                    let _ = ws_sink.send(Message::Close(None)).await;
-                    break;
+                    tcp_read_open = false;
+                    if let Err(err) = ws_sink
+                        .send(Message::Text(TOWS_TCP_EOF_MESSAGE.into()))
+                        .await
+                    {
+                        if is_normal_websocket_close(&err) {
+                            break;
+                        }
+                        return Err(err).context("failed to send tcp EOF control frame");
+                    }
+                    if remote_tcp_eof {
+                        let _ = ws_sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    continue;
                 }
 
-                if let Err(err) = ws_sink
-                    .send(Message::Binary(buffer[..read_size].to_vec().into()))
-                    .await
-                {
+                let payload = std::mem::replace(
+                    &mut buffer,
+                    Vec::with_capacity(RELAY_BUFFER_SIZE),
+                );
+                if let Err(err) = ws_sink.send(Message::Binary(payload.into())).await {
                     if is_normal_websocket_close(&err) {
                         break;
                     }
@@ -411,6 +519,22 @@ where
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
+                        if text.as_str() == TOWS_READY_MESSAGE {
+                            continue;
+                        }
+                        if text.as_str() == TOWS_TCP_EOF_MESSAGE {
+                            if let Err(err) = tcp_write.shutdown().await
+                                && !is_normal_connection_close(&err)
+                            {
+                                return Err(err).context("failed to apply remote tcp EOF");
+                            }
+                            remote_tcp_eof = true;
+                            if !tcp_read_open {
+                                let _ = ws_sink.send(Message::Close(None)).await;
+                                break;
+                            }
+                            continue;
+                        }
                         if text.as_str() == WEBVPN_HEARTBEAT_MESSAGE {
                             if heartbeat_role.echoes_heartbeat()
                                 && let Err(err) = ws_sink.send(Message::Text(text)).await
@@ -455,6 +579,7 @@ where
     Ok(())
 }
 
+/// Runs a heartbeat-only WebSocket connection until it closes.
 pub async fn run_webvpn_heartbeat_websocket<S>(
     websocket: WebSocketStream<S>,
     heartbeat_role: WebVpnHeartbeatRole,
@@ -532,6 +657,8 @@ fn is_normal_websocket_close(err: &WebSocketError) -> bool {
     )
 }
 
+#[cfg(feature = "client")]
+/// Opens an authenticated WebVPN WebSocket using the supplied Cookie header.
 pub async fn connect_websocket(
     url: &str,
     cookie: &str,
@@ -550,7 +677,18 @@ pub async fn connect_websocket(
         })?,
     );
 
-    let (websocket, _) = match connect_async_with_config(request, None, true).await {
+    let connection = tokio::time::timeout(
+        Duration::from_secs(WEBSOCKET_CONNECT_TIMEOUT_SECS),
+        connect_async_with_config(request, None, true),
+    )
+    .await
+    .map_err(|_| {
+        ConnectFailure::Other(anyhow!(
+            "websocket handshake timed out after {WEBSOCKET_CONNECT_TIMEOUT_SECS}s: {url}"
+        ))
+    })?;
+
+    let (websocket, _) = match connection {
         Ok(result) => result,
         Err(WebSocketError::Http(response)) => {
             let location = response
@@ -588,6 +726,7 @@ pub async fn connect_websocket(
 }
 
 #[allow(clippy::result_large_err)]
+/// Accepts a WebSocket and returns it together with the requested URL path.
 pub async fn accept_websocket_with_path(
     stream: TcpStream,
 ) -> Result<(WebSocketStream<TcpStream>, String)> {
@@ -621,6 +760,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "client")]
     fn builds_webvpn_ws_url_from_server_and_target() {
         let url = build_webvpn_ws_url("192.0.2.10:4489", Some("3389")).unwrap();
 
@@ -631,6 +771,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "client")]
     fn builds_webvpn_keepalive_ws_url_from_server() {
         let url = build_webvpn_keepalive_ws_url("192.0.2.10:4489").unwrap();
 
@@ -641,6 +782,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "client")]
     fn target_path_uses_documented_defaults() {
         assert_eq!(
             tcp_target_url_path_from_addr(DEFAULT_TARGET_ADDR).unwrap(),
@@ -666,6 +808,19 @@ mod tests {
     }
 
     #[test]
+    fn tcp_target_path_requires_a_route_boundary() {
+        assert!(parse_tcp_target_path("/tcpfoo:22").is_err());
+        assert!(parse_tcp_target_path("/tcpx/22").is_err());
+        assert_eq!(parse_tcp_target_path("/tcp").unwrap(), DEFAULT_TARGET_ADDR);
+        assert_eq!(parse_tcp_target_path("/tcp/").unwrap(), DEFAULT_TARGET_ADDR);
+        assert_eq!(
+            parse_tcp_target_path("/tcp/2222").unwrap(),
+            "127.0.0.1:2222"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "client")]
     fn rsa_encrypt_matches_webvpn_rsa_utils() {
         let encrypted = rsa_encrypt(
             "654321",
@@ -698,5 +853,132 @@ mod tests {
             format_log_message(LogLevel::Error, "client", "failed"),
             "\x1b[31m[client]\x1b[0m failed"
         );
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn relay_moves_binary_data_in_both_directions() {
+        let tcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let mut target_peer = TcpStream::connect(tcp_addr).await.unwrap();
+        let (target_stream, _) = tcp_listener.accept().await.unwrap();
+
+        let ws_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (transport, _) = ws_listener.accept().await.unwrap();
+            let (websocket, path) = accept_websocket_with_path(transport).await.unwrap();
+            assert_eq!(path, "/tcp");
+            relay_stream(websocket, target_stream, WebVpnHeartbeatRole::Server)
+                .await
+                .unwrap();
+        });
+
+        let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/tcp"))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Binary(b"client-to-target".to_vec().into()))
+            .await
+            .unwrap();
+        let mut received = [0_u8; 16];
+        target_peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"client-to-target");
+
+        target_peer.write_all(b"target-to-client").await.unwrap();
+        let message = websocket.next().await.unwrap().unwrap();
+        assert_eq!(message.into_data(), b"target-to-client".as_slice());
+
+        websocket.close(None).await.unwrap();
+        relay_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_relay_consumes_tows_ready_control_frame() {
+        let tcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let relay_tcp = TcpStream::connect(tcp_addr).await.unwrap();
+        let (mut local_peer, _) = tcp_listener.accept().await.unwrap();
+
+        let ws_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (transport, _) = ws_listener.accept().await.unwrap();
+            let (mut websocket, _) = accept_websocket_with_path(transport).await.unwrap();
+            websocket
+                .send(Message::Text(TOWS_READY_MESSAGE.into()))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Binary(b"payload".to_vec().into()))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+
+        let (websocket, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/tcp"))
+            .await
+            .unwrap();
+        let relay = tokio::spawn(relay_stream(
+            websocket,
+            relay_tcp,
+            WebVpnHeartbeatRole::Client,
+        ));
+        let mut received = [0_u8; 7];
+        local_peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"payload");
+
+        server.await.unwrap();
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_tcp_half_close_for_the_response_direction() {
+        let tcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let mut target_peer = TcpStream::connect(tcp_addr).await.unwrap();
+        let (target_stream, _) = tcp_listener.accept().await.unwrap();
+
+        let ws_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (transport, _) = ws_listener.accept().await.unwrap();
+            let (websocket, _) = accept_websocket_with_path(transport).await.unwrap();
+            relay_stream(websocket, target_stream, WebVpnHeartbeatRole::Server).await
+        });
+        let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/tcp"))
+            .await
+            .unwrap();
+
+        target_peer.shutdown().await.unwrap();
+        assert_eq!(
+            websocket.next().await.unwrap().unwrap(),
+            Message::Text(TOWS_TCP_EOF_MESSAGE.into())
+        );
+        websocket
+            .send(Message::Binary(b"response".to_vec().into()))
+            .await
+            .unwrap();
+        let mut response = [0_u8; 8];
+        target_peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+
+        websocket
+            .send(Message::Text(TOWS_TCP_EOF_MESSAGE.into()))
+            .await
+            .unwrap();
+        relay.await.unwrap().unwrap();
     }
 }

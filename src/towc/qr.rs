@@ -1,3 +1,5 @@
+//! Terminal QR-code decoding and rendering for the client CLI.
+
 use anyhow::{Context, Result};
 use image::GrayImage;
 use std::io::{self, Write};

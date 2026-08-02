@@ -1,9 +1,13 @@
 use crate::{
-    ConnectFailure, DEFAULT_LOCAL_LISTEN_ADDR, DEFAULT_LOCAL_LISTEN_PORT, DEFAULT_SERVER_PORT,
-    DEFAULT_TARGET_HOST, DEFAULT_TARGET_PORT, TOWS_TARGET_CONNECT_FAILURE_PREFIX,
-    WebVpnHeartbeatRole, build_webvpn_ws_url, connect_websocket, log_error, log_info, log_success,
-    log_warn, normalize_server_addr, normalize_tcp_target_arg, parse_socket_addr_with_default_host,
-    relay_stream, rsa_encrypt,
+    ConnectFailure, DEFAULT_TARGET_HOST, TOWS_READY_MESSAGE, TOWS_TARGET_CONNECT_FAILURE_PREFIX,
+    WebVpnHeartbeatRole, build_webvpn_keepalive_ws_url, build_webvpn_ws_url, connect_websocket,
+    log_info, log_success, log_warn, normalize_server_addr, normalize_tcp_target_arg,
+    parse_socket_addr_with_default_host, relay_stream, rsa_encrypt,
+};
+#[cfg(feature = "cli")]
+use crate::{
+    DEFAULT_LOCAL_LISTEN_ADDR, DEFAULT_LOCAL_LISTEN_PORT, DEFAULT_SERVER_PORT, DEFAULT_TARGET_PORT,
+    log_error,
 };
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -13,7 +17,9 @@ use reqwest::{Client, Url};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
+#[cfg(feature = "cli")]
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -26,7 +32,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-#[path = "bin/towc/qr.rs"]
+#[cfg(feature = "cli")]
 mod qr;
 
 const WEBVPN_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/login";
@@ -39,9 +45,7 @@ const WECHAT_APP_ID: &str = "wx16c67d169e7a9290";
 const WECHAT_REDIRECT_URI: &str = "https://cas.szut.edu.cn/cas/login?service=https%3A%2F%2Fwebvpn.szut.edu.cn%2Flogin%3Fcas_login%3Dtrue&client_name=WeiXinClient";
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0";
 const WEBVPN_FINGERPRINT: &str = "5a0b00fe6ae8277a4bfadd4e103f6e1c";
-const WEBVPN_READY_ATTEMPTS: usize = 6;
-const WEBVPN_READY_SETTLE_MS: u64 = 700;
-const WEBVPN_READY_TIMEOUT_MS: u64 = 900;
+const WEBVPN_READY_TIMEOUT_SECS: u64 = 8;
 const CACHED_LOGIN_TIMEOUT_SECS: u64 = 8;
 const WEBVPN_COOKIE_REFRESH_INTERVAL_SECS: u64 = 180;
 const WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS: u64 = 8;
@@ -51,20 +55,40 @@ const WECHAT_POLL_ATTEMPTS: usize = 180;
 const WECHAT_POLL_TIMEOUT_SECS: u64 = 35;
 const WECHAT_POLL_SETTLE_MS: u64 = 1800;
 const COOKIE_CACHE_FILE_NAME: &str = "webvpn.cookie";
+/// Environment variable overriding the built-in Cookie/defaults cache directory.
+///
+/// A process manager can assign a distinct value to every `towc` child process
+/// to avoid cross-process cache coordination.
+pub const CACHE_DIRECTORY_ENV: &str = "TCP_OVER_WEBSOCKET_CACHE_DIR";
+#[cfg(feature = "cli")]
 const INTERACTIVE_DEFAULTS_CACHE_FILE_NAME: &str = "interactive.defaults";
+#[cfg(feature = "cli")]
 const INTERACTIVE_DEFAULTS_CACHE_VERSION: &str = "1";
+#[cfg(feature = "cli")]
 const LOGIN_METHOD_PROMPT: &str =
     "login method (enter mobile/email, or press Enter for WeChat QR): ";
 const TUNNEL_RETRY_INTERVAL_SECS: u64 = 5;
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Interactive login method used when a cached WebVPN session is unavailable.
 pub enum LoginMethod {
-    Sms { mobile: String },
-    Email { email: String },
+    /// Request a verification code by SMS.
+    Sms {
+        /// Mobile number receiving the code.
+        mobile: String,
+    },
+    /// Request a verification code by email.
+    Email {
+        /// Email address receiving the code.
+        email: String,
+    },
+    /// Display a WeChat QR code and wait for confirmation.
     WechatQr,
 }
 
 impl LoginMethod {
+    /// Validates the login identifier without performing network I/O.
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Sms { mobile }
@@ -80,34 +104,70 @@ impl LoginMethod {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Observable lifecycle state of a shared WebVPN session.
 pub enum SessionState {
+    /// No usable login session exists.
     LoggedOut,
-    LoggingIn { method: LoginMethod },
+    /// A login flow is currently running.
+    LoggingIn {
+        /// Login method being used.
+        method: LoginMethod,
+    },
+    /// The session is authenticated and can open tunnels.
     Ready,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Detailed session events delivered to an embedded UI.
 pub enum SessionEvent {
+    /// Cached credentials are being checked.
     CheckingCachedCookie,
+    /// No valid cached credentials were available.
     CachedCookieUnavailable,
-    LoggingIn { method: LoginMethod },
-    CodeRequested { label: String },
-    QrCode { jpeg: Vec<u8> },
+    /// An interactive login flow started.
+    LoggingIn {
+        /// Login method being used.
+        method: LoginMethod,
+    },
+    /// A verification code must be supplied by the UI.
+    CodeRequested {
+        /// Human-readable identifier for the requested code.
+        label: String,
+    },
+    /// A QR code is ready for display.
+    QrCode {
+        /// JPEG-encoded QR image.
+        jpeg: Vec<u8>,
+    },
+    /// Authentication completed successfully.
     Ready,
+    /// The gateway reported that the active session expired.
     Expired,
+    /// The session was explicitly logged out.
     LoggedOut,
-    Error { detail: String },
+    /// A login or refresh operation failed.
+    Error {
+        /// Human-readable error chain.
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Configuration for one independently managed local forwarding tunnel.
 pub struct TunnelConfig {
+    /// Remote `tows` host or host-port.
     pub server: String,
+    /// TCP target on the `tows` host, optionally using port-only shorthand.
     pub target: String,
+    /// Local listener address, optionally using port-only shorthand.
     pub listen_addr: String,
 }
 
 impl TunnelConfig {
+    /// Validates and normalizes all addresses without opening sockets.
     pub fn validate(&self) -> Result<()> {
         normalize_server_addr(&self.server).context("invalid tows address")?;
         normalize_tcp_target_arg(Some(&self.target)).context("invalid target address")?;
@@ -117,37 +177,83 @@ impl TunnelConfig {
     }
 }
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Observable lifecycle state of a local tunnel.
 pub enum TunnelState {
+    /// Stored but not started.
     Configured,
+    /// Started and waiting for an authenticated session.
     PendingAuth,
+    /// Checking gateway, server, and target readiness.
     Probing,
+    /// Listening locally and accepting connections.
     Running,
+    /// Waiting before another readiness attempt.
     Retrying,
+    /// Stopped because of a non-retryable configuration or listener error.
     Failed,
+    /// Explicitly stopped or canceled.
     Stopped,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Detailed per-tunnel events delivered to an embedded UI.
 pub enum TunnelEvent {
-    StateChanged { tunnel_id: u64, state: TunnelState },
-    LocalConnectionOpened { tunnel_id: u64, peer: String },
-    LocalConnectionClosed { tunnel_id: u64, peer: String },
-    Error { tunnel_id: u64, detail: String },
+    /// The tunnel lifecycle state changed.
+    StateChanged {
+        /// Tunnel identifier assigned by [`TunnelManager`].
+        tunnel_id: u64,
+        /// New tunnel state.
+        state: TunnelState,
+    },
+    /// A local TCP connection was accepted.
+    LocalConnectionOpened {
+        /// Owning tunnel identifier.
+        tunnel_id: u64,
+        /// Local peer address.
+        peer: String,
+    },
+    /// A previously opened local TCP connection ended.
+    LocalConnectionClosed {
+        /// Owning tunnel identifier.
+        tunnel_id: u64,
+        /// Local peer address.
+        peer: String,
+    },
+    /// A tunnel or one of its connections encountered an error.
+    Error {
+        /// Owning tunnel identifier.
+        tunnel_id: u64,
+        /// Human-readable error chain.
+        detail: String,
+    },
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Unified event stream for embedded client integrations.
 pub enum EmbeddedClientEvent {
+    /// Shared login-session event.
     Session(SessionEvent),
+    /// Per-tunnel event.
     Tunnel(TunnelEvent),
 }
 
+/// UI boundary used by embedded applications.
+///
+/// Callbacks run on library tasks and should return quickly. Dispatch expensive
+/// rendering or user interaction to the host application's own executor.
 pub trait EmbeddedClientUi: Send + Sync {
+    /// Receives an ordered session or tunnel event.
     fn emit(&self, event: EmbeddedClientEvent);
+    /// Obtains a verification code after a matching `CodeRequested` event.
     fn request_verification_code(&self, label: &str) -> Result<String>;
 }
 
 #[derive(Clone)]
+/// Handle to the currently authenticated session.
 pub struct SessionHandle {
     cookie: Arc<Mutex<String>>,
 }
@@ -159,6 +265,7 @@ impl SessionHandle {
 }
 
 #[derive(Clone)]
+/// Owns login state and the background Cookie refresh lifecycle.
 pub struct SessionManager {
     inner: Arc<SessionManagerInner>,
 }
@@ -186,6 +293,7 @@ impl Drop for SessionRuntime {
 }
 
 impl SessionManager {
+    /// Creates a logged-out session manager using `ui` for callbacks.
     pub fn new(ui: Arc<dyn EmbeddedClientUi>) -> Self {
         install_crypto_provider();
         let initial = SessionState::LoggedOut;
@@ -202,6 +310,7 @@ impl SessionManager {
         }
     }
 
+    /// Returns a snapshot of the current session state.
     pub fn state(&self) -> SessionState {
         self.inner
             .state
@@ -210,10 +319,12 @@ impl SessionManager {
             .clone()
     }
 
+    /// Subscribes to session state changes.
     pub fn subscribe(&self) -> watch::Receiver<SessionState> {
         self.inner.state_tx.subscribe()
     }
 
+    /// Returns the active handle when the session is ready.
     pub fn handle(&self) -> Option<SessionHandle> {
         if self.state() != SessionState::Ready {
             return None;
@@ -226,6 +337,7 @@ impl SessionManager {
             .map(|runtime| runtime.handle.clone())
     }
 
+    /// Runs an interactive login unless the manager is already ready.
     pub async fn login(&self, method: LoginMethod) -> Result<SessionHandle> {
         let _login_guard = self.inner.login_lock.lock().await;
         method.validate()?;
@@ -284,25 +396,10 @@ impl SessionManager {
             }
         };
 
-        let handle = SessionHandle {
-            cookie: Arc::new(Mutex::new(cookie)),
-        };
-        let (cancel, cancel_rx) = watch::channel(false);
-        let refresh_task = tokio::spawn(maintain_session_cookie_refresh(
-            handle.clone(),
-            cancel_rx,
-            Arc::downgrade(&self.inner),
-        ));
-        *self.inner.runtime.lock().expect("session runtime poisoned") = Some(SessionRuntime {
-            handle: handle.clone(),
-            cancel,
-            refresh_task,
-        });
-        self.set_state(SessionState::Ready);
-        self.emit(SessionEvent::Ready);
-        Ok(handle)
+        Ok(self.activate_session(cookie))
     }
 
+    /// Validates cached credentials and starts refresh when they are usable.
     pub async fn login_with_cached_cookie(&self) -> Result<Option<SessionHandle>> {
         let _login_guard = self.inner.login_lock.lock().await;
         if let Some(handle) = self.handle() {
@@ -326,25 +423,51 @@ impl SessionManager {
         if self.inner.login_epoch.load(Ordering::Acquire) != login_epoch {
             return Ok(None);
         }
-        let handle = SessionHandle {
-            cookie: Arc::new(Mutex::new(cookie)),
-        };
-        let (cancel, cancel_rx) = watch::channel(false);
-        let refresh_task = tokio::spawn(maintain_session_cookie_refresh(
-            handle.clone(),
-            cancel_rx,
-            Arc::downgrade(&self.inner),
-        ));
-        *self.inner.runtime.lock().expect("session runtime poisoned") = Some(SessionRuntime {
-            handle: handle.clone(),
-            cancel,
-            refresh_task,
-        });
-        self.set_state(SessionState::Ready);
-        self.emit(SessionEvent::Ready);
-        Ok(Some(handle))
+        Ok(Some(self.activate_session(cookie)))
     }
 
+    /// Validates cached credentials against the configured `tows` endpoint.
+    ///
+    /// Unlike portal refresh validation, this performs one direct WebSocket
+    /// handshake through the same gateway route used by tunnels. A redirect to
+    /// login is therefore detected before the tunnel manager is started.
+    pub async fn login_with_cached_cookie_for_server(
+        &self,
+        server: &str,
+    ) -> Result<Option<SessionHandle>> {
+        let _login_guard = self.inner.login_lock.lock().await;
+        if let Some(handle) = self.handle() {
+            return Ok(Some(handle));
+        }
+        let login_epoch = self.inner.login_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.emit(SessionEvent::CheckingCachedCookie);
+        let cached_cookie = match try_cached_tunnel_login(server).await {
+            Ok(CachedCookieCheck::Ready(cookie)) => Some(cookie),
+            Ok(CachedCookieCheck::Unavailable) => {
+                self.emit(SessionEvent::CachedCookieUnavailable);
+                None
+            }
+            Ok(CachedCookieCheck::Expired) => {
+                self.emit(SessionEvent::Expired);
+                None
+            }
+            Err(err) => {
+                self.emit(SessionEvent::Error {
+                    detail: format!("{err:#}"),
+                });
+                return Err(err);
+            }
+        };
+        let Some(cookie) = cached_cookie else {
+            return Ok(None);
+        };
+        if self.inner.login_epoch.load(Ordering::Acquire) != login_epoch {
+            return Ok(None);
+        }
+        Ok(Some(self.activate_session(cookie)))
+    }
+
+    /// Cancels refresh and transitions the session to logged out.
     pub fn logout(&self) {
         self.inner.login_epoch.fetch_add(1, Ordering::AcqRel);
         self.inner
@@ -380,6 +503,26 @@ impl SessionManager {
         }
     }
 
+    fn activate_session(&self, cookie: String) -> SessionHandle {
+        let handle = SessionHandle {
+            cookie: Arc::new(Mutex::new(cookie)),
+        };
+        let (cancel, cancel_rx) = watch::channel(false);
+        let refresh_task = tokio::spawn(maintain_session_cookie_refresh(
+            handle.clone(),
+            cancel_rx,
+            Arc::downgrade(&self.inner),
+        ));
+        *self.inner.runtime.lock().expect("session runtime poisoned") = Some(SessionRuntime {
+            handle: handle.clone(),
+            cancel,
+            refresh_task,
+        });
+        self.set_state(SessionState::Ready);
+        self.emit(SessionEvent::Ready);
+        handle
+    }
+
     fn set_state(&self, state: SessionState) {
         *self.inner.state.lock().expect("session state poisoned") = state.clone();
         self.inner.state_tx.send_replace(state);
@@ -391,22 +534,29 @@ impl SessionManager {
 }
 
 #[derive(Clone)]
+/// Lightweight observable handle for a configured tunnel.
 pub struct TunnelHandle {
     id: u64,
     state: Arc<Mutex<TunnelState>>,
 }
 
 impl TunnelHandle {
+    /// Returns the manager-assigned tunnel identifier.
     pub fn id(&self) -> u64 {
         self.id
     }
 
+    /// Returns a snapshot of the current tunnel state.
     pub fn state(&self) -> TunnelState {
         *self.state.lock().expect("tunnel state poisoned")
     }
 }
 
 #[derive(Clone)]
+/// Owns tunnel lifecycle state for embedded integrations.
+///
+/// The command-line client creates exactly one tunnel. Identifiers remain in
+/// the structured API so a future host can correlate lifecycle events.
 pub struct TunnelManager {
     inner: Arc<TunnelManagerInner>,
 }
@@ -423,6 +573,23 @@ struct TunnelRuntime {
     handle: TunnelHandle,
     cancel: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
+}
+
+struct LocalConnectionEventGuard {
+    ui: Arc<dyn EmbeddedClientUi>,
+    tunnel_id: u64,
+    peer: String,
+}
+
+impl Drop for LocalConnectionEventGuard {
+    fn drop(&mut self) {
+        self.ui.emit(EmbeddedClientEvent::Tunnel(
+            TunnelEvent::LocalConnectionClosed {
+                tunnel_id: self.tunnel_id,
+                peer: self.peer.clone(),
+            },
+        ));
+    }
 }
 
 impl Drop for TunnelManagerInner {
@@ -442,6 +609,7 @@ impl Drop for TunnelManagerInner {
 }
 
 impl TunnelManager {
+    /// Creates a tunnel manager bound to a shared session and UI sink.
     pub fn new(session: SessionManager, ui: Arc<dyn EmbeddedClientUi>) -> Self {
         Self {
             inner: Arc::new(TunnelManagerInner {
@@ -453,6 +621,7 @@ impl TunnelManager {
         }
     }
 
+    /// Validates and stores a tunnel, returning its identifier.
     pub fn add(&self, config: TunnelConfig) -> Result<u64> {
         config.validate()?;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
@@ -476,6 +645,7 @@ impl TunnelManager {
         Ok(id)
     }
 
+    /// Returns an observable handle for a known tunnel.
     pub fn handle(&self, id: u64) -> Option<TunnelHandle> {
         self.inner
             .tunnels
@@ -485,6 +655,7 @@ impl TunnelManager {
             .map(|runtime| runtime.handle.clone())
     }
 
+    /// Starts a tunnel; starting an already-running tunnel is a no-op.
     pub async fn start(&self, id: u64) -> Result<()> {
         let mut tunnels = self.inner.tunnels.lock().expect("tunnel map poisoned");
         let runtime = tunnels
@@ -510,6 +681,7 @@ impl TunnelManager {
         Ok(())
     }
 
+    /// Stops a tunnel and all active local connections.
     pub async fn stop(&self, id: u64) -> Result<()> {
         let (cancel, task, handle) = {
             let mut tunnels = self.inner.tunnels.lock().expect("tunnel map poisoned");
@@ -533,6 +705,7 @@ impl TunnelManager {
         Ok(())
     }
 
+    /// Stops and removes a tunnel from the manager.
     pub async fn remove(&self, id: u64) -> Result<()> {
         self.stop(id).await?;
         self.inner
@@ -552,6 +725,7 @@ async fn run_tunnel_task(
     mut cancel: watch::Receiver<bool>,
 ) {
     let mut session_state = session.subscribe();
+    let mut last_probe_error: Option<String> = None;
     loop {
         let Some(session_handle) =
             wait_for_session(&handle, &ui, &session, &mut session_state, &mut cancel).await
@@ -599,7 +773,11 @@ async fn run_tunnel_task(
             if session.state() != SessionState::Ready {
                 continue;
             }
-            emit_tunnel_error(&ui, handle.id, format!("{err:#}"));
+            let detail = format!("{err:#}");
+            if last_probe_error.as_deref() != Some(detail.as_str()) {
+                emit_tunnel_error(&ui, handle.id, detail.clone());
+                last_probe_error = Some(detail);
+            }
             set_tunnel_state(&handle, &ui, TunnelState::Retrying);
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(TUNNEL_RETRY_INTERVAL_SECS)) => {}
@@ -608,6 +786,7 @@ async fn run_tunnel_task(
             }
             continue;
         }
+        last_probe_error = None;
 
         let listen_addr =
             match parse_socket_addr_with_default_host(&config.listen_addr, DEFAULT_TARGET_HOST) {
@@ -657,7 +836,13 @@ async fn run_tunnel_task(
                             ));
                             let url = url.clone();
                             let cookie = Arc::clone(session_handle.cookie());
+                            let connection_event_guard = LocalConnectionEventGuard {
+                                ui: Arc::clone(&ui),
+                                tunnel_id: handle.id,
+                                peer: peer.clone(),
+                            };
                             connections.spawn(async move {
+                                let _connection_event_guard = connection_event_guard;
                                 let result = handle_local_connection(stream, &url, &cookie).await;
                                 (peer, result)
                             });
@@ -673,12 +858,6 @@ async fn run_tunnel_task(
                     let Some(Ok((peer, result))) = result else {
                         continue;
                     };
-                    ui.emit(EmbeddedClientEvent::Tunnel(
-                        TunnelEvent::LocalConnectionClosed {
-                            tunnel_id: handle.id,
-                            peer: peer.clone(),
-                        },
-                    ));
                     match result {
                         Ok(()) => {}
                         Err(ConnectFailure::CookieExpired { .. }) => {
@@ -777,6 +956,7 @@ struct PublicKeyResponse {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "cli")]
 struct ClientConfig {
     server: String,
     target: Option<String>,
@@ -784,12 +964,14 @@ struct ClientConfig {
     login: Option<VerificationLogin>,
 }
 
+#[cfg(feature = "cli")]
 struct InteractiveForwardingConfig {
     target: String,
     listen_addr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "cli")]
 struct InteractiveDefaults {
     server: String,
     target: String,
@@ -799,6 +981,7 @@ struct InteractiveDefaults {
 type WebVpnClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "cli")]
 enum ParsedArgs {
     Help,
     Interactive,
@@ -829,6 +1012,7 @@ enum ReadinessFailureKind {
     ClosedAfterOpen,
     OpenFailed,
     ReadFailed,
+    ReadyTimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -840,6 +1024,7 @@ enum ReadinessFailure {
     ClosedAfterOpen { reason: Option<String> },
     OpenFailed { detail: String },
     ReadFailed { detail: String },
+    ReadyTimedOut,
 }
 
 impl ReadinessFailure {
@@ -852,6 +1037,7 @@ impl ReadinessFailure {
             Self::ClosedAfterOpen { .. } => ReadinessFailureKind::ClosedAfterOpen,
             Self::OpenFailed { .. } => ReadinessFailureKind::OpenFailed,
             Self::ReadFailed { .. } => ReadinessFailureKind::ReadFailed,
+            Self::ReadyTimedOut => ReadinessFailureKind::ReadyTimedOut,
         }
     }
 
@@ -864,6 +1050,7 @@ impl ReadinessFailure {
             Self::ClosedAfterOpen { .. } => "WebSocket closed after opening",
             Self::OpenFailed { .. } => "WebSocket open failed",
             Self::ReadFailed { .. } => "WebSocket read failed",
+            Self::ReadyTimedOut => "tows readiness acknowledgement timed out",
         }
     }
 
@@ -926,12 +1113,35 @@ impl ReadinessFailure {
                 ),
                 format!("detail: {detail}"),
             ],
+            Self::ReadyTimedOut => vec![
+                format!(
+                    "phase: WebVPN opened the route to {server_addr}, but tows did not confirm target {target_addr}"
+                ),
+                "likely cause: tows is outdated/stalled, or target TCP connect did not complete".to_string(),
+                "check: update/restart tows and verify the target is reachable from its host".to_string(),
+            ],
         }
     }
 }
 
-struct TerminalUi;
+#[cfg(feature = "cli")]
+struct TerminalUi {
+    ready_message: String,
+}
 
+#[cfg(feature = "cli")]
+impl TerminalUi {
+    fn new(config: &TunnelConfig) -> Self {
+        Self {
+            ready_message: format!(
+                "ready: local {} -> WebVPN -> tows {} -> target {}",
+                config.listen_addr, config.server, config.target
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
 impl EmbeddedClientUi for TerminalUi {
     fn emit(&self, event: EmbeddedClientEvent) {
         match event {
@@ -952,17 +1162,20 @@ impl EmbeddedClientUi for TerminalUi {
             EmbeddedClientEvent::Session(SessionEvent::Error { detail }) => {
                 log_error("session", detail);
             }
-            EmbeddedClientEvent::Tunnel(TunnelEvent::StateChanged { tunnel_id, state }) => {
-                log_info("tunnel", format!("#{tunnel_id} state: {state:?}"));
+            EmbeddedClientEvent::Tunnel(TunnelEvent::StateChanged {
+                state: TunnelState::Running,
+                ..
+            }) => {
+                log_success("tunnel", &self.ready_message);
             }
-            EmbeddedClientEvent::Tunnel(TunnelEvent::LocalConnectionOpened { tunnel_id, peer }) => {
-                log_success("tunnel", format!("#{tunnel_id} tcp {peer} connected"))
+            EmbeddedClientEvent::Tunnel(TunnelEvent::LocalConnectionOpened { peer, .. }) => {
+                log_success("tunnel", format!("tcp {peer} connected"))
             }
-            EmbeddedClientEvent::Tunnel(TunnelEvent::LocalConnectionClosed { tunnel_id, peer }) => {
-                log_info("tunnel", format!("#{tunnel_id} tcp {peer} closed"))
+            EmbeddedClientEvent::Tunnel(TunnelEvent::LocalConnectionClosed { peer, .. }) => {
+                log_info("tunnel", format!("tcp {peer} closed"))
             }
-            EmbeddedClientEvent::Tunnel(TunnelEvent::Error { tunnel_id, detail }) => {
-                log_error("tunnel", format!("#{tunnel_id}: {detail}"));
+            EmbeddedClientEvent::Tunnel(TunnelEvent::Error { detail, .. }) => {
+                log_error("tunnel", detail);
             }
             _ => {}
         }
@@ -982,25 +1195,37 @@ impl std::fmt::Display for ReadinessFailureKind {
 impl std::error::Error for ReadinessFailureKind {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Convenience configuration for the single-tunnel embedded runner.
 pub struct EmbeddedClientConfig {
+    /// Remote `tows` host or host-port.
     pub server: String,
+    /// TCP target on the server.
     pub target: String,
+    /// Local listener address.
     pub listen_addr: String,
+    /// Fallback login method when cached credentials are unavailable.
     pub login: LoginMethod,
 }
 
+/// Backward-compatible name for [`LoginMethod`].
 pub type EmbeddedLogin = LoginMethod;
 
+/// Runs one authenticated tunnel until `shutdown` becomes true or closes.
 pub async fn run_embedded_client(
     config: EmbeddedClientConfig,
     ui: Arc<dyn EmbeddedClientUi>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     install_crypto_provider();
+    let login = config.login.clone();
     let session = SessionManager::new(Arc::clone(&ui));
     let tunnels = TunnelManager::new(session.clone(), ui);
-    if session.login_with_cached_cookie().await?.is_none() {
-        session.login(config.login).await?;
+    if session
+        .login_with_cached_cookie_for_server(&config.server)
+        .await?
+        .is_none()
+    {
+        session.login(login.clone()).await?;
     }
     let id = tunnels.add(TunnelConfig {
         server: config.server,
@@ -1008,14 +1233,35 @@ pub async fn run_embedded_client(
         listen_addr: config.listen_addr,
     })?;
     tunnels.start(id).await?;
-    if !*shutdown.borrow() {
-        let _ = shutdown.changed().await;
+    let mut session_state = session.subscribe();
+    while !*shutdown.borrow() {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            changed = session_state.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if *session_state.borrow() == SessionState::LoggedOut {
+                    tokio::select! {
+                        login_result = session.login(login.clone()) => {
+                            login_result.context("failed to restore expired WebVPN session")?;
+                        }
+                        _ = shutdown.changed() => break,
+                    }
+                }
+            }
+        }
     }
     tunnels.stop(id).await?;
     session.logout();
     Ok(())
 }
 
+/// Returns the directory used by the built-in credential and defaults cache.
 pub fn cache_directory() -> Option<PathBuf> {
     cookie_cache_path().and_then(|path| path.parent().map(PathBuf::from))
 }
@@ -1024,13 +1270,15 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Runs the `towc` command-line interface.
+#[cfg(feature = "cli")]
 pub async fn run_cli() -> Result<()> {
     log_info("client", format!("towc v{}", env!("CARGO_PKG_VERSION")));
     install_crypto_provider();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let parsed_args = parse_args(&raw_args)?;
-    let (config, fallback_login) = match parsed_args {
+    let (config, mut login_method) = match parsed_args {
         ParsedArgs::Help => {
             print_usage();
             return Ok(());
@@ -1045,31 +1293,72 @@ pub async fn run_cli() -> Result<()> {
             (config, Some(login))
         }
     };
-    let ui: Arc<dyn EmbeddedClientUi> = Arc::new(TerminalUi);
+    let tunnel_config = TunnelConfig {
+        server: normalize_server_addr(&config.server)?,
+        target: normalize_tcp_target_arg(config.target.as_deref())?,
+        listen_addr: parse_socket_addr_with_default_host(&config.listen_addr, DEFAULT_TARGET_HOST)?
+            .to_string(),
+    };
+    let ui: Arc<dyn EmbeddedClientUi> = Arc::new(TerminalUi::new(&tunnel_config));
     let session = SessionManager::new(Arc::clone(&ui));
     let tunnels = TunnelManager::new(session.clone(), ui);
-    if session.login_with_cached_cookie().await?.is_none() {
-        let login = match fallback_login {
+    if session
+        .login_with_cached_cookie_for_server(&tunnel_config.server)
+        .await?
+        .is_none()
+    {
+        let login = match login_method.clone() {
             Some(login) => login,
             None => prompt_login_identity()?
                 .map(login_method_from_verification)
                 .unwrap_or(LoginMethod::WechatQr),
         };
+        login_method = Some(login.clone());
         session.login(login).await?;
     }
-    let id = tunnels.add(TunnelConfig {
-        server: config.server,
-        target: normalize_tcp_target_arg(config.target.as_deref())?,
-        listen_addr: config.listen_addr,
-    })?;
+    let id = tunnels.add(tunnel_config)?;
     tunnels.start(id).await?;
-    tokio::signal::ctrl_c().await?;
+    let mut session_state = session.subscribe();
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            shutdown_result = &mut shutdown => {
+                shutdown_result?;
+                break;
+            }
+            changed = session_state.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if *session_state.borrow() == SessionState::LoggedOut {
+                    let login = match login_method.clone() {
+                        Some(login) => login,
+                        None => prompt_login_identity()?
+                            .map(login_method_from_verification)
+                            .unwrap_or(LoginMethod::WechatQr),
+                    };
+                    login_method = Some(login.clone());
+                    tokio::select! {
+                        login_result = session.login(login) => {
+                            login_result.context("failed to restore expired WebVPN session")?;
+                        }
+                        shutdown_result = &mut shutdown => {
+                            shutdown_result?;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     log_info("client", "shutting down");
     tunnels.stop(id).await?;
     session.logout();
     Ok(())
 }
 
+#[cfg(feature = "cli")]
 async fn prepare_interactive_startup() -> Result<ClientConfig> {
     let cached_defaults = read_cached_interactive_defaults();
     let server = match &cached_defaults {
@@ -1107,6 +1396,7 @@ async fn prepare_interactive_startup() -> Result<ClientConfig> {
     })
 }
 
+#[cfg(feature = "cli")]
 fn login_method_from_verification(login: VerificationLogin) -> LoginMethod {
     match login {
         VerificationLogin::Sms { mobile } => LoginMethod::Sms { mobile },
@@ -1114,6 +1404,7 @@ fn login_method_from_verification(login: VerificationLogin) -> LoginMethod {
     }
 }
 
+#[cfg(feature = "cli")]
 async fn prompt_interactive_forwarding_config(
     target_default: &str,
     listen_default: &str,
@@ -1127,6 +1418,7 @@ async fn prompt_interactive_forwarding_config(
     .context("interactive forwarding parameter task failed")?
 }
 
+#[cfg(feature = "cli")]
 fn prompt_interactive_forwarding_config_blocking(
     target_default: &str,
     listen_default: &str,
@@ -1245,6 +1537,55 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
     }
 }
 
+enum CachedCookieCheck {
+    Unavailable,
+    Expired,
+    Ready(String),
+}
+
+fn cached_cookie_check_from_failure(
+    cookie: String,
+    failure: ConnectFailure,
+) -> Result<CachedCookieCheck> {
+    match failure {
+        ConnectFailure::CookieExpired { .. } => Ok(CachedCookieCheck::Expired),
+        // `/wengine-vpn/failed` is returned after authentication when WebVPN
+        // cannot reach tows. The Cookie is valid; tunnel recovery handles the
+        // endpoint outage separately.
+        ConnectFailure::WebVpnFailed { .. } => Ok(CachedCookieCheck::Ready(cookie)),
+        ConnectFailure::Other(err) => {
+            Err(err).context("failed to verify cached WebVPN login through tunnel endpoint")
+        }
+    }
+}
+
+async fn try_cached_tunnel_login(server: &str) -> Result<CachedCookieCheck> {
+    let Some(cookie) = read_cached_cookie() else {
+        return Ok(CachedCookieCheck::Unavailable);
+    };
+    if ticket_cookie_from_header(&cookie).is_none()
+        || HeaderValue::from_bytes(cookie.as_bytes()).is_err()
+    {
+        return Ok(CachedCookieCheck::Unavailable);
+    }
+
+    let url = build_webvpn_keepalive_ws_url(server)?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(CACHED_LOGIN_TIMEOUT_SECS),
+        connect_websocket(&url, &cookie),
+    )
+    .await
+    .context("timed out while checking cached WebVPN cookie against tunnel endpoint")?;
+
+    match result {
+        Ok(mut websocket) => {
+            let _ = websocket.send(Message::Close(None)).await;
+            Ok(CachedCookieCheck::Ready(cookie))
+        }
+        Err(failure) => cached_cookie_check_from_failure(cookie, failure),
+    }
+}
+
 async fn maintain_session_cookie_refresh(
     session: SessionHandle,
     mut cancel: watch::Receiver<bool>,
@@ -1310,6 +1651,7 @@ fn unix_timestamp_millis() -> u128 {
         .as_millis()
 }
 
+#[cfg(feature = "cli")]
 fn parse_args(args: &[String]) -> Result<ParsedArgs> {
     if args.is_empty() {
         return Ok(ParsedArgs::Interactive);
@@ -1369,6 +1711,7 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs> {
     Ok(ParsedArgs::Run(config))
 }
 
+#[cfg(feature = "cli")]
 fn next_flag_value(args: &[String], index: &mut usize, name: &str) -> Result<String> {
     *index += 1;
     let value = args
@@ -1381,10 +1724,12 @@ fn next_flag_value(args: &[String], index: &mut usize, name: &str) -> Result<Str
     Ok(value.to_string())
 }
 
+#[cfg(feature = "cli")]
 fn is_help_arg(value: &str) -> bool {
     value == "--help" || value == "-h"
 }
 
+#[cfg(feature = "cli")]
 fn prompt_login_identity() -> Result<Option<VerificationLogin>> {
     loop {
         let Some(value) = prompt_optional(LOGIN_METHOD_PROMPT)? else {
@@ -1398,6 +1743,7 @@ fn prompt_login_identity() -> Result<Option<VerificationLogin>> {
     }
 }
 
+#[cfg(feature = "cli")]
 fn prompt_required(prompt: &str) -> Result<String> {
     loop {
         let Some(value) = prompt_line(prompt)? else {
@@ -1410,14 +1756,17 @@ fn prompt_required(prompt: &str) -> Result<String> {
     }
 }
 
+#[cfg(feature = "cli")]
 fn prompt_optional(prompt: &str) -> Result<Option<String>> {
     Ok(prompt_line(prompt)?.filter(|value| !value.is_empty()))
 }
 
+#[cfg(feature = "cli")]
 fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
     Ok(prompt_optional(prompt)?.unwrap_or_else(|| default.to_string()))
 }
 
+#[cfg(feature = "cli")]
 fn prompt_line(prompt: &str) -> Result<Option<String>> {
     print!("{prompt}");
     io::stdout().flush().context("failed to flush prompt")?;
@@ -1433,6 +1782,7 @@ fn prompt_line(prompt: &str) -> Result<Option<String>> {
     Ok(Some(value.trim().to_string()))
 }
 
+#[cfg(feature = "cli")]
 fn parse_login_identity(value: &str) -> Result<VerificationLogin> {
     let value = value.trim();
     if value.is_empty() {
@@ -1454,6 +1804,7 @@ fn parse_login_identity(value: &str) -> Result<VerificationLogin> {
     anyhow::bail!("invalid login value: use a numeric mobile number or an email address")
 }
 
+#[cfg(feature = "cli")]
 fn validate_interactive_defaults(defaults: &InteractiveDefaults) -> Result<()> {
     normalize_server_addr(&defaults.server).context("invalid tows address")?;
     normalize_tcp_target_arg(Some(&defaults.target)).context("invalid target address")?;
@@ -1462,6 +1813,7 @@ fn validate_interactive_defaults(defaults: &InteractiveDefaults) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cli")]
 fn format_interactive_defaults(defaults: &InteractiveDefaults) -> String {
     format!(
         "version={INTERACTIVE_DEFAULTS_CACHE_VERSION}\nserver={}\ntarget={}\nlisten={}\n",
@@ -1469,6 +1821,7 @@ fn format_interactive_defaults(defaults: &InteractiveDefaults) -> String {
     )
 }
 
+#[cfg(feature = "cli")]
 fn parse_interactive_defaults(contents: &str) -> Result<InteractiveDefaults> {
     let mut version = None;
     let mut server = None;
@@ -1507,6 +1860,7 @@ fn parse_interactive_defaults(contents: &str) -> Result<InteractiveDefaults> {
     Ok(defaults)
 }
 
+#[cfg(feature = "cli")]
 fn read_cached_interactive_defaults() -> Option<InteractiveDefaults> {
     let path = interactive_defaults_cache_path()?;
     match fs::read_to_string(&path) {
@@ -1533,6 +1887,7 @@ fn read_cached_interactive_defaults() -> Option<InteractiveDefaults> {
     }
 }
 
+#[cfg(feature = "cli")]
 fn write_cached_interactive_defaults(defaults: &InteractiveDefaults) {
     let Some(path) = interactive_defaults_cache_path() else {
         log_warn(
@@ -1614,6 +1969,9 @@ fn write_cached_cookie(cookie: &str) {
 
 #[cfg(windows)]
 fn cache_file_path(file_name: &str) -> Option<PathBuf> {
+    if let Some(path) = configured_cache_directory() {
+        return Some(path.join(file_name));
+    }
     std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
@@ -1622,6 +1980,9 @@ fn cache_file_path(file_name: &str) -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 fn cache_file_path(file_name: &str) -> Option<PathBuf> {
+    if let Some(path) = configured_cache_directory() {
+        return Some(path.join(file_name));
+    }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
@@ -1629,10 +1990,17 @@ fn cache_file_path(file_name: &str) -> Option<PathBuf> {
     Some(base.join("tcp_over_websocket").join(file_name))
 }
 
+fn configured_cache_directory() -> Option<PathBuf> {
+    std::env::var_os(CACHE_DIRECTORY_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 fn cookie_cache_path() -> Option<PathBuf> {
     cache_file_path(COOKIE_CACHE_FILE_NAME)
 }
 
+#[cfg(feature = "cli")]
 fn interactive_defaults_cache_path() -> Option<PathBuf> {
     cache_file_path(INTERACTIVE_DEFAULTS_CACHE_FILE_NAME)
 }
@@ -1643,129 +2011,18 @@ async fn wait_for_webvpn_ready(
     server_addr: &str,
     target_addr: &str,
 ) -> Result<()> {
-    let mut failures = Vec::new();
-    log_info("client", "checking WebVPN tunnel readiness");
-
-    for attempt in 1..=WEBVPN_READY_ATTEMPTS {
-        match probe_webvpn_ready(url, cookie).await {
-            Ok(()) => {
-                let message = if failures.is_empty() {
-                    "WebVPN tunnel ready".to_string()
-                } else {
-                    format!("WebVPN tunnel ready after {attempt}/{WEBVPN_READY_ATTEMPTS} attempts")
-                };
-                log_success("client", message);
-                return Ok(());
-            }
-            Err(failure) => {
-                failures.push(failure);
-                if attempt >= WEBVPN_READY_ATTEMPTS {
-                    continue;
-                }
-
-                if attempt == 1 {
-                    log_warn(
-                        "client",
-                        format!(
-                            "readiness check failed; retrying ({attempt}/{WEBVPN_READY_ATTEMPTS})"
-                        ),
-                    );
-                } else if readiness_failure_kind_changed(&failures) {
-                    let label = failures
-                        .last()
-                        .expect("failure was just recorded")
-                        .observation_label();
-                    log_warn(
-                        "client",
-                        format!(
-                            "readiness failure changed to {label}; retrying ({attempt}/{WEBVPN_READY_ATTEMPTS})"
-                        ),
-                    );
-                }
-            }
-        }
-
-        if attempt < WEBVPN_READY_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(WEBVPN_READY_SETTLE_MS)).await;
-        }
-    }
-
-    for (index, line) in readiness_failure_summary_lines(&failures, server_addr, target_addr)
-        .into_iter()
-        .enumerate()
-    {
-        if index == 0 {
-            log_error("client", line);
-        } else {
-            log_warn("client", line);
-        }
-    }
-
-    Err(anyhow::Error::new(
-        failures
-            .last()
-            .map(ReadinessFailure::kind)
-            .unwrap_or(ReadinessFailureKind::OpenFailed),
-    )
-    .context("WebVPN tunnel did not become ready; see diagnosis above"))
-}
-
-fn readiness_failure_kind_changed(failures: &[ReadinessFailure]) -> bool {
-    let [.., previous, current] = failures else {
-        return false;
+    let failure = match probe_webvpn_ready(url, cookie).await {
+        Ok(()) => return Ok(()),
+        Err(failure) => failure,
     };
 
-    previous.kind() != current.kind()
-}
-
-fn readiness_failure_summary_lines(
-    failures: &[ReadinessFailure],
-    server_addr: &str,
-    target_addr: &str,
-) -> Vec<String> {
-    let Some(last_failure) = failures.last() else {
-        return vec!["readiness failed without a captured failure detail".to_string()];
-    };
-
-    let mut lines = vec![format!(
-        "readiness failed after {} attempts: {}",
-        failures.len(),
-        readiness_failure_counts(failures).join(", ")
-    )];
-
-    if failures
-        .iter()
-        .any(|failure| failure.kind() != last_failure.kind())
-    {
-        lines.push(format!(
-            "last readiness failure: {}",
-            last_failure.observation_label()
-        ));
-    }
-
-    lines.extend(last_failure.diagnostic_lines(server_addr, target_addr));
-    lines
-}
-
-fn readiness_failure_counts(failures: &[ReadinessFailure]) -> Vec<String> {
-    let mut counts = Vec::<(ReadinessFailureKind, &'static str, usize)>::new();
-
-    for failure in failures {
-        if let Some((_, _, count)) = counts
-            .iter_mut()
-            .find(|(kind, _, _)| *kind == failure.kind())
-        {
-            *count += 1;
-            continue;
-        }
-
-        counts.push((failure.kind(), failure.observation_label(), 1));
-    }
-
-    counts
-        .into_iter()
-        .map(|(_, label, count)| format!("{label} x{count}"))
-        .collect()
+    let diagnosis = failure
+        .diagnostic_lines(server_addr, target_addr)
+        .join("; ");
+    Err(anyhow::Error::new(failure.kind()).context(format!(
+        "readiness failed: {}; {diagnosis}",
+        failure.observation_label()
+    )))
 }
 
 async fn probe_webvpn_ready(
@@ -1776,23 +2033,41 @@ async fn probe_webvpn_ready(
         .await
         .map_err(readiness_failure_from_connect_failure)?;
 
-    let timeout = tokio::time::sleep(Duration::from_millis(WEBVPN_READY_TIMEOUT_MS));
-    tokio::pin!(timeout);
-
-    let ready = tokio::select! {
-        message = websocket.next() => {
-            match message {
-                Some(Ok(Message::Close(frame))) => {
-                    Err(readiness_failure_from_close_reason(
-                        frame.map(|frame| frame.reason.to_string()),
-                    ))
+    let ready = match tokio::time::timeout(Duration::from_secs(WEBVPN_READY_TIMEOUT_SECS), async {
+        loop {
+            match websocket.next().await {
+                Some(Ok(Message::Text(text))) if text.as_str() == TOWS_READY_MESSAGE => {
+                    return Ok(());
                 }
-                Some(Ok(_)) => Ok(()),
-                Some(Err(err)) => Err(readiness_failure_from_websocket_error(err)),
-                None => Err(ReadinessFailure::ClosedAfterOpen { reason: None }),
+                Some(Ok(Message::Ping(payload))) => {
+                    websocket
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(readiness_failure_from_websocket_error)?;
+                }
+                Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Ok(Message::Close(frame))) => {
+                    return Err(readiness_failure_from_close_reason(
+                        frame.map(|frame| frame.reason.to_string()),
+                    ));
+                }
+                Some(Ok(_)) => {
+                    return Err(ReadinessFailure::ReadFailed {
+                        detail: "received data before the tows readiness acknowledgement"
+                            .to_string(),
+                    });
+                }
+                Some(Err(err)) => {
+                    return Err(readiness_failure_from_websocket_error(err));
+                }
+                None => return Err(ReadinessFailure::ClosedAfterOpen { reason: None }),
             }
         }
-        _ = &mut timeout => Ok(()),
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ReadinessFailure::ReadyTimedOut),
     };
 
     let _ = websocket.send(Message::Close(None)).await;
@@ -1848,7 +2123,6 @@ async fn login_with_wechat_qr(ui: &dyn EmbeddedClientUi) -> Result<String> {
     let client = build_login_client(Arc::clone(&cookie_jar))?;
     let login_entry = initialize_webvpn_ticket_cookie(&client, &cookie_jar).await?;
 
-    log_info("client", "fetching WeChat QR login page");
     let qr_page_url = wechat_qrconnect_url()?;
     let qr_page = client
         .get(qr_page_url)
@@ -1889,8 +2163,6 @@ async fn login_with_wechat_qr(ui: &dyn EmbeddedClientUi) -> Result<String> {
             anyhow::bail!("WeChat QR code expired; please restart towc and scan again");
         }
     };
-    log_success("client", "WeChat confirmed login");
-    log_info("client", "completing WebVPN authentication");
     let response = client
         .get(wechat_cas_callback_url(&code)?)
         .header(USER_AGENT, BROWSER_USER_AGENT)
@@ -1909,7 +2181,7 @@ async fn login_with_wechat_qr(ui: &dyn EmbeddedClientUi) -> Result<String> {
         .or(login_entry.cookie_header)
         .context("WeChat login completed but WebVPN cookie header was not found")?;
 
-    log_success("client", "WeChat QR login completed");
+    log_success("client", "WebVPN login successful (WeChat)");
     Ok(cookie)
 }
 
@@ -1936,20 +2208,13 @@ async fn login_with_verification_code(
     };
 
     log_info("client", format!("sending {label} verification code"));
-    let send_body = client
+    client
         .get(send_url)
         .send()
         .await
         .context("failed to send verification code request")?
         .error_for_status()
-        .context("verification code request failed")?
-        .text()
-        .await
-        .context("failed to read verification code response")?;
-    log_info(
-        "client",
-        format!("verification service response: {}", send_body.trim()),
-    );
+        .context("verification code request failed")?;
 
     let login_url = login_entry.cas_login_url;
     let login_html = client
@@ -1988,7 +2253,6 @@ async fn login_with_verification_code(
 
     let mut final_url = None::<String>;
     for attempt in 1..=CAS_LOGIN_ATTEMPTS {
-        log_info("client", "submitting verification login");
         let response = client
             .post(&login_url)
             .header(ORIGIN, "https://webvpn.szut.edu.cn")
@@ -2039,7 +2303,7 @@ async fn login_with_verification_code(
         .or(post_login_cookie)
         .or(login_entry.cookie_header)
         .context("login completed but WebVPN cookie header was not found")?;
-    log_success("client", "verification login completed");
+    log_success("client", "WebVPN login successful (verification code)");
     Ok(cookie)
 }
 
@@ -2047,7 +2311,6 @@ async fn initialize_webvpn_ticket_cookie(
     client: &Client,
     cookie_jar: &reqwest::cookie::Jar,
 ) -> Result<WebVpnLoginEntry> {
-    log_info("client", "initializing WebVPN ticket cookie");
     let response = client
         .get(WEBVPN_LOGIN_URL)
         .send()
@@ -2073,10 +2336,8 @@ async fn initialize_webvpn_ticket_cookie(
     if cookie_header
         .as_deref()
         .and_then(ticket_cookie_from_header)
-        .is_some()
+        .is_none()
     {
-        log_success("client", "WebVPN ticket cookie initialized");
-    } else {
         log_warn(
             "client",
             "WebVPN login entry did not set a ticket cookie; continuing with CAS login",
@@ -2096,7 +2357,6 @@ async fn initialize_webvpn_ticket_cookie(
 }
 
 async fn set_webvpn_fingerprint(client: &Client) -> Result<()> {
-    log_info("client", "registering WebVPN fingerprint");
     let url =
         format!("https://webvpn.szut.edu.cn/set-fingerprint?fingerprint={WEBVPN_FINGERPRINT}");
     client
@@ -2160,6 +2420,7 @@ fn wechat_poll_url(uuid: &str, last: Option<u16>) -> Result<String> {
 
 async fn poll_wechat_qr_code(client: &Client, uuid: &str) -> Result<WechatQrPollResult> {
     let mut last = None::<u16>;
+    let mut warned_unexpected_status = false;
     for _ in 1..=WECHAT_POLL_ATTEMPTS {
         let body = client
             .get(wechat_poll_url(uuid, last)?)
@@ -2191,14 +2452,16 @@ async fn poll_wechat_qr_code(client: &Client, uuid: &str) -> Result<WechatQrPoll
             403 => anyhow::bail!("WeChat QR login was canceled"),
             402 => return Ok(WechatQrPollResult::Expired),
             500 => {
-                log_warn("client", "WeChat QR polling returned 500, retrying");
                 tokio::time::sleep(Duration::from_millis(WECHAT_POLL_SETTLE_MS)).await;
             }
             other => {
-                log_warn(
-                    "client",
-                    format!("unexpected WeChat QR status {other}, retrying"),
-                );
+                if !warned_unexpected_status {
+                    log_warn(
+                        "client",
+                        format!("unexpected WeChat QR status {other}; continuing to wait"),
+                    );
+                    warned_unexpected_status = true;
+                }
                 tokio::time::sleep(Duration::from_millis(WECHAT_POLL_SETTLE_MS)).await;
             }
         }
@@ -2300,6 +2563,7 @@ fn extract_token_after(body: &str, marker: &str) -> Option<String> {
     if token.is_empty() { None } else { Some(token) }
 }
 
+#[cfg(feature = "cli")]
 fn prompt_verification_code(label: &str) -> Result<String> {
     print!("Enter {label} verification code: ");
     io::stdout()
@@ -2356,7 +2620,6 @@ async fn activate_webvpn_fingerprint_if_needed(
         return Ok(None);
     }
 
-    log_info("client", "activating WebVPN fingerprint");
     let activation_url = webvpn_fingerprint_activation_url(final_url)?;
     let response = client
         .get(activation_url)
@@ -2440,6 +2703,7 @@ fn attr_value(fragment: &str, name: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "cli")]
 fn print_usage() {
     println!(
         "Usage: towc\n       towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [--login <mobile|email>]"
@@ -2457,7 +2721,7 @@ fn print_usage() {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cli"))]
 mod tests {
     use super::*;
 
@@ -2495,7 +2759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_tunnels_wait_for_one_shared_session_independently() {
+    async fn tunnel_ids_remain_independent_for_embedded_event_correlation() {
         let ui = Arc::new(RecordingUi::default());
         let event_ui: Arc<dyn EmbeddedClientUi> = ui.clone();
         let session = SessionManager::new(Arc::clone(&event_ui));
@@ -2550,6 +2814,66 @@ mod tests {
     }
 
     #[test]
+    fn cached_cookie_login_redirect_is_classified_as_expired_immediately() {
+        let result = cached_cookie_check_from_failure(
+            "ticket=cached".to_string(),
+            ConnectFailure::CookieExpired {
+                location: "/webvpn.szut.edu.cn/login".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result, CachedCookieCheck::Expired));
+    }
+
+    #[test]
+    fn cached_cookie_remains_usable_when_only_tows_is_unreachable() {
+        let result = cached_cookie_check_from_failure(
+            "ticket=cached".to_string(),
+            ConnectFailure::WebVpnFailed {
+                location: "/wengine-vpn/failed".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result, CachedCookieCheck::Ready(cookie) if cookie == "ticket=cached"));
+    }
+
+    #[tokio::test]
+    async fn aborting_a_local_connection_still_emits_its_closed_event() {
+        let ui = Arc::new(RecordingUi::default());
+        let event_ui: Arc<dyn EmbeddedClientUi> = ui.clone();
+        let peer = "127.0.0.1:12345".to_string();
+        event_ui.emit(EmbeddedClientEvent::Tunnel(
+            TunnelEvent::LocalConnectionOpened {
+                tunnel_id: 7,
+                peer: peer.clone(),
+            },
+        ));
+        let guard = LocalConnectionEventGuard {
+            ui: event_ui,
+            tunnel_id: 7,
+            peer: peer.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        task.abort();
+        let _ = task.await;
+
+        let events = ui.events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EmbeddedClientEvent::Tunnel(TunnelEvent::LocalConnectionClosed {
+                tunnel_id: 7,
+                peer: closed_peer,
+            }) if closed_peer == &peer
+        )));
+    }
+
+    #[test]
     fn parses_server_first_and_options_in_any_order() {
         let parsed = parse_args(&args(&[
             "192.0.2.10:4489",
@@ -2594,37 +2918,24 @@ mod tests {
     }
 
     #[test]
-    fn readiness_summary_describes_webvpn_failed_as_tows_endpoint_issue() {
-        let failures = vec![
-            ReadinessFailure::WebVpnFailed {
-                location: "/wengine-vpn/failed".to_string(),
-            };
-            6
-        ];
+    fn readiness_diagnoses_webvpn_failed_as_tows_endpoint_issue() {
+        let failure = ReadinessFailure::WebVpnFailed {
+            location: "/wengine-vpn/failed".to_string(),
+        };
 
-        let lines = readiness_failure_summary_lines(&failures, "192.0.2.10:4489", "127.0.0.1:22");
+        let lines = failure.diagnostic_lines("192.0.2.10:4489", "127.0.0.1:22");
 
-        assert_eq!(
-            lines[0],
-            "readiness failed after 6 attempts: WebVPN returned /wengine-vpn/failed x6"
-        );
-        assert!(lines[1].contains("before tows accepted WebSocket"));
-        assert!(lines[2].contains("likely cause: tows is not running/reachable"));
+        assert!(lines[0].contains("before tows accepted WebSocket"));
+        assert!(lines[1].contains("likely cause: tows is not running/reachable"));
     }
 
     #[test]
-    fn readiness_summary_describes_reset_as_probable_target_issue() {
-        let failures = vec![ReadinessFailure::ResetAfterOpen; 6];
-
+    fn readiness_diagnoses_reset_as_probable_target_issue() {
         let lines =
-            readiness_failure_summary_lines(&failures, "192.0.2.10:4489", "127.0.0.1:54162");
+            ReadinessFailure::ResetAfterOpen.diagnostic_lines("192.0.2.10:4489", "127.0.0.1:54162");
 
-        assert_eq!(
-            lines[0],
-            "readiness failed after 6 attempts: WebSocket reset after opening x6"
-        );
-        assert!(lines[1].contains("WebVPN reached tows"));
-        assert!(lines[2].contains("likely cause: target 127.0.0.1:54162"));
+        assert!(lines[0].contains("WebVPN reached tows"));
+        assert!(lines[1].contains("likely cause: target 127.0.0.1:54162"));
     }
 
     #[test]
@@ -2642,10 +2953,9 @@ mod tests {
             }
         );
 
-        let lines =
-            readiness_failure_summary_lines(&[failure], "192.0.2.10:4489", "127.0.0.1:54162");
-        assert!(lines[1].contains("then failed to connect target 127.0.0.1:54162"));
-        assert!(lines[2].contains("cause: target TCP connection failed"));
+        let lines = failure.diagnostic_lines("192.0.2.10:4489", "127.0.0.1:54162");
+        assert!(lines[0].contains("then failed to connect target 127.0.0.1:54162"));
+        assert!(lines[1].contains("cause: target TCP connection failed"));
     }
 
     #[test]
@@ -2743,6 +3053,20 @@ mod tests {
         assert_eq!(
             LOGIN_METHOD_PROMPT,
             "login method (enter mobile/email, or press Enter for WeChat QR): "
+        );
+    }
+
+    #[test]
+    fn terminal_ready_message_contains_the_complete_tunnel_path() {
+        let ui = TerminalUi::new(&TunnelConfig {
+            server: "10.18.47.77:4489".to_string(),
+            target: "127.0.0.1:22".to_string(),
+            listen_addr: "127.0.0.1:14489".to_string(),
+        });
+
+        assert_eq!(
+            ui.ready_message,
+            "ready: local 127.0.0.1:14489 -> WebVPN -> tows 10.18.47.77:4489 -> target 127.0.0.1:22"
         );
     }
 }

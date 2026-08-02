@@ -1,5 +1,5 @@
 use crate::{
-    DEFAULT_SERVER_PORT, SERVER_LISTEN_ADDR, SERVER_LISTEN_HOST,
+    DEFAULT_SERVER_PORT, SERVER_LISTEN_ADDR, SERVER_LISTEN_HOST, TOWS_READY_MESSAGE,
     TOWS_TARGET_CONNECT_FAILURE_PREFIX, WEBVPN_KEEPALIVE_PATH, WebVpnHeartbeatRole,
     accept_websocket_with_path, log_error, log_info, log_success,
     parse_socket_addr_with_default_host, parse_tcp_target_path, relay_stream,
@@ -23,48 +23,88 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 const HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const MAX_WEBSOCKET_CLOSE_REASON_BYTES: usize = 123;
+const MAX_HTTP_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+const HTTP_REQUEST_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const TARGET_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Observable lifecycle state of an embedded server.
 pub enum TowsServerState {
+    /// No listener task is active.
     Stopped,
+    /// The listener is being bound.
     Starting,
-    Running { listen_addr: SocketAddr },
+    /// The listener is accepting connections.
+    Running {
+        /// Actual bound address, including an OS-assigned port when requested.
+        listen_addr: SocketAddr,
+    },
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Classified purpose of an accepted server connection.
 pub enum TowsConnectionKind {
+    /// Plain HTTP health probe.
     HttpProbe,
+    /// Heartbeat-only compatibility WebSocket.
     Keepalive,
-    Tunnel { target: String },
+    /// Data tunnel connected to a TCP target.
+    Tunnel {
+        /// Normalized target address.
+        target: String,
+    },
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Structured events emitted by [`TowsServer`].
 pub enum TowsEvent {
+    /// Server lifecycle state changed.
     StateChanged(TowsServerState),
+    /// A TCP connection was accepted.
     ConnectionOpened {
+        /// Unique connection identifier.
         connection_id: u64,
+        /// Remote peer address.
         peer: String,
     },
+    /// The connection was classified and is ready.
     ConnectionReady {
+        /// Unique connection identifier.
         connection_id: u64,
+        /// Classified connection purpose.
         kind: TowsConnectionKind,
     },
+    /// A previously opened connection ended.
     ConnectionClosed {
+        /// Unique connection identifier.
         connection_id: u64,
+        /// Remote peer address.
         peer: String,
     },
+    /// Listener-level or connection-level failure.
     Error {
+        /// Connection identifier, or `None` for listener failures.
         connection_id: Option<u64>,
+        /// Human-readable error chain.
         detail: String,
     },
 }
 
+/// Receives structured server events.
+///
+/// `emit` runs synchronously on server tasks and should return quickly.
 pub trait TowsEventSink: Send + Sync {
+    /// Receives the next server event.
     fn emit(&self, event: TowsEvent);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Runtime configuration for a server listener.
 pub struct TowsServerConfig {
+    /// Address on which incoming HTTP and WebSocket connections are accepted.
     pub listen_addr: SocketAddr,
 }
 
@@ -77,6 +117,7 @@ impl Default for TowsServerConfig {
 }
 
 #[derive(Clone)]
+/// Reusable, observable TCP-over-WebSocket server.
 pub struct TowsServer {
     inner: Arc<TowsServerInner>,
 }
@@ -104,6 +145,7 @@ impl Drop for ServerRunGuard {
 }
 
 impl TowsServer {
+    /// Creates a stopped server using `events` for callbacks.
     pub fn new(events: Arc<dyn TowsEventSink>) -> Self {
         let initial = TowsServerState::Stopped;
         let (state_tx, _) = watch::channel(initial);
@@ -118,14 +160,17 @@ impl TowsServer {
         }
     }
 
+    /// Returns a snapshot of the current server state.
     pub fn state(&self) -> TowsServerState {
         *self.inner.state.lock().expect("tows server state poisoned")
     }
 
+    /// Subscribes to server state changes.
     pub fn subscribe(&self) -> watch::Receiver<TowsServerState> {
         self.inner.state_tx.subscribe()
     }
 
+    /// Binds and runs the server until `shutdown` becomes true or closes.
     pub async fn run(
         &self,
         config: TowsServerConfig,
@@ -233,6 +278,7 @@ impl TowsServer {
     }
 }
 
+/// Convenience wrapper that constructs and runs one [`TowsServer`].
 pub async fn run_tows_server(
     config: TowsServerConfig,
     events: Arc<dyn TowsEventSink>,
@@ -262,6 +308,7 @@ impl TowsEventSink for TerminalEventSink {
     }
 }
 
+/// Runs the `tows` command-line interface.
 pub async fn run_cli() -> Result<()> {
     log_info("server", format!("tows v{}", env!("CARGO_PKG_VERSION")));
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -320,7 +367,22 @@ async fn handle_connection(
     }
 
     let target_addr = parse_tcp_target_path(&path)?;
-    let target = match TcpStream::connect(&target_addr).await {
+    let target_result = match tokio::time::timeout(
+        TARGET_CONNECT_TIMEOUT,
+        TcpStream::connect(&target_addr),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "target connection timed out after {}s",
+                TARGET_CONNECT_TIMEOUT.as_secs()
+            ),
+        )),
+    };
+    let target = match target_result {
         Ok(target) => target,
         Err(err) => {
             let reason = target_connect_failure_close_reason(&target_addr, &err);
@@ -330,13 +392,16 @@ async fn handle_connection(
                     reason: reason.into(),
                 })))
                 .await;
-
             anyhow::bail!(
                 "target connect failed: {path} -> {target_addr}: {err}; diagnosis: {}",
                 target_connect_failure_diagnosis(&err)
             );
         }
     };
+    websocket
+        .send(Message::Text(TOWS_READY_MESSAGE.into()))
+        .await
+        .context("failed to acknowledge tunnel readiness")?;
     events.emit(TowsEvent::ConnectionReady {
         connection_id,
         kind: TowsConnectionKind::Tunnel {
@@ -382,14 +447,34 @@ fn truncate_websocket_close_reason(reason: &str) -> String {
 }
 
 async fn is_websocket_upgrade_request(stream: &TcpStream) -> Result<bool> {
-    let mut buffer = [0_u8; 1024];
-    let read_size = stream
-        .peek(&mut buffer)
-        .await
-        .context("failed to inspect incoming request")?;
+    let mut buffer = vec![0_u8; MAX_HTTP_REQUEST_HEAD_BYTES];
+    tokio::time::timeout(HTTP_REQUEST_HEAD_TIMEOUT, async {
+        loop {
+            let read_size = stream
+                .peek(&mut buffer)
+                .await
+                .context("failed to inspect incoming request")?;
+            let head = &buffer[..read_size];
+            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let request = String::from_utf8_lossy(head);
+                return Ok(has_websocket_upgrade_headers(&request));
+            }
+            if read_size == buffer.len() {
+                anyhow::bail!(
+                    "incoming HTTP request headers exceed {MAX_HTTP_REQUEST_HEAD_BYTES} bytes"
+                );
+            }
+            if read_size == 0 {
+                anyhow::bail!("connection closed before HTTP request headers were complete");
+            }
 
-    let request = String::from_utf8_lossy(&buffer[..read_size]);
-    Ok(has_websocket_upgrade_headers(&request))
+            // MSG_PEEK leaves the bytes readable, so wait briefly for the next TCP
+            // segment instead of immediately spinning on the same prefix.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for complete HTTP request headers")?
 }
 
 fn has_websocket_upgrade_headers(request: &str) -> bool {
@@ -437,6 +522,7 @@ async fn respond_http_probe(mut stream: TcpStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
@@ -511,6 +597,54 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
         assert_eq!(server.state(), TowsServerState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_detection_waits_for_fragmented_headers() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(listen_addr).await.unwrap();
+            stream
+                .write_all(b"GET /tcp HTTP/1.1\r\nHost: test\r\nConnec")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stream
+                .write_all(b"tion: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+
+        assert!(is_websocket_upgrade_request(&stream).await.unwrap());
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_acknowledges_readiness_after_target_connects() {
+        let target_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let ws_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let sink: Arc<dyn TowsEventSink> = Arc::new(RecordingSink::default());
+
+        let handler = tokio::spawn(async move {
+            let (stream, _) = ws_listener.accept().await.unwrap();
+            handle_connection(1, stream, sink).await
+        });
+        let target_accept = tokio::spawn(async move { target_listener.accept().await.unwrap() });
+
+        let (mut websocket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{ws_addr}/tcp/{target_addr}"))
+                .await
+                .unwrap();
+        let message = websocket.next().await.unwrap().unwrap();
+        assert_eq!(message, Message::Text(TOWS_READY_MESSAGE.into()));
+
+        websocket.close(None).await.unwrap();
+        target_accept.await.unwrap();
+        handler.await.unwrap().unwrap();
     }
 
     #[test]
