@@ -1596,13 +1596,10 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
     let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
     seed_webvpn_cookie_jar(&cookie_jar, &cookie);
     let client = build_login_client(Arc::clone(&cookie_jar))?;
-    let verification = async {
-        let cookie = match refresh_and_activate_portal_cookie(&client, &cookie_jar).await? {
-            PortalCookieRefresh::Refreshed(cookie) => Some(cookie),
-            PortalCookieRefresh::Expired => None,
-        };
-        Ok::<Option<String>, anyhow::Error>(cookie)
-    };
+    // Verify the cached ticket as-is. Refreshing first would only prove that
+    // the Cookie endpoint accepted a request, not that this ticket can enter a
+    // protected WebVPN page.
+    let verification = activate_cached_portal_session(&client, &cookie_jar);
     match tokio::time::timeout(Duration::from_secs(CACHED_LOGIN_TIMEOUT_SECS), verification).await {
         Ok(Ok(Some(cookie))) => {
             write_cached_cookie(&cookie);
