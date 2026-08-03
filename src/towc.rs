@@ -39,6 +39,8 @@ const WEBVPN_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/login";
 const WEBVPN_TICKET_COOKIE_PREFIX: &str = "wengine_vpn_ticketwebvpn_szut_edu_cn=";
 const WEBVPN_CAS_HASH: &str = "77726476706e69737468656265737421f3f652d2342a7d44300d8db9d6562d";
 const WEBVPN_CAS_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421f3f652d2342a7d44300d8db9d6562d/cas/login?service=https%3A%2F%2Fwebvpn.szut.edu.cn%2Flogin%3Fcas_login%3Dtrue";
+const WEBVPN_PORTAL_LOGIN_URL: &str = "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421f3f652d2342a7d44300d8db9d/cas/login?service=https%3A%2F%2Fcas.szut.edu.cn%2F";
+const WEBVPN_PERSONAL_CENTER_URL: &str = "https://webvpn.szut.edu.cn/https/77726476706e69737468656265737421f3f652d2342a7d44300d8db9d/personal-center";
 const WEBVPN_WECHAT_HASH: &str =
     "77726476706e69737468656265737421ffe7449269276d59660187e289446d36a8d6";
 const WECHAT_APP_ID: &str = "wx16c67d169e7a9290";
@@ -46,7 +48,7 @@ const WECHAT_REDIRECT_URI: &str = "https://cas.szut.edu.cn/cas/login?service=htt
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0";
 const WEBVPN_FINGERPRINT: &str = "5a0b00fe6ae8277a4bfadd4e103f6e1c";
 const WEBVPN_READY_TIMEOUT_SECS: u64 = 8;
-const CACHED_LOGIN_TIMEOUT_SECS: u64 = 8;
+const CACHED_LOGIN_TIMEOUT_SECS: u64 = 15;
 const WEBVPN_COOKIE_REFRESH_INTERVAL_SECS: u64 = 180;
 const WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS: u64 = 8;
 const CAS_LOGIN_ATTEMPTS: usize = 2;
@@ -1594,20 +1596,80 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
     let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
     seed_webvpn_cookie_jar(&cookie_jar, &cookie);
     let client = build_login_client(Arc::clone(&cookie_jar))?;
-    match tokio::time::timeout(
-        Duration::from_secs(CACHED_LOGIN_TIMEOUT_SECS),
-        refresh_portal_cookie_once(&client, &cookie_jar),
-    )
-    .await
-    {
-        Ok(Ok(PortalCookieRefresh::Refreshed(cookie))) => {
+    let verification = async {
+        match refresh_portal_cookie_once(&client, &cookie_jar).await? {
+            // A response from the Cookie endpoint is not sufficient evidence that
+            // the ticket is usable. WebVPN still requires the CAS/portal route to
+            // activate the ticket before a protected portal page can be opened.
+            PortalCookieRefresh::Refreshed(_) => {
+                activate_cached_portal_session(&client, &cookie_jar).await
+            }
+            PortalCookieRefresh::Expired => Ok(None),
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(CACHED_LOGIN_TIMEOUT_SECS), verification).await {
+        Ok(Ok(Some(cookie))) => {
             write_cached_cookie(&cookie);
             Ok(Some(cookie))
         }
-        Ok(Ok(PortalCookieRefresh::Expired)) => Ok(None),
+        Ok(Ok(None)) => Ok(None),
         Ok(Err(err)) => Err(err).context("failed to verify cached WebVPN login"),
         Err(_) => anyhow::bail!("timed out while verifying cached WebVPN login"),
     }
+}
+
+async fn activate_cached_portal_session(
+    client: &Client,
+    cookie_jar: &reqwest::cookie::Jar,
+) -> Result<Option<String>> {
+    let login_response = client
+        .get(WEBVPN_PORTAL_LOGIN_URL)
+        .header(REFERER, WEBVPN_LOGIN_URL)
+        .send()
+        .await
+        .context("failed to open the WebVPN portal login entry")?
+        .error_for_status()
+        .context("WebVPN portal login entry request failed")?;
+    let login_final_url = login_response.url().to_string();
+    let login_body = login_response
+        .text()
+        .await
+        .context("failed to read the WebVPN portal login response")?;
+    if is_cas_login_form(&login_final_url, extract_execution(&login_body).as_deref()) {
+        return Ok(None);
+    }
+    let _ = activate_webvpn_fingerprint_if_needed(client, cookie_jar, &login_final_url).await?;
+
+    // Re-open the protected page after the login redirect. This is the actual
+    // acceptance criterion for a cached ticket; a freshly set Cookie alone is
+    // deliberately not accepted.
+    for _ in 0..2 {
+        let response = client
+            .get(WEBVPN_PERSONAL_CENTER_URL)
+            .header(REFERER, WEBVPN_PORTAL_LOGIN_URL)
+            .send()
+            .await
+            .context("failed to open the WebVPN personal center")?
+            .error_for_status()
+            .context("WebVPN personal center request failed")?;
+        let final_url = response.url().to_string();
+        if is_webvpn_fingerprint_url(&final_url) {
+            activate_webvpn_fingerprint_if_needed(client, cookie_jar, &final_url).await?;
+            continue;
+        }
+        if !is_webvpn_personal_center_url(&final_url) {
+            return Ok(None);
+        }
+
+        let cookie = webvpn_cookie_header_from_jar(cookie_jar)
+            .context("WebVPN portal activation completed without WebVPN cookies")?;
+        if ticket_cookie_from_header(&cookie).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some(cookie));
+    }
+
+    Ok(None)
 }
 
 enum CachedCookieCheck {
@@ -2786,6 +2848,10 @@ fn is_webvpn_fingerprint_url(url: &str) -> bool {
     url.contains("/fingerprint") && url.contains("ticket=ST-")
 }
 
+fn is_webvpn_personal_center_url(url: &str) -> bool {
+    url.contains("webvpn.szut.edu.cn") && url.contains("/personal-center")
+}
+
 fn is_cas_login_form(final_url: &str, execution: Option<&str>) -> bool {
     final_url.contains("/cas/login") && execution.is_some()
 }
@@ -3191,5 +3257,14 @@ mod tests {
             ui.ready_message,
             "ready: local 127.0.0.1:14489 -> WebVPN -> tows 10.18.47.77:4489 -> target 127.0.0.1:22"
         );
+    }
+
+    #[test]
+    fn cached_login_requires_the_protected_portal_destination() {
+        assert!(is_webvpn_personal_center_url(WEBVPN_PERSONAL_CENTER_URL));
+        assert!(!is_webvpn_personal_center_url(WEBVPN_PORTAL_LOGIN_URL));
+        assert!(!is_webvpn_personal_center_url(
+            "https://webvpn.szut.edu.cn/login"
+        ));
     }
 }
