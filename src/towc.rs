@@ -50,7 +50,7 @@ const WEBVPN_FINGERPRINT: &str = "5a0b00fe6ae8277a4bfadd4e103f6e1c";
 const WEBVPN_READY_TIMEOUT_SECS: u64 = 8;
 const CACHED_LOGIN_TIMEOUT_SECS: u64 = 15;
 const WEBVPN_COOKIE_REFRESH_INTERVAL_SECS: u64 = 180;
-const WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS: u64 = 8;
+const WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS: u64 = 15;
 const CAS_LOGIN_ATTEMPTS: usize = 2;
 const CAS_LOGIN_RETRY_SETTLE_MS: u64 = 1500;
 const WECHAT_POLL_ATTEMPTS: usize = 180;
@@ -1597,15 +1597,11 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
     seed_webvpn_cookie_jar(&cookie_jar, &cookie);
     let client = build_login_client(Arc::clone(&cookie_jar))?;
     let verification = async {
-        match refresh_portal_cookie_once(&client, &cookie_jar).await? {
-            // A response from the Cookie endpoint is not sufficient evidence that
-            // the ticket is usable. WebVPN still requires the CAS/portal route to
-            // activate the ticket before a protected portal page can be opened.
-            PortalCookieRefresh::Refreshed(_) => {
-                activate_cached_portal_session(&client, &cookie_jar).await
-            }
-            PortalCookieRefresh::Expired => Ok(None),
-        }
+        let cookie = match refresh_and_activate_portal_cookie(&client, &cookie_jar).await? {
+            PortalCookieRefresh::Refreshed(cookie) => Some(cookie),
+            PortalCookieRefresh::Expired => None,
+        };
+        Ok::<Option<String>, anyhow::Error>(cookie)
     };
     match tokio::time::timeout(Duration::from_secs(CACHED_LOGIN_TIMEOUT_SECS), verification).await {
         Ok(Ok(Some(cookie))) => {
@@ -1615,6 +1611,24 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
         Ok(Ok(None)) => Ok(None),
         Ok(Err(err)) => Err(err).context("failed to verify cached WebVPN login"),
         Err(_) => anyhow::bail!("timed out while verifying cached WebVPN login"),
+    }
+}
+
+async fn refresh_and_activate_portal_cookie(
+    client: &Client,
+    cookie_jar: &reqwest::cookie::Jar,
+) -> Result<PortalCookieRefresh> {
+    match refresh_portal_cookie_once(client, cookie_jar).await? {
+        // A response from the Cookie endpoint is not sufficient evidence that
+        // the ticket is usable. WebVPN still requires the CAS/portal route to
+        // activate the ticket before a protected portal page can be opened.
+        PortalCookieRefresh::Refreshed(_) => {
+            let Some(cookie) = activate_cached_portal_session(client, cookie_jar).await? else {
+                return Ok(PortalCookieRefresh::Expired);
+            };
+            Ok(PortalCookieRefresh::Refreshed(cookie))
+        }
+        PortalCookieRefresh::Expired => Ok(PortalCookieRefresh::Expired),
     }
 }
 
@@ -1792,7 +1806,7 @@ async fn maintain_session_cookie_refresh(
 
         match tokio::time::timeout(
             Duration::from_secs(WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS),
-            refresh_portal_cookie_once(&client, &cookie_jar),
+            refresh_and_activate_portal_cookie(&client, &cookie_jar),
         )
         .await
         {
