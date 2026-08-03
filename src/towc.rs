@@ -1800,8 +1800,10 @@ async fn maintain_session_cookie_refresh(
         .await
         {
             Ok(Ok(PortalCookieRefresh::Refreshed(cookie))) => {
-                replace_current_cookie(session.cookie(), cookie.clone());
-                write_cached_cookie(&cookie);
+                if current_cookie(session.cookie()) != cookie {
+                    replace_current_cookie(session.cookie(), cookie.clone());
+                    write_cached_cookie(&cookie);
+                }
             }
             Ok(Ok(PortalCookieRefresh::Expired)) => {
                 if let Some(inner) = manager.upgrade() {
