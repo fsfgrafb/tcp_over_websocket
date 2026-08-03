@@ -1599,7 +1599,7 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
     // Verify the cached ticket as-is. Refreshing first would only prove that
     // the Cookie endpoint accepted a request, not that this ticket can enter a
     // protected WebVPN page.
-    let verification = activate_cached_portal_session(&client, &cookie_jar);
+    let verification = verify_cached_portal_session(&client, &cookie_jar);
     match tokio::time::timeout(Duration::from_secs(CACHED_LOGIN_TIMEOUT_SECS), verification).await {
         Ok(Ok(Some(cookie))) => {
             write_cached_cookie(&cookie);
@@ -1611,16 +1611,16 @@ async fn try_cached_portal_login() -> Result<Option<String>> {
     }
 }
 
-async fn refresh_and_activate_portal_cookie(
+async fn refresh_and_verify_portal_cookie(
     client: &Client,
     cookie_jar: &reqwest::cookie::Jar,
 ) -> Result<PortalCookieRefresh> {
     match refresh_portal_cookie_once(client, cookie_jar).await? {
         // A response from the Cookie endpoint is not sufficient evidence that
-        // the ticket is usable. WebVPN still requires the CAS/portal route to
-        // activate the ticket before a protected portal page can be opened.
+        // the ticket is usable. Verify the refreshed ticket against a protected
+        // portal page, but never invoke the interactive fingerprint flow here.
         PortalCookieRefresh::Refreshed(_) => {
-            let Some(cookie) = activate_cached_portal_session(client, cookie_jar).await? else {
+            let Some(cookie) = verify_cached_portal_session(client, cookie_jar).await? else {
                 return Ok(PortalCookieRefresh::Expired);
             };
             Ok(PortalCookieRefresh::Refreshed(cookie))
@@ -1629,7 +1629,7 @@ async fn refresh_and_activate_portal_cookie(
     }
 }
 
-async fn activate_cached_portal_session(
+async fn verify_cached_portal_session(
     client: &Client,
     cookie_jar: &reqwest::cookie::Jar,
 ) -> Result<Option<String>> {
@@ -1649,38 +1649,30 @@ async fn activate_cached_portal_session(
     if is_cas_login_form(&login_final_url, extract_execution(&login_body).as_deref()) {
         return Ok(None);
     }
-    let _ = activate_webvpn_fingerprint_if_needed(client, cookie_jar, &login_final_url).await?;
 
     // Re-open the protected page after the login redirect. This is the actual
     // acceptance criterion for a cached ticket; a freshly set Cookie alone is
-    // deliberately not accepted.
-    for _ in 0..2 {
-        let response = client
-            .get(WEBVPN_PERSONAL_CENTER_URL)
-            .header(REFERER, WEBVPN_PORTAL_LOGIN_URL)
-            .send()
-            .await
-            .context("failed to open the WebVPN personal center")?
-            .error_for_status()
-            .context("WebVPN personal center request failed")?;
-        let final_url = response.url().to_string();
-        if is_webvpn_fingerprint_url(&final_url) {
-            activate_webvpn_fingerprint_if_needed(client, cookie_jar, &final_url).await?;
-            continue;
-        }
-        if !is_webvpn_personal_center_url(&final_url) {
-            return Ok(None);
-        }
-
-        let cookie = webvpn_cookie_header_from_jar(cookie_jar)
-            .context("WebVPN portal activation completed without WebVPN cookies")?;
-        if ticket_cookie_from_header(&cookie).is_none() {
-            return Ok(None);
-        }
-        return Ok(Some(cookie));
+    // deliberately not accepted. Cached login must not trigger fingerprint
+    // activation, which belongs only to an interactive login flow.
+    let response = client
+        .get(WEBVPN_PERSONAL_CENTER_URL)
+        .header(REFERER, WEBVPN_PORTAL_LOGIN_URL)
+        .send()
+        .await
+        .context("failed to open the WebVPN personal center")?
+        .error_for_status()
+        .context("WebVPN personal center request failed")?;
+    let final_url = response.url().to_string();
+    if !is_webvpn_personal_center_url(&final_url) {
+        return Ok(None);
     }
 
-    Ok(None)
+    let cookie = webvpn_cookie_header_from_jar(cookie_jar)
+        .context("WebVPN portal verification completed without WebVPN cookies")?;
+    if ticket_cookie_from_header(&cookie).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(cookie))
 }
 
 enum CachedCookieCheck {
@@ -1803,7 +1795,7 @@ async fn maintain_session_cookie_refresh(
 
         match tokio::time::timeout(
             Duration::from_secs(WEBVPN_COOKIE_REFRESH_TIMEOUT_SECS),
-            refresh_and_activate_portal_cookie(&client, &cookie_jar),
+            refresh_and_verify_portal_cookie(&client, &cookie_jar),
         )
         .await
         {
