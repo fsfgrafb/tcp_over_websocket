@@ -122,7 +122,7 @@ RSA 加密（提交前）：
   POST {CAS}/cas/login?service=...   字段:
     username   = 手机号/邮箱
     password   = RSA(倒序(验证码))
-    rememberMe = true   ← 仅手机登录需要（邮箱登录无需此字段；实测手机缺它会导致失败）
+    rememberMe = true   ← 可选，可省略（对照测试验证：不带也能成功，与历史版本一致）
     execution  = token
     _eventId   = submit
   需带 Origin: https://webvpn.szut.edu.cn 与 Referer 头
