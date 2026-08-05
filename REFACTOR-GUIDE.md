@@ -112,6 +112,8 @@ RSA 加密（提交前）：
   GET {CAS}/v2/getPubKey → {modulus, exponent}（公钥）
   验证码字符串 倒序 → RSA 加密（JS RSAUtils.encryptedString；Rust 版: 62字符/块 modpow，hex 空格拼接）
   → 作为表单 password 字段（登录页 #ppassword 输入框的值经 JS 加密后填入隐藏 #password）
+  ⚠️ 必须先倒序再 RSA（漏倒序 → 服务端返回"验证码错误"；2026-08-05 脚本实测踩坑）
+  ⚠️ 发送接口返回码: "success"=已发送 / "valid"=已有未过期验证码(不重发,直接复用) / "unbind"=未绑定 / 其他=错误
 
 提交（POST 表单到登录 URL 本身）：
   POST {CAS}/cas/login?service=...   字段:
