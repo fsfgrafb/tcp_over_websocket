@@ -98,19 +98,35 @@ Key = IV = "wrdvpnisthebest!"（16字节 ASCII）
 
 **方式一：微信扫码**（推荐）——完整流程见 2.6，流程最简、无需收验证码。
 
-**方式二：手机验证码 / 方式三：邮箱验证码**（v0.4 历史实现，逻辑相同，参考 `git show v0.4.0:src/towc.rs` 的 `login_with_verification_code`）：
+**方式二：手机验证码 / 方式三：邮箱验证码**（2026-08-05 浏览器实测 + JS 逆向确认，逻辑相同）：
 ```
-1. GET CAS 登录页 → 提取表单隐藏字段 execution token
-2. GET /cas/v2/getPubKey → RSA 公钥（modulus/exponent，JSON）
-3. 发送验证码：/cas/v2/services/sedsms?mobile={手机号}   （手机）
-                /cas/v2/services/sendEmailYzm?email={邮箱}  （邮箱）
-4. 用户输入验证码 → 字符串倒序 → RSA 加密
-   （62 字符/块，每块 modpow，结果 hex 用空格拼接）
-5. POST /cas/login 表单：username + password(RSA密文) + execution + _eventId=submit
-   需带 Origin: https://webvpn.szut.edu.cn 与 Referer 头
-6. 若仍停在 CAS 登录页 → 换新 execution 重试一次（最多 2 次）
-7. 成功后 → 指纹激活 → 提取 ticket（与微信相同）
+前置：GET {CAS}/cas/login?service=... → 提取表单隐藏字段 execution token
+      （登录页还有 getPubKey 公钥，见下）
+
+发送验证码：
+  GET {CAS}/v2/services/sedsms?mobile={手机号}     （手机）
+  GET {CAS}/v2/services/sendEmailYzm?email={邮箱}  （邮箱）
+  返回: "success"=已发送 / "valid"=需图形验证码(边界情况) / "unbind"=手机号/邮箱未绑定(不发码) / 其他=错误
+
+RSA 加密（提交前）：
+  GET {CAS}/v2/getPubKey → {modulus, exponent}（公钥）
+  验证码字符串 倒序 → RSA 加密（JS RSAUtils.encryptedString；Rust 版: 62字符/块 modpow，hex 空格拼接）
+  → 作为表单 password 字段（登录页 #ppassword 输入框的值经 JS 加密后填入隐藏 #password）
+
+提交（POST 表单到登录 URL 本身）：
+  POST {CAS}/cas/login?service=...   字段:
+    username   = 手机号/邮箱
+    password   = RSA(倒序(验证码))
+    rememberMe = true
+    execution  = token
+    _eventId   = submit
+  需带 Origin: https://webvpn.szut.edu.cn 与 Referer 头
+  若响应仍是 CAS 登录页（execution 变化）→ 换新 execution 重试一次（最多 2 次）
+  成功 → 走 2.6 步骤 4~5（ST 票据 + 指纹激活 + 提取 ticket）
 ```
+- 登录页三种登录方式 Tab：扫码 / 手机(#fm2) / 邮箱(#fm3)，另有密码登录(#fm4，多 authcode 图形验证码字段，本轮可不支持)
+- 所有接口经 webvpn 代理：`{CAS} = https://webvpn.szut.edu.cn/https/{编码(cas.szut.edu.cn)}/cas`（注意路径含 `/cas/` 段）
+- 验证码发送接口存在 60s 倒计时（服务端限频），脚本需处理"已发送/未绑定/限频"返回值
 - 登录入口统一走 `https://webvpn.szut.edu.cn/https/{编码(cas.szut.edu.cn)}/cas/login`（webvpn 代理）
 
 ---
