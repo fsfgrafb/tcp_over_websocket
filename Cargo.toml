@@ -11,10 +11,10 @@ keywords = ["tcp", "websocket", "tunnel", "webvpn"]
 categories = ["network-programming"]
 
 [features]
-default = ["client", "server", "cli"]
+default = ["client", "server"]
 client = [
 	"dep:aes",
-	"dep:num-bigint",
+	"dep:image",
 	"dep:reqwest",
 	"dep:rustls",
 	"dep:serde",
@@ -22,13 +22,11 @@ client = [
 	"tokio-tungstenite/rustls-tls-webpki-roots",
 ]
 server = []
-cli = ["client", "dep:image"]
 
 [dependencies]
 aes = { version = "0.8", optional = true }
 anyhow = "1"
 futures-util = "0.3"
-num-bigint = { version = "0.4", optional = true }
 reqwest = { version = "0.12", default-features = false, features = [
 	"cookies",
 	"json",
@@ -51,9 +49,14 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["h
 [[bin]]
 name = "towc"
 path = "src/bin/towc.rs"
-required-features = ["cli"]
+required-features = ["client"]
 
 [[bin]]
 name = "tows"
 path = "src/bin/tows.rs"
 required-features = ["server"]
+
+[[bin]]
+name = "cookie_keepalive_test"
+path = "src/bin/cookie_keepalive_test.rs"
+required-features = ["client"]

@@ -1,176 +1,118 @@
 # tcp_over_websocket
 
-面向 SZUT WebVPN 的 TCP over WebSocket 转发工具，由客户端 `towc` 和服务端 `tows` 组成。
+供苏州工学院学生使用的 TCP 转发工具。它可以借助 SZUT WebVPN，把本机的一个端口转发到另一台机器上的服务；最常见的用途是通过 SSH 访问该机器。
 
-```text
-local app -> towc -> SZUT WebVPN -> tows -> target service
-```
+本项目包含两个程序：
 
-`towc` 负责 WebVPN 登录、Cookie 续期、本地 TCP 监听和 WebSocket 建连；`tows` 接收 WebSocket，将数据转发到服务端本机的目标 TCP 服务。默认场景是通过 WebVPN 访问 SSH，也可以转发其他 TCP 端口。
+- tows：运行在目标服务所在的机器上。
+- towc：运行在自己的电脑上，负责登录 WebVPN 和建立本地端口。
 
-## 快速使用
+详细的通信原理见 [工作原理](docs/working-principles.md)。
 
-在目标服务所在机器启动服务端：
+需要测量 WebVPN Cookie 是否会在纯 HTTP 刷新下保持有效时，见 [Cookie 保活实验](docs/cookie-keepalive-experiment.md)。
 
-```bash
+## 使用前准备
+
+1. 准备两台机器：自己的电脑运行 towc，能够访问目标服务的机器运行 tows。
+2. 确保 tows 的监听端口可被 WebVPN 访问；默认端口为 4489，必要时在服务器防火墙中放行。
+3. 下载与系统对应的 tows、towc 可执行文件，或按下文从源码构建。两端请使用相同版本。
+
+## 快速启动
+
+### 1. 在目标机器启动服务端
+
+在目标服务所在的机器上运行：
+
+~~~bash
 tows
-```
+~~~
 
-在本机启动客户端，并连接本地监听端口：
+程序默认监听 4489 端口。保持该终端运行即可。
 
-```bash
+### 2. 在本机启动客户端
+
+将 <tows-ip> 替换成目标机器的 IP 地址：
+
+~~~bash
 towc <tows-ip>
+~~~
+
+第一次启动时，终端会显示微信二维码；使用微信扫码确认即可登录 WebVPN。
+
+当终端显示隧道已就绪后，默认可通过本机 14489 端口访问目标机器的 SSH 服务：
+
+~~~bash
 ssh -p 14489 user@localhost
-```
+~~~
 
-转发其他端口时：
+将 user 换成目标机器上的用户名。
 
-```bash
-towc <tows-ip> --target 3389 --listen 13389
-```
+## 配置转发
 
-不带参数运行 `towc` 会进入交互模式。输入 `tows` 地址后，程序会在用户继续填写目标和本地监听地址期间，静默地通过对应 WebVPN 保活 WebSocket 预检缓存 Cookie；成功建立的 WebSocket 不会关闭，参数填写完成后会直接移交给 `SessionRuntime` 作为会话级保活连接。此后才按正常顺序输出缓存检查结果并进入 readiness，避免重新建立保活连接和等待缓存验证。登录重定向会立即判定为过期并进入正常登录流程，不再进行多次 readiness 重试。`tows` 不可达只代表隧道端点故障，不会被误判为 Cookie 过期。仅当缓存缺失、格式无效或明确过期时，才询问登录方式：输入手机号/邮箱使用验证码，或直接回车使用终端微信扫码。新登录取得的 Cookie 会立即写入本地缓存。
+### 服务端
 
-交互模式会把本次实际采用的 `tows`、目标和本地监听地址分别缓存；下次启动时，这三个值会显示为新的默认选项，直接回车即可复用。此配置缓存与 WebVPN Cookie 缓存相互独立。
-
-## 命令
-
-```text
+~~~text
 tows [port]
-```
+~~~
 
-- 监听端口默认 `4489`。
-- 普通 HTTP 探测返回 `204 No Content`。
+port 为服务端监听端口，默认是 4489。例如：
 
-```text
-towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>] [--login <mobile|email>]
-```
+~~~bash
+tows 54489
+~~~
 
-- `tows` 端口默认 `4489`。
-- 目标地址默认 `127.0.0.1:22`。
-- 本地监听地址默认 `127.0.0.1:14489`。
-- 交互模式首次运行时 `tows` 地址必填，目标和监听端口使用内置默认值；已有交互缓存时，三项提示中的默认值会替换为上次采用的值。登录方式始终在这三项参数输入完成且缓存 Cookie 验证失败后才询问。
-- 带参数启动时也会优先尝试缓存认证。`--login` 仅是缓存缺失、格式无效或明确过期时的验证码登录后备方式；未提供 `--login` 时回退到终端微信扫码，因此认证过程仍可能要求输入验证码或扫码。
-- 启动日志会输出程序名和版本，例如 `towc v0.5.0`。
+### 客户端
 
-## 会话与隧道
+~~~text
+towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>]
+~~~
 
-每个 `towc` 进程只管理一个登录会话、一组本地监听参数和一条隧道。需要多开隧道时，使用不同的本地监听端口启动多个 `towc`；一个 `tows` 进程可以并发服务多个 `towc`。这种进程边界便于上层软件独立启动、停止和重启每条隧道。
+| 参数 | 作用 | 默认值 |
+| --- | --- | --- |
+| <tows-ip[:port]> | tows 所在机器的地址和端口 | 端口省略时使用 4489 |
+| --target | 要访问的目标服务；该地址相对于 tows 所在机器 | 127.0.0.1:22 |
+| --listen | 在自己电脑上开放的本地地址 | 127.0.0.1:14489 |
 
-`towc` 内部仍将登录会话和转发隧道作为两个独立生命周期：
+只填写端口时，--target 使用 tows 本机的该端口；--listen 使用本机回环地址。例如，把远程 Windows 远程桌面端口转发到本机 13389：
 
-1. 会话层每 `180` 秒访问 WebVPN 门户 Cookie 接口，将最新 Cookie 更新到内存和缓存。它不访问任何 `tows`。
-2. 每条实际建立的数据连接由 `relay_stream` 在建立后立即发送一次 `连接成功`，之后每 `60` 秒发送并由 `tows` 回显，以避开当前网关约 `160` 秒的数据 WebSocket 空闲回收。会话同时维持一条独立的 `/webvpn-keepalive` WebSocket，沿用 v0.4 的立即发送、之后每 `210` 秒发送策略，断开后自动重连。
+~~~bash
+towc <tows-ip> --target 3389 --listen 13389
+~~~
 
-`tows` 只有在目标 TCP 连接成功后才发送 readiness 确认；`towc` 收到确认后才开放本地监听。relay 使用内部控制帧传递 TCP 半关闭，确保请求方向 EOF 后，响应方向仍可继续传输。
-readiness 与半关闭属于两端内部协议，部署时应同时更新 `towc` 和 `tows`。
+随后在远程桌面客户端中连接：
 
-`tows` 不可达只会让当前隧道进入重试，不会退出登录。Cookie 过期时会话回到未登录状态，隧道保留配置并等待重新登录。停止隧道也不会主动退出会话。
+~~~text
+127.0.0.1:13389
+~~~
 
-每轮隧道 readiness 只探测一次，不在内部连续重试；非认证类失败交给隧道生命周期按固定间隔重新启动探测，避免一次启动产生重复请求和重复诊断。
+也可以指定完整地址：
 
-隧道进入运行状态时，终端会一次性输出规范化后的完整链路，例如 `local 127.0.0.1:14489 -> WebVPN -> tows 10.18.47.77:4489 -> target 127.0.0.1:22`；中间状态不重复刷屏。
+~~~bash
+towc <tows-ip>:54489 --target 192.168.1.20:3306 --listen 127.0.0.1:13306
+~~~
 
-Cookie 续期保证空闲一段时间后仍能创建新连接，WebSocket 心跳维持现有连接，二者不能互相替代。周期性成功信息不会重复写入日志；连接建立、断线重连、刷新失败和 Cookie 失效仍会记录。
+不带参数运行 towc 会进入交互模式。程序会询问 tows 地址、目标端口和本地端口。
 
-## 作为库使用
+## 登录与多条隧道
 
-默认 feature 同时启用客户端、服务端和终端 CLI。只导入其中一端时可关闭默认 feature，避免编译另一端及终端二维码的依赖：
+towc 会保存 WebVPN 登录状态并在下次启动时复用。登录状态失效后，重新启动 towc 并扫码即可。
 
-```toml
-# 仅客户端
-tcp_over_websocket = { version = "0.5", default-features = false, features = ["client"] }
+如果需要多个转发，请为每个 towc 进程选择不同的 --listen 端口。例如：
 
-# 仅服务端
-tcp_over_websocket = { version = "0.5", default-features = false, features = ["server"] }
-```
+~~~bash
+towc <tows-ip> --target 22 --listen 14489
+towc <tows-ip> --target 3389 --listen 13389
+~~~
 
-客户端能力通过 `tcp_over_websocket::towc` 导出。上层软件可以为每条配置分别调用单隧道入口 `run_embedded_client`，通过 `EmbeddedClientUi` 接收结构化事件并提供验证码：
+一个 tows 可以同时服务多个 towc。
 
-```rust,no_run
-use std::sync::Arc;
-use tcp_over_websocket::towc::{
-    EmbeddedClientConfig, EmbeddedClientUi, LoginMethod, run_embedded_client,
-};
+## 服务端开机自启（可选）
 
-# fn build_ui() -> Arc<dyn EmbeddedClientUi> { todo!() }
-# async fn example() -> anyhow::Result<()> {
-let ui = build_ui();
-let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-run_embedded_client(
-    EmbeddedClientConfig {
-        server: "192.0.2.10:4489".into(),
-        target: "127.0.0.1:22".into(),
-        listen_addr: "127.0.0.1:14489".into(),
-        login: LoginMethod::WechatQr,
-    },
-    ui,
-    shutdown_rx,
-)
-.await?;
-# Ok(())
-# }
-```
+通常只需让 tows 开机自启；towc 需要 WebVPN 登录，建议按需在本机手动启动。
 
-`TunnelEvent` 中的 `tunnel_id` 作为结构化接口关联字段继续保留，供未来上层管理软件使用；单隧道终端输出不会显示内部编号。
+Linux 使用 systemd 时，可创建 /etc/systemd/system/tows.service：
 
-上层为每条隧道创建独立 `towc` 子进程时，可给各进程设置
-`TCP_OVER_WEBSOCKET_CACHE_DIR`，使 Cookie 和交互默认值写入各自目录。未设置时沿用系统缓存目录；跨进程目录分配与生命周期同步由上层负责，库内不引入全局锁。
-
-服务端通过 `tcp_over_websocket::tows` 导出。`TowsServer` 可订阅监听状态，由宿主传入关闭信号；连接建立、HTTP 探测、兼容保活和数据隧道分别产生结构化事件：
-
-```rust,no_run
-use std::{net::SocketAddr, sync::Arc};
-use tcp_over_websocket::tows::{TowsEventSink, TowsServer, TowsServerConfig};
-
-# fn build_sink() -> Arc<dyn TowsEventSink> { todo!() }
-# async fn example() -> anyhow::Result<()> {
-let server = TowsServer::new(build_sink());
-let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-server
-    .run(
-        TowsServerConfig {
-            listen_addr: SocketAddr::from(([0, 0, 0, 0], 4489)),
-        },
-        shutdown_rx,
-    )
-    .await?;
-# Ok(())
-# }
-```
-
-## 网络性能
-
-WebVPN WebSocket、服务端入站连接和目标 TCP 连接均启用 `TCP_NODELAY`，减少 SSH 等交互式小包被 Nagle 算法延迟合并的可能。保活流量只有每几分钟一个短文本帧和一次 HTTP 请求，通常不会造成可感知的吞吐或延迟负担；实际延迟仍主要取决于 WebVPN 路由和网络状况。
-
-## 构建与升级
-
-```bash
-cargo build --release
-```
-
-构建产物：
-
-- Linux/macOS：`target/release/tows`、`target/release/towc`
-- Windows：`target/release/tows.exe`、`target/release/towc.exe`
-
-协议或保活逻辑升级时应同时更新两端。Linux 服务端示例：
-
-```bash
-sudo install -m 0755 target/release/tows /usr/local/bin/tows
-sudo systemctl restart tows
-sudo systemctl status tows
-```
-
-重启后通过启动日志中的版本号确认 systemd 没有继续运行旧二进制。
-
-## 开机自启
-
-一般只建议为 `tows` 配置开机自启。`towc` 依赖 WebVPN 登录态，适合在需要时手动启动。
-
-Linux systemd 单元示例 `/etc/systemd/system/tows.service`：
-
-```ini
+~~~ini
 [Unit]
 Description=tcp_over_websocket server
 After=network-online.target
@@ -183,34 +125,36 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-```
+~~~
 
-```bash
+然后执行：
+
+~~~bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now tows
-```
+~~~
 
-Windows 任务计划程序示例：
+Windows 可在“任务计划程序”中新建“启动时”任务，程序或脚本填写 tows.exe 的完整路径，参数填写 4489。
 
-```powershell
-schtasks /Create /TN "tows" /SC ONSTART /RL HIGHEST /TR "C:\Tools\tcp_over_websocket\tows.exe 4489"
-```
+## 从源码构建
 
-## 源码结构
+需要安装 Rust 1.85 或更新版本。在项目目录执行：
 
-```text
-src/lib.rs          WebVPN 地址生成、加密、WebSocket 握手、心跳和双向转发
-src/towc.rs         可导入的登录会话、Cookie 生命周期、隧道管理和客户端实现
-src/tows.rs         可导入的服务端监听、连接事件和目标转发实现
-src/bin/towc.rs     towc 命令行薄入口
-src/towc/qr.rs      微信二维码解码与终端渲染
-src/bin/tows.rs     tows 命令行薄入口
-```
+~~~bash
+cargo build --release
+~~~
 
-## 排障
+生成的文件位于：
 
-- `WebVPN returned /wengine-vpn/failed`：检查 `tows` 是否运行、端口是否正确、防火墙是否放行。
-- `tows reported target connect failure`：检查目标服务是否监听在 `--target` 指定的地址。
-- `cookie expired`：确认两端版本一致；若 Cookie 刷新此前持续失败，重新启动 `towc` 并登录。
-- 隧道持续处于 `Retrying`：检查 `towc` 到 WebVPN、WebVPN 到 `tows` 及 `tows` 到目标服务的连通性。
-- 本地端口占用：使用其他 `--listen` 端口。
+- Linux/macOS：target/release/tows、target/release/towc
+- Windows：target/release/tows.exe、target/release/towc.exe
+
+升级后请同时替换 tows 和 towc，再重启相应程序。
+
+## 常见问题
+
+| 现象 | 处理方式 |
+| --- | --- |
+| 连接失败或被关闭 | 确认 tows 正在运行、地址和端口正确，目标服务可用，并检查服务器防火墙。 |
+| WebVPN login expired | 重新启动 towc 并扫码登录。 |
+| 本地端口已被占用 | 换一个 --listen 端口，例如 --listen 14490。 |
