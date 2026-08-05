@@ -26,9 +26,12 @@
 外网应用 → towc(本机) → WebVPN WebSocket隧道 → tows(内网某机器,监听端口) → 目标TCP服务
 ```
 
-两个程序：
-- **towc**：跑在用户自己电脑（外网）。负责 WebVPN 登录、本地监听端口、把每个本地 TCP 连接封装成一条 WebSocket 转发。
-- **tows**：跑在能访问目标服务的内网机器上。监听固定端口、接受 WebSocket、从路径解析目标、连接目标 TCP、双向转发。
+三个可执行文件（本仓库产出）：
+- **towc**（控制台，跨平台）：跑在用户自己电脑（外网）。负责 WebVPN 登录、本地监听端口、把每个本地 TCP 连接封装成一条 WebSocket 转发。
+  - **带参模式**：`towc <tows-ip[:port]> [--target <host:port|port>] [--listen <host:port|port>]`
+  - **无参交互式登录模式**：`towc`（不带参数）进入交互，依次询问 tows 地址/端口、目标端口、本地监听端口；可缓存上次输入作默认值。**交互模式后续再扩充，初版先保证可用**
+- **tows**（控制台，跨平台）：跑在能访问目标服务的内网机器上。监听固定端口（**可选启动参数** `tows [port]`，默认 4489）、接受 WebSocket、从路径解析目标、连接目标 TCP、双向转发。**行为与旧版 tows 一致**。
+- **towc_gui**（Windows 专属 GUI）：towc 的图形界面版（Windows 专属；本轮重构可先不做，或预留接口/目录，后续补充）
 
 ---
 
@@ -87,8 +90,28 @@ Key = IV = "wrdvpnisthebest!"（16字节 ASCII）
    （#0 发 ST = 认证成功标志；#1 校验 ST 激活 ticket = 隧道会话建立）
 5. 访问目标验证: /{http|https}/{编码}/ → 200
 ```
-- 缓存复用：保存 ticket cookie，下次启动先用它访问 WebVPN 会话入口验证（未认证则重新扫码）
+- 缓存复用：保存 ticket cookie，下次启动先用它访问 WebVPN 会话入口验证（未认证则重新登录）
 - ⚠️ 微信二维码/轮询推荐**直连**（简单、不依赖 ticket）；代理方式（`/https/{编码(open.weixin.qq.com)}/...`）是官方浏览器方式，仅作兜底，且轮询域（lp.open.weixin.qq.com）与 open 域编码不同，注意区分
+
+### 2.7 登录支持三种方式
+统一前置（三种方式相同）：直达 CAS 登录页 → 激活指纹；统一后置：CAS 回调 → 激活 ticket（见 2.6 步骤 4~5）。
+
+**方式一：微信扫码**（推荐）——完整流程见 2.6，流程最简、无需收验证码。
+
+**方式二：手机验证码 / 方式三：邮箱验证码**（v0.4 历史实现，逻辑相同，参考 `git show v0.4.0:src/towc.rs` 的 `login_with_verification_code`）：
+```
+1. GET CAS 登录页 → 提取表单隐藏字段 execution token
+2. GET /cas/v2/getPubKey → RSA 公钥（modulus/exponent，JSON）
+3. 发送验证码：/cas/v2/services/sedsms?mobile={手机号}   （手机）
+                /cas/v2/services/sendEmailYzm?email={邮箱}  （邮箱）
+4. 用户输入验证码 → 字符串倒序 → RSA 加密
+   （62 字符/块，每块 modpow，结果 hex 用空格拼接）
+5. POST /cas/login 表单：username + password(RSA密文) + execution + _eventId=submit
+   需带 Origin: https://webvpn.szut.edu.cn 与 Referer 头
+6. 若仍停在 CAS 登录页 → 换新 execution 重试一次（最多 2 次）
+7. 成功后 → 指纹激活 → 提取 ticket（与微信相同）
+```
+- 登录入口统一走 `https://webvpn.szut.edu.cn/https/{编码(cas.szut.edu.cn)}/cas/login`（webvpn 代理）
 
 ---
 
@@ -143,11 +166,13 @@ Key = IV = "wrdvpnisthebest!"（16字节 ASCII）
 
 ## 5. 重构要求（用户指定）
 
-1. **从最简形态开始**：先做出能用的最小闭环（登录 + 单隧道 + 转发），再逐步加功能
-2. **优先最低延迟 + 最高转发效率**：这是核心指标，任何功能不能损害转发性能
-3. 保持"学生在外网连内网 TCP"的目标场景（SSH / MC / RDP）
-4. 代码语言：Rust（原项目为 Rust，edition 2024，依赖 tokio/tokio-tungstenite/reqwest/rustls）
-5. 完成后需与 10.18.47.77 上的环境配合实测（见 §6）
+1. **从最简形态开始**：先做出能用的最小闭环（登录 + 单隧道 + 转发），再逐步加功能；**初版优先**，交互模式等可后续扩充
+2. **优先最低延迟 + 最高转发效率**：核心指标，任何功能不能损害转发性能
+3. **三个可执行文件**：tows（可选启动参数，行为同旧版）+ towc（**带参模式 + 无参交互式登录模式**）+ towc_gui（Windows 专属 GUI，可后续）
+4. **登录三种方式**：微信扫码 / 手机验证码 / 邮箱验证码（见 §2.6/2.7）
+5. 保持"学生在外网连内网 TCP"的目标场景（SSH / MC / RDP）
+6. 代码语言：Rust（原项目为 Rust，edition 2024，依赖 tokio/tokio-tungstenite/reqwest/rustls）
+7. 完成后需与 10.18.47.77 上的环境配合实测（见 §6）
 
 ---
 
@@ -178,5 +203,9 @@ Key = IV = "wrdvpnisthebest!"（16字节 ASCII）
 
 ## 8. 用户后续可能补充
 
-- 用户表示"待会我会提供更多信息"，本文档是初版；收到补充后请更新
+- **已补充（2026-08-05）**：
+  - 三个可执行文件：tows / towc / towc_gui（GUI 为 Windows 专属，本轮可后续）
+  - tows 与旧版行为一致，可选启动参数；towc 保留带参版 + 无参交互版（交互后续扩充，初版先写好）
+  - 登录支持：微信扫码 / 手机验证码 / 邮箱验证码
+- 用户表示还会提供更多信息，收到后请更新本文档
 - 若有疑问，优先查阅 `C:\Development\test\docs\` 的详细记录
