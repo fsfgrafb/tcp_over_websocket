@@ -981,6 +981,14 @@ async fn handle_frame(
     traffic: &Option<Arc<TrafficCounters>>,
 ) -> Result<()> {
     if retired_ids.contains(&frame.tunnel_id) {
+        if matches!(frame.kind, FrameType::Data | FrameType::Eof | FrameType::Close) {
+            tracing::info!(
+                target: "towc",
+                "diagnostic: received {:?} for retired stream {}",
+                frame.kind,
+                frame.tunnel_id
+            );
+        }
         match frame.kind {
             FrameType::Close | FrameType::OpenFail => {
                 retired_ids.remove(&frame.tunnel_id);
@@ -994,6 +1002,19 @@ async fn handle_frame(
             _ => bail!("server sent a disallowed {:?} frame", frame.kind),
         }
         return Ok(());
+    }
+    if matches!(frame.kind, FrameType::Data | FrameType::Eof)
+        && !tunnels.contains_key(&frame.tunnel_id)
+    {
+        let mut active_ids = tunnels.keys().copied().collect::<Vec<_>>();
+        active_ids.sort_unstable();
+        let mut retired_ids = retired_ids.iter().copied().collect::<Vec<_>>();
+        retired_ids.sort_unstable();
+        bail!(
+            "{:?} frame refers to unknown tunnel_id {}; active_ids={active_ids:?}; retired_ids={retired_ids:?}",
+            frame.kind,
+            frame.tunnel_id
+        );
     }
     match frame.kind {
         FrameType::OpenOk => {
@@ -1057,6 +1078,11 @@ async fn handle_frame(
             Ok(())
         }
         FrameType::Eof => {
+            tracing::info!(
+                target: "towc",
+                "diagnostic: received EOF for active stream {}",
+                frame.tunnel_id
+            );
             let tunnel = open_tunnel_mut(tunnels, frame.tunnel_id)?;
             if tunnel.remote_eof_seen {
                 bail!("stream {} received duplicate EOF", frame.tunnel_id);
@@ -1071,6 +1097,12 @@ async fn handle_frame(
             maybe_finish(frame.tunnel_id, writer, observer, tunnels, retired_ids).await
         }
         FrameType::Close => {
+            tracing::info!(
+                target: "towc",
+                "diagnostic: received CLOSE for stream {}; active={}",
+                frame.tunnel_id,
+                tunnels.contains_key(&frame.tunnel_id)
+            );
             if tunnels.contains_key(&frame.tunnel_id) {
                 remove_tunnel(frame.tunnel_id, writer, observer, tunnels, "peer closed").await;
             }
@@ -1112,6 +1144,10 @@ async fn handle_tunnel_event(
         }
         TunnelEvent::TcpError(id, reason) => {
             if tunnels.contains_key(&id) {
+                tracing::info!(
+                    target: "towc",
+                    "diagnostic: sending CLOSE for stream {id} after local TCP error: {reason}"
+                );
                 writer
                     .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
@@ -1168,6 +1204,10 @@ async fn read_tcp(
                 let eof =
                     Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
+                    tracing::info!(
+                        target: "towc",
+                        "diagnostic: sent EOF for stream {id} after local TCP EOF"
+                    );
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
                 return;
@@ -1186,6 +1226,10 @@ async fn read_tcp(
                 let eof =
                     Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
+                    tracing::info!(
+                        target: "towc",
+                        "diagnostic: sent EOF for stream {id} after normal local TCP close"
+                    );
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
                 return;
@@ -1251,6 +1295,10 @@ async fn maybe_finish(
             if tunnel.local_eof_sent && tunnel.remote_eof_seen && tunnel.tcp_writer_done
     );
     if finished {
+        tracing::info!(
+            target: "towc",
+            "diagnostic: sending CLOSE for stream {id} after bidirectional EOF"
+        );
         writer
             .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
@@ -1268,6 +1316,15 @@ async fn remove_tunnel(
     reason: &str,
 ) {
     if let Some(tunnel) = tunnels.remove(&id) {
+        let name = match &tunnel {
+            Tunnel::Opening(opening) => opening.name.as_str(),
+            Tunnel::Open(open) => open.name.as_str(),
+        };
+        tracing::info!(
+            target: "towc",
+            "diagnostic: removed stream {id} <{name}>; reason={}",
+            if reason.is_empty() { "unspecified" } else { reason }
+        );
         match tunnel {
             Tunnel::Opening(opening) => {
                 if !reason.is_empty() {
@@ -1304,6 +1361,10 @@ async fn close_named(
         })
         .collect::<Vec<_>>();
     for id in ids {
+        tracing::info!(
+            target: "towc",
+            "diagnostic: sending CLOSE for stream {id} after configuration change"
+        );
         writer
             .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
