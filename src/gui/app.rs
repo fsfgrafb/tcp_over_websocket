@@ -3,7 +3,7 @@ use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, mpsc as std_mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 use crate::address::{parse_listen, parse_target, parse_tows};
@@ -60,11 +60,11 @@ impl LoginKind {
             Self::Wechat => Ok(LoginPreference::Wechat),
             Self::Mobile => match LoginPreference::from_identity(identity) {
                 Ok(LoginPreference::Mobile(value)) => Ok(LoginPreference::Mobile(value)),
-                _ => bail!("手机登录需要填写纯数字手机号"),
+                _ => bail!("mobile login requires a numeric phone number"),
             },
             Self::Email => match LoginPreference::from_identity(identity) {
                 Ok(LoginPreference::Email(value)) => Ok(LoginPreference::Email(value)),
-                _ => bail!("邮箱登录需要填写有效邮箱"),
+                _ => bail!("email login requires a valid email address"),
             },
         }
     }
@@ -82,7 +82,7 @@ impl AuthPrompt for GuiBridge {
     fn show_qr(&self, image: Vec<u8>) -> Result<()> {
         self.events
             .send(WorkerEvent::Qr(image))
-            .map_err(|_| anyhow::anyhow!("GUI 已关闭"))
+            .map_err(|_| anyhow::anyhow!("GUI was closed"))
     }
 
     fn request_code(&self, label: &str) -> Result<String> {
@@ -92,10 +92,10 @@ impl AuthPrompt for GuiBridge {
                 label: label.to_string(),
                 reply,
             })
-            .map_err(|_| anyhow::anyhow!("GUI 已关闭"))?;
+            .map_err(|_| anyhow::anyhow!("GUI was closed"))?;
         receiver
             .recv()
-            .map_err(|_| anyhow::anyhow!("验证码输入已取消"))
+            .map_err(|_| anyhow::anyhow!("verification code entry was cancelled"))
     }
 }
 
@@ -150,11 +150,14 @@ struct TowcApp {
     export_selected: HashSet<String>,
     auto_start_pending: bool,
     login_visible: bool,
+    theme: egui::ThemePreference,
+    connected_since: Option<Instant>,
 }
 
 impl TowcApp {
     fn new(creation: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&creation.egui_ctx);
+        creation.egui_ctx.set_theme(egui::ThemePreference::System);
         let loaded = load_default_config();
         let auto_start_pending =
             !loaded.save_blocked && loaded.config.tunnels.iter().any(|tunnel| tunnel.enabled);
@@ -178,6 +181,8 @@ impl TowcApp {
             export_selected: HashSet::new(),
             auto_start_pending,
             login_visible: false,
+            theme: egui::ThemePreference::System,
+            connected_since: None,
         };
         if let Some(warning) = app.warning.clone() {
             app.log(warning);
@@ -192,12 +197,14 @@ impl TowcApp {
         let (preference, groups) = match self.session_config() {
             Ok(session) => session,
             Err(error) => {
-                self.log(format!("无法启动: {error:#}"));
+                self.log(format!("cannot start: {error:#}"));
                 return;
             }
         };
         if let Err(error) = save_default_config(&self.config) {
-            self.log(format!("保存配置失败，未启动: {error:#}"));
+            self.log(format!(
+                "cannot save configuration; startup cancelled: {error:#}"
+            ));
             return;
         }
 
@@ -233,7 +240,7 @@ impl TowcApp {
                 tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
-                    .context("无法创建 GUI 异步运行时")?
+                    .context("cannot create GUI async runtime")?
                     .block_on(async move {
                         let cookie =
                             login_or_restore_for_server(auth, preference, &probe_server).await?;
@@ -249,11 +256,11 @@ impl TowcApp {
 
     fn session_config(&self) -> Result<(LoginPreference, Vec<ServerGroup>)> {
         if self.save_blocked {
-            bail!("原配置处于保护状态；请先确认使用当前界面配置");
+            bail!("the configuration is protected; confirm the current GUI configuration first");
         }
-        validate_config(&self.config).context("配置校验失败")?;
+        validate_config(&self.config).context("configuration validation failed")?;
         if !listen_conflicts(&self.config).is_empty() {
-            bail!("存在启用隧道的监听端口冲突");
+            bail!("enabled tunnels have conflicting listen addresses");
         }
 
         let preference = self.login_kind.preference(self.identity.trim())?;
@@ -280,7 +287,7 @@ impl TowcApp {
             }
         }
         if groups.is_empty() {
-            bail!("至少需要配置一条隧道");
+            bail!("at least one tunnel must be configured");
         }
         Ok(groups)
     }
@@ -292,18 +299,18 @@ impl TowcApp {
             if listen_conflicts(&self.config).is_empty() {
                 Ok(())
             } else {
-                bail!("本地监听端口冲突")
+                bail!("local listen address conflict")
             }
         }) {
             self.config.tunnels[index].enabled = previous;
-            self.log(format!("无法切换隧道: {error:#}"));
+            self.log(format!("cannot toggle tunnel: {error:#}"));
             return;
         }
         if !self.save_blocked
             && let Err(error) = save_default_config(&self.config)
         {
             self.config.tunnels[index].enabled = previous;
-            self.log(format!("无法保存隧道状态: {error:#}"));
+            self.log(format!("cannot save tunnel state: {error:#}"));
             return;
         }
         if self.running {
@@ -311,7 +318,7 @@ impl TowcApp {
                 Ok(groups) => groups,
                 Err(error) => {
                     self.config.tunnels[index].enabled = previous;
-                    self.log(format!("无法应用隧道状态: {error:#}"));
+                    self.log(format!("cannot apply tunnel state: {error:#}"));
                     return;
                 }
             };
@@ -321,15 +328,15 @@ impl TowcApp {
                 .is_none_or(|updates| updates.send(groups).is_err())
             {
                 self.config.tunnels[index].enabled = previous;
-                self.log("运行时已停止，无法热切换隧道".to_string());
+                self.log("runtime stopped; cannot hot-toggle tunnel".to_string());
                 return;
             }
         }
         let tunnel = &self.config.tunnels[index];
         self.log(format!(
-            "隧道 {} 已{}",
+            "tunnel {} {}",
             tunnel.name,
-            if enabled { "启用" } else { "禁用" }
+            if enabled { "enabled" } else { "disabled" }
         ));
     }
 
@@ -342,12 +349,12 @@ impl TowcApp {
             .cloned()
             .collect::<Vec<_>>();
         let Some(path) = export_path() else {
-            self.log("找不到导出目录".to_string());
+            self.log("cannot locate export directory".to_string());
             return;
         };
         match export_tunnels(&path, tunnels) {
-            Ok(()) => self.log(format!("已导出到 {}", path.display())),
-            Err(error) => self.log(format!("导出失败: {error:#}")),
+            Ok(()) => self.log(format!("exported to {}", path.display())),
+            Err(error) => self.log(format!("export failed: {error:#}")),
         }
     }
 
@@ -357,6 +364,7 @@ impl TowcApp {
             self.status = "正在停止".to_string();
         }
         self.updates = None;
+        self.connected_since = None;
     }
 
     fn poll_events(&mut self, context: &egui::Context) {
@@ -377,6 +385,10 @@ impl TowcApp {
                     {
                         self.login_visible = false;
                         self.qr_texture = None;
+                        self.pending_code = None;
+                    }
+                    if message.starts_with("connected to tows ") && self.connected_since.is_none() {
+                        self.connected_since = Some(Instant::now());
                     }
                     self.status = message.clone();
                     self.log(message);
@@ -390,7 +402,7 @@ impl TowcApp {
                         self.login_visible = true;
                         self.qr_texture = Some(texture);
                     }
-                    Err(error) => self.log(format!("二维码显示失败: {error:#}")),
+                    Err(error) => self.log(format!("cannot display QR code: {error:#}")),
                 },
                 WorkerEvent::CodeRequest { label, reply } => {
                     self.pending_code = Some((label, reply));
@@ -403,10 +415,11 @@ impl TowcApp {
                     self.updates = None;
                     self.pending_code = None;
                     self.qr_texture = None;
+                    self.connected_since = None;
                     match result {
                         Ok(()) => {
                             self.status = "已停止".to_string();
-                            self.log("全部本地监听已停止".to_string());
+                            self.log("all local listeners stopped".to_string());
                         }
                         Err(error) => {
                             self.status = "失败：请手动重新登录并启动".to_string();
@@ -416,7 +429,7 @@ impl TowcApp {
                                         .insert(tunnel.name.clone(), "失败".to_string());
                                 }
                             }
-                            self.log(format!("连接失败，全部监听已停止: {error}"));
+                            self.log(format!("connection failed; all listeners stopped: {error}"));
                         }
                     }
                 }
@@ -433,6 +446,7 @@ impl TowcApp {
         } else {
             format!("[towc] {message}")
         };
+        let message = message.chars().flat_map(char::escape_default).collect();
         self.logs.push(message);
         if self.logs.len() > 500 {
             self.logs.drain(..self.logs.len() - 500);
@@ -446,7 +460,9 @@ impl TowcApp {
             }
             let count = bundle.tunnels.len();
             merge_import(&mut self.config, bundle, policy);
-            self.log(format!("已导入 {count} 条隧道（尚未覆盖来源文件）"));
+            self.log(format!(
+                "imported {count} tunnels; source files were not modified"
+            ));
         }
     }
 }
@@ -469,7 +485,7 @@ impl eframe::App for TowcApp {
         if !dropped.is_empty() && !self.running {
             let bundle = read_import_paths(&dropped);
             self.log(format!(
-                "读取 {} 个配置文件，共 {} 条隧道",
+                "read {} configuration files containing {} tunnels",
                 bundle.files_read,
                 bundle.tunnels.len()
             ));
@@ -481,27 +497,99 @@ impl eframe::App for TowcApp {
             }
         }
 
-        egui::TopBottomPanel::top("top").show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(format!("tcp_over_websocket v{}", crate::APP_VERSION));
-                ui.separator();
-                ui.label(&self.status);
-            });
-            if let Some(warning) = &self.warning {
-                ui.colored_label(egui::Color32::YELLOW, warning);
-                if self.save_blocked && ui.button("确认使用当前界面配置并允许保存").clicked()
-                {
-                    self.save_blocked = false;
-                    self.warning = None;
-                    self.auto_start_pending =
-                        self.config.tunnels.iter().any(|tunnel| tunnel.enabled);
-                    self.log("已解除原配置保护；来源文件仍未被自动覆盖".to_string());
-                }
-            }
-        });
-
         egui::CentralPanel::default().show(context, |ui| {
-            ui.heading("隧道");
+            ui.group(|ui| {
+                ui.set_min_height(290.0);
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.heading("认证状态");
+                    ui.separator();
+                    ui.label("主题");
+                    let old_theme = self.theme;
+                    ui.selectable_value(&mut self.theme, egui::ThemePreference::System, "跟随系统");
+                    ui.selectable_value(&mut self.theme, egui::ThemePreference::Dark, "深色");
+                    ui.selectable_value(&mut self.theme, egui::ThemePreference::Light, "浅色");
+                    if self.theme != old_theme {
+                        context.set_theme(self.theme);
+                    }
+                });
+                if let Some(warning) = &self.warning {
+                    ui.colored_label(egui::Color32::YELLOW, warning);
+                    if self.save_blocked && ui.button("确认使用当前界面配置并允许保存").clicked()
+                    {
+                        self.save_blocked = false;
+                        self.warning = None;
+                        self.auto_start_pending =
+                            self.config.tunnels.iter().any(|tunnel| tunnel.enabled);
+                        self.log(
+                            "configuration protection disabled; source file was not modified"
+                                .to_string(),
+                        );
+                    }
+                }
+                if self.login_visible {
+                    ui.horizontal(|ui| {
+                        ui.label("登录方式");
+                        ui.add_enabled_ui(!self.running, |ui| {
+                            ui.selectable_value(
+                                &mut self.login_kind,
+                                LoginKind::Wechat,
+                                "微信扫码",
+                            );
+                            ui.selectable_value(
+                                &mut self.login_kind,
+                                LoginKind::Mobile,
+                                "手机验证码",
+                            );
+                            ui.selectable_value(
+                                &mut self.login_kind,
+                                LoginKind::Email,
+                                "邮箱验证码",
+                            );
+                            if self.login_kind != LoginKind::Wechat {
+                                ui.text_edit_singleline(&mut self.identity);
+                            }
+                        });
+                    });
+                }
+                if let Some(texture) = &self.qr_texture {
+                    ui.label("请用微信扫码并确认：");
+                    ui.image((texture.id(), egui::vec2(240.0, 240.0)));
+                } else {
+                    ui.label(&self.status);
+                    if let Some(since) = self.connected_since {
+                        ui.label(format!("连接时长：{}", format_elapsed(since.elapsed())));
+                    }
+                    for tunnel in self.config.tunnels.iter().filter(|tunnel| tunnel.enabled) {
+                        let status = self
+                            .tunnel_status
+                            .get(&tunnel.name)
+                            .map(String::as_str)
+                            .unwrap_or("等待连接");
+                        ui.label(format!("{} · {} · {status}", tunnel.tows, tunnel.name));
+                    }
+                }
+                if let Some((label, _)) = &self.pending_code {
+                    ui.separator();
+                    ui.label(format!("请输入{label}验证码（不会写入日志或配置）："));
+                    ui.horizontal(|ui| {
+                        let response = ui.text_edit_singleline(&mut self.code_input);
+                        let submit = ui.button("提交验证码").clicked()
+                            || (response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                        if submit
+                            && !self.code_input.trim().is_empty()
+                            && let Some((_, reply)) = self.pending_code.take()
+                        {
+                            let _ = reply.send(self.code_input.trim().to_string());
+                            self.code_input.clear();
+                        }
+                    });
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.heading("隧道配置");
             let conflicts = listen_conflicts(&self.config);
             let mut remove = None;
             let mut toggle = None;
@@ -537,8 +625,8 @@ impl eframe::App for TowcApp {
                     egui::Grid::new(format!("tunnels-{server}"))
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.label("导出");
-                            ui.label("运行");
+                            ui.label("选择");
+                            ui.label("启用");
                             ui.label("名称");
                             ui.label("目标");
                             ui.label("本地监听");
@@ -555,7 +643,7 @@ impl eframe::App for TowcApp {
                                     }
                                 }
                                 let mut enabled = tunnel.enabled;
-                                if ui.checkbox(&mut enabled, "启用").changed() {
+                                if toggle_switch(ui, &mut enabled).changed() {
                                     toggle = Some((index, enabled));
                                 }
                                 ui.add_enabled_ui(!self.running, |ui| {
@@ -595,7 +683,13 @@ impl eframe::App for TowcApp {
                                     );
                                 }
                                 if ui
-                                    .add_enabled(!self.running, egui::Button::new("删除"))
+                                    .add_enabled(
+                                        !self.running,
+                                        egui::Button::new(
+                                            egui::RichText::new("删除").color(egui::Color32::WHITE),
+                                        )
+                                        .fill(egui::Color32::from_rgb(190, 45, 45)),
+                                    )
                                     .clicked()
                                 {
                                     remove = Some(index);
@@ -678,11 +772,11 @@ impl eframe::App for TowcApp {
                     .clicked()
                 {
                     if self.save_blocked {
-                        self.log("配置仍处于保护状态".to_string());
+                        self.log("configuration is still protected".to_string());
                     } else {
                         match save_default_config(&self.config) {
-                            Ok(()) => self.log("配置已保存".to_string()),
-                            Err(error) => self.log(format!("保存失败: {error:#}")),
+                            Ok(()) => self.log("configuration saved".to_string()),
+                            Err(error) => self.log(format!("save failed: {error:#}")),
                         }
                     }
                 }
@@ -703,79 +797,19 @@ impl eframe::App for TowcApp {
                 }
             });
 
-            ui.separator();
+            ui.add_space(8.0);
+            ui.heading("日志输出");
             ui.group(|ui| {
-                ui.set_min_height(290.0);
                 ui.set_min_width(ui.available_width());
-                if self.login_visible {
-                    ui.horizontal(|ui| {
-                        ui.label("登录方式");
-                        ui.add_enabled_ui(!self.running, |ui| {
-                            ui.selectable_value(
-                                &mut self.login_kind,
-                                LoginKind::Wechat,
-                                "微信扫码",
-                            );
-                            ui.selectable_value(
-                                &mut self.login_kind,
-                                LoginKind::Mobile,
-                                "手机验证码",
-                            );
-                            ui.selectable_value(
-                                &mut self.login_kind,
-                                LoginKind::Email,
-                                "邮箱验证码",
-                            );
-                            if self.login_kind != LoginKind::Wechat {
-                                ui.text_edit_singleline(&mut self.identity);
-                            }
-                        });
-                    });
-                }
-                if let Some(texture) = &self.qr_texture {
-                    ui.label("请用微信扫码并确认：");
-                    ui.image((texture.id(), egui::vec2(240.0, 240.0)));
-                } else {
-                    ui.heading("连接信息");
-                    ui.label(&self.status);
-                    for tunnel in self.config.tunnels.iter().filter(|tunnel| tunnel.enabled) {
-                        let status = self
-                            .tunnel_status
-                            .get(&tunnel.name)
-                            .map(String::as_str)
-                            .unwrap_or("等待连接");
-                        ui.label(format!("{} · {} · {status}", tunnel.tows, tunnel.name));
-                    }
-                }
-                if let Some((label, _)) = &self.pending_code {
-                    ui.separator();
-                    ui.label(format!("请输入{label}验证码（不会写入日志或配置）："));
-                    ui.horizontal(|ui| {
-                        let response = ui.text_edit_singleline(&mut self.code_input);
-                        let submit = ui.button("提交验证码").clicked()
-                            || (response.lost_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                        if submit
-                            && !self.code_input.trim().is_empty()
-                            && let Some((_, reply)) = self.pending_code.take()
-                        {
-                            let _ = reply.send(self.code_input.trim().to_string());
-                            self.code_input.clear();
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.logs {
+                            ui.monospace(line);
                         }
                     });
-                }
             });
-
-            ui.separator();
-            ui.heading("日志");
-            egui::ScrollArea::vertical()
-                .max_height(180.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &self.logs {
-                        ui.monospace(line);
-                    }
-                });
         });
         context.request_repaint_after(Duration::from_millis(100));
     }
@@ -789,9 +823,48 @@ fn forward_rule(tunnel: &TunnelConfig) -> Result<ForwardRule> {
     })
 }
 
+fn toggle_switch(ui: &mut egui::Ui, value: &mut bool) -> egui::Response {
+    let height = ui.spacing().interact_size.y;
+    let (rect, mut response) =
+        ui.allocate_exact_size(egui::vec2(height * 1.8, height), egui::Sense::click());
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let amount = ui.ctx().animate_bool_responsive(response.id, *value);
+        let visuals = ui.style().interact_selectable(&response, *value);
+        let radius = rect.height() / 2.0;
+        ui.painter().rect(
+            rect,
+            radius,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let center_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), amount);
+        ui.painter().circle_filled(
+            egui::pos2(center_x, rect.center().y),
+            radius * 0.72,
+            visuals.fg_stroke.color,
+        );
+    }
+    response
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
 fn qr_texture(context: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHandle> {
     let image = image::load_from_memory(bytes)
-        .context("无法解码二维码")?
+        .context("cannot decode QR code")?
         .to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());

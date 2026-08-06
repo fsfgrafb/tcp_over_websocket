@@ -85,7 +85,9 @@ pub fn load_default_config() -> LoadedConfig {
         return LoadedConfig {
             config: GuiConfig::default(),
             save_blocked: true,
-            warning: Some("找不到 APPDATA/LOCALAPPDATA，无法保存配置".to_string()),
+            warning: Some(
+                "APPDATA/LOCALAPPDATA is unavailable; configuration cannot be saved".to_string(),
+            ),
         };
     };
     load_config_at(&path)
@@ -103,7 +105,7 @@ fn load_config_at(path: &Path) -> LoadedConfig {
                 config: GuiConfig::default(),
                 save_blocked: true,
                 warning: Some(format!(
-                    "配置 {} 无法读取，已加载默认值且不会覆盖原文件：{error:#}",
+                    "cannot read configuration {}; defaults loaded without overwriting it: {error:#}",
                     path.display()
                 )),
             },
@@ -116,13 +118,13 @@ fn load_config_at(path: &Path) -> LoadedConfig {
         Err(error) => LoadedConfig {
             config: GuiConfig::default(),
             save_blocked: true,
-            warning: Some(format!("读取 {} 失败：{error}", path.display())),
+            warning: Some(format!("failed to read {}: {error}", path.display())),
         },
     }
 }
 
 pub fn save_default_config(config: &GuiConfig) -> Result<()> {
-    let path = config_path().context("找不到配置目录")?;
+    let path = config_path().context("cannot locate configuration directory")?;
     validate_config(config)?;
     write_json(&path, config)
 }
@@ -133,7 +135,7 @@ pub fn export_path() -> Option<PathBuf> {
 
 pub fn export_tunnels(path: &Path, tunnels: Vec<TunnelConfig>) -> Result<()> {
     if tunnels.is_empty() {
-        bail!("至少选择一条隧道才能导出");
+        bail!("select at least one tunnel to export");
     }
     let config = GuiConfig { tunnels };
     validate_config(&config)?;
@@ -141,7 +143,7 @@ pub fn export_tunnels(path: &Path, tunnels: Vec<TunnelConfig>) -> Result<()> {
 }
 
 pub fn parse_config(contents: &[u8]) -> Result<GuiConfig> {
-    let mut config: GuiConfig = serde_json::from_slice(contents).context("JSON 格式错误")?;
+    let mut config: GuiConfig = serde_json::from_slice(contents).context("invalid JSON")?;
     assign_missing_names(&mut config.tunnels);
     validate_config(&config)?;
     Ok(config)
@@ -153,15 +155,17 @@ pub fn validate_config(config: &GuiConfig) -> Result<()> {
     for (index, tunnel) in config.tunnels.iter().enumerate() {
         let name = tunnel.name.trim();
         if name.is_empty() {
-            bail!("第 {} 条隧道名称不能为空", index + 1);
+            bail!("tunnel {} must have a name", index + 1);
         }
         if !names.insert(name.to_string()) {
-            bail!("隧道名称重复: {name}");
+            bail!("duplicate tunnel name: {name}");
         }
-        let server =
-            parse_tows(&tunnel.tows).with_context(|| format!("隧道 {name} 的 tows 地址无效"))?;
-        parse_target(&tunnel.target).with_context(|| format!("隧道 {name} 的 target 无效"))?;
-        parse_listen(&tunnel.listen).with_context(|| format!("隧道 {name} 的 listen 无效"))?;
+        let server = parse_tows(&tunnel.tows)
+            .with_context(|| format!("tunnel {name} has an invalid tows address"))?;
+        parse_target(&tunnel.target)
+            .with_context(|| format!("tunnel {name} has an invalid target"))?;
+        parse_listen(&tunnel.listen)
+            .with_context(|| format!("tunnel {name} has an invalid listen address"))?;
         if tunnel.enabled {
             *group_sizes.entry(server.to_string()).or_default() += 1;
         }
@@ -170,7 +174,7 @@ pub fn validate_config(config: &GuiConfig) -> Result<()> {
         .into_iter()
         .find(|(_, count)| *count > MAX_TUNNELS)
     {
-        bail!("tows {server} 启用了 {count} 条隧道，最多允许 {MAX_TUNNELS} 条");
+        bail!("tows {server} has {count} enabled tunnels; maximum is {MAX_TUNNELS}");
     }
     Ok(())
 }
@@ -205,14 +209,14 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
     let mut files_read = 0;
     for path in files {
         match fs::read(&path)
-            .with_context(|| format!("无法读取 {}", path.display()))
+            .with_context(|| format!("cannot read {}", path.display()))
             .and_then(|contents| parse_config(&contents))
         {
             Ok(config) => {
                 files_read += 1;
                 tunnels.extend(config.tunnels);
             }
-            Err(error) => messages.push(format!("跳过 {}：{error:#}", path.display())),
+            Err(error) => messages.push(format!("skipped {}: {error:#}", path.display())),
         }
     }
     assign_missing_names(&mut tunnels);
@@ -273,7 +277,7 @@ fn collect_json_files(path: &Path, files: &mut Vec<PathBuf>, messages: &mut Vec<
         {
             files.push(path.to_path_buf());
         } else {
-            messages.push(format!("跳过非 JSON 文件 {}", path.display()));
+            messages.push(format!("skipped non-JSON file {}", path.display()));
         }
         return;
     }
@@ -284,10 +288,12 @@ fn collect_json_files(path: &Path, files: &mut Vec<PathBuf>, messages: &mut Vec<
                     collect_json_files(&entry.path(), files, messages);
                 }
             }
-            Err(error) => messages.push(format!("无法读取目录 {}：{error}", path.display())),
+            Err(error) => {
+                messages.push(format!("cannot read directory {}: {error}", path.display()))
+            }
         }
     } else {
-        messages.push(format!("路径不存在：{}", path.display()));
+        messages.push(format!("path does not exist: {}", path.display()));
     }
 }
 
