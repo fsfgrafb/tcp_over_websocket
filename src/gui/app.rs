@@ -8,8 +8,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::address::{DEFAULT_TOWS_PORT, Endpoint, parse_listen, parse_target, parse_tows};
 use crate::client::{
-    AuthPrompt, ClientObserver, ForwardRule, LoginPreference, ServerGroup, login_or_restore,
-    run_dynamic_server_groups,
+    AuthPrompt, ClientObserver, ForwardRule, LoginPreference, ServerGroup, clear_cached_ticket,
+    login_or_restore, run_dynamic_server_groups,
 };
 use crate::storage::BoundedLogWriter;
 
@@ -203,8 +203,9 @@ struct TowcApp {
     connected_since: Option<Instant>,
     editing_snapshot: Option<GuiConfig>,
     connected_servers: HashSet<String>,
-    last_cookie_refresh: Option<Instant>,
+    cookie_cycle_started: Option<Instant>,
     restart_when_stopped: bool,
+    logout_when_stopped: bool,
     tunnel_edits: Vec<TunnelEdit>,
     connection_editor: Option<ConnectionEditor>,
     app_settings_editor: Option<AppSettingsEditor>,
@@ -252,8 +253,9 @@ impl TowcApp {
             connected_since: None,
             editing_snapshot: None,
             connected_servers: HashSet::new(),
-            last_cookie_refresh: None,
+            cookie_cycle_started: None,
             restart_when_stopped: false,
+            logout_when_stopped: false,
             tunnel_edits,
             connection_editor: None,
             app_settings_editor: None,
@@ -295,7 +297,7 @@ impl TowcApp {
         self.qr_texture = None;
         self.tunnel_status.clear();
         self.connected_servers.clear();
-        self.last_cookie_refresh = None;
+        self.cookie_cycle_started = None;
 
         std::thread::spawn(move || {
             let bridge = Arc::new(GuiBridge {
@@ -516,6 +518,40 @@ impl TowcApp {
         self.updates = None;
         self.cookie_interval_updates = None;
         self.connected_since = None;
+        self.cookie_cycle_started = None;
+    }
+
+    fn logout(&mut self) {
+        self.restart_when_stopped = false;
+        if self.running {
+            self.logout_when_stopped = true;
+            self.stop();
+            self.status = "正在退出登录".to_string();
+        } else {
+            self.finish_logout();
+        }
+    }
+
+    fn finish_logout(&mut self) {
+        match clear_cached_ticket() {
+            Ok(()) => {
+                self.login_kind = LoginKind::Wechat;
+                self.login_visible = true;
+                self.qr_texture = None;
+                self.pending_code = None;
+                self.submit_code_when_requested = false;
+                self.connected_since = None;
+                self.connected_servers.clear();
+                self.cookie_cycle_started = None;
+                self.status = "已退出登录".to_string();
+                self.log("已退出登录，正在重新获取微信登录二维码".to_string());
+                self.auto_start_pending = true;
+            }
+            Err(error) => {
+                self.status = "退出登录失败".to_string();
+                self.log(format!("无法删除登录凭据：{error:#}"));
+            }
+        }
     }
 
     fn poll_events(&mut self, context: &egui::Context) {
@@ -543,10 +579,14 @@ impl TowcApp {
                         || message == "WebVPN login completed")
                         && self.connected_since.is_none()
                     {
-                        self.connected_since = Some(Instant::now());
+                        let now = Instant::now();
+                        self.connected_since = Some(now);
+                        self.cookie_cycle_started = Some(now);
                     }
                     if message.starts_with("connected to tows ") && self.connected_since.is_none() {
-                        self.connected_since = Some(Instant::now());
+                        let now = Instant::now();
+                        self.connected_since = Some(now);
+                        self.cookie_cycle_started = Some(now);
                     }
                     if let Some(server) = message.strip_prefix("connected to tows ") {
                         self.connected_servers.insert(server.to_string());
@@ -564,7 +604,8 @@ impl TowcApp {
                         self.connected_servers.remove(server);
                     }
                     if message == "WebVPN cookie refreshed" {
-                        self.last_cookie_refresh = Some(Instant::now());
+                        let now = Instant::now();
+                        self.cookie_cycle_started = Some(now);
                     }
                     self.status = message.clone();
                     self.log(message);
@@ -602,21 +643,27 @@ impl TowcApp {
                     self.qr_texture = None;
                     self.connected_since = None;
                     self.connected_servers.clear();
-                    match result {
-                        Ok(()) => {
-                            self.status = "已停止".to_string();
-                            self.log("所有本地监听已停止".to_string());
-                        }
-                        Err(error) => {
-                            self.status = "认证或连接已失效，请重新登录".to_string();
-                            self.login_visible = true;
-                            for tunnel in &self.config.tunnels {
-                                if tunnel.enabled {
-                                    self.tunnel_status
-                                        .insert(tunnel.name.clone(), "失败".to_string());
-                                }
+                    self.cookie_cycle_started = None;
+                    if self.logout_when_stopped {
+                        self.logout_when_stopped = false;
+                        self.finish_logout();
+                    } else {
+                        match result {
+                            Ok(()) => {
+                                self.status = "已停止".to_string();
+                                self.log("所有本地监听已停止".to_string());
                             }
-                            self.log(format!("连接失败，所有监听已停止：{error}"));
+                            Err(error) => {
+                                self.status = "认证或连接已失效，请重新登录".to_string();
+                                self.login_visible = true;
+                                for tunnel in &self.config.tunnels {
+                                    if tunnel.enabled {
+                                        self.tunnel_status
+                                            .insert(tunnel.name.clone(), "失败".to_string());
+                                    }
+                                }
+                                self.log(format!("连接失败，所有监听已停止：{error}"));
+                            }
                         }
                     }
                     if self.restart_when_stopped {
@@ -979,10 +1026,21 @@ impl eframe::App for TowcApp {
                 .resizable(false)
                 .show_separator_line(true)
                 .show_inside(ui, |ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
                         if ui.button("＋ 添加连接").clicked() {
                             self.open_new_connection_editor();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.connected_since.is_some(),
+                                egui::Button::new("退出登录"),
+                            )
+                            .on_hover_text("删除本机登录凭据并重新进行微信登录")
+                            .clicked()
+                        {
+                            self.logout();
                         }
                         if ui.button("↓ 导入配置").clicked() {
                             self.choose_import_files();
@@ -1004,7 +1062,8 @@ impl eframe::App for TowcApp {
                                 request_initial_focus: true,
                             });
                         }
-                    });
+                    },
+                    );
                 });
             let panel_width = ui.available_width();
             egui::ScrollArea::vertical()
@@ -1326,14 +1385,10 @@ impl eframe::App for TowcApp {
                                                 metric_card(
                                                     ui,
                                                     "Cookie 刷新",
-                                                    self.last_cookie_refresh
-                                                        .map(|since| {
-                                                            format!(
-                                                                "{} 前",
-                                                                format_elapsed(since.elapsed())
-                                                            )
-                                                        })
-                                                        .unwrap_or_else(|| "等待周期".to_string()),
+                                                    cookie_refresh_countdown(
+                                                        self.cookie_cycle_started,
+                                                        self.cookie_refresh_secs,
+                                                    ),
                                                 );
                                                 ui.end_row();
                                             });
@@ -2052,6 +2107,7 @@ impl eframe::App for TowcApp {
                         self.cookie_refresh_secs = interval;
                         if interval_changed && let Some(updates) = &self.cookie_interval_updates {
                             let _ = updates.send(Duration::from_secs(self.cookie_refresh_secs));
+                            self.cookie_cycle_started = Some(Instant::now());
                         }
                         self.persist_gui_state();
                     }
@@ -2350,6 +2406,14 @@ fn format_elapsed(elapsed: Duration) -> String {
     )
 }
 
+fn cookie_refresh_countdown(cycle_started: Option<Instant>, interval_secs: u64) -> String {
+    let Some(cycle_started) = cycle_started else {
+        return "--:--:--".to_string();
+    };
+    let remaining = interval_secs.saturating_sub(cycle_started.elapsed().as_secs());
+    format!("{} 后", format_elapsed(Duration::from_secs(remaining)))
+}
+
 fn localize_log_line(line: &str) -> String {
     let (tag, body) = split_log_tag(line);
     format!("{tag} {}", localize_log_body(body))
@@ -2434,7 +2498,6 @@ fn localize_log_body(message: &str) -> String {
         ("read ", "已读取 "),
         ("tows connection ", "tows 连接 "),
         ("invalid input: ", "输入无效："),
-        ("WebVPN location: ", "WebVPN 地址："),
         ("skipped non-JSON file ", "已跳过非 JSON 文件："),
         ("skipped ", "已跳过："),
         ("cannot read directory ", "无法读取目录："),

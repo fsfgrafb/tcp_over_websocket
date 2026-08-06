@@ -6,8 +6,8 @@ mod qr;
 mod runtime;
 
 pub use auth::{
-    AuthPrompt, LoginPreference, SessionCookie, login_or_restore, login_with_preference,
-    restore_valid_cached_ticket,
+    AuthPrompt, LoginPreference, SessionCookie, clear_cached_ticket, login_or_restore,
+    login_with_preference, restore_valid_cached_ticket,
 };
 pub use config::{
     ClientConfig, InteractiveDefaults, ParsedArgs, parse_args, prompt_interactive, prompt_login,

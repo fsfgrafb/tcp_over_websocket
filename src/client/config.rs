@@ -6,7 +6,6 @@ use std::io::{self, Write};
 use crate::address::{
     DEFAULT_LISTEN, DEFAULT_TARGET, Endpoint, parse_listen, parse_target, parse_tows,
 };
-use crate::network::build_webvpn_ws_url;
 use crate::storage::{data_file, write_json};
 
 use super::auth::LoginPreference;
@@ -122,11 +121,6 @@ pub fn prompt_interactive() -> Result<ClientConfig> {
             Err(error) => tracing::warn!(target: "towc", "invalid input: {error}"),
         }
     };
-
-    let location = reqwest::Url::parse(&build_webvpn_ws_url(&server)?)?
-        .path()
-        .to_string();
-    tracing::info!(target: "towc", "WebVPN location: {location}");
 
     let target_default = cached
         .as_ref()

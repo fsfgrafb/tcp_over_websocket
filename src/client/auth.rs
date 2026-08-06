@@ -97,6 +97,17 @@ pub async fn restore_valid_cached_ticket() -> Option<SessionCookie> {
     Some(session)
 }
 
+/// 删除本机保存的 WebVPN 登录凭据。当前运行会话应先停止，避免随后再次写回缓存。
+pub fn clear_cached_ticket() -> Result<()> {
+    let path = data_file(COOKIE_FILE).context("cookie cache directory is unavailable")?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove WebVPN cookie cache {}", path.display())),
+    }
+}
+
 pub async fn login_with_preference(
     prompt: Arc<dyn AuthPrompt>,
     preference: LoginPreference,
