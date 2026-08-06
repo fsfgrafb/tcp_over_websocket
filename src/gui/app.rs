@@ -2849,7 +2849,12 @@ fn metric_card(ui: &mut egui::Ui, label: &str, value: String, width: f32) {
             ),
     );
     content.spacing_mut().item_spacing.y = 1.0;
-    content.weak(label);
+    let label_color = if content.visuals().dark_mode {
+        egui::Color32::from_rgb(178, 182, 188)
+    } else {
+        egui::Color32::from_rgb(76, 82, 90)
+    };
+    content.label(egui::RichText::new(label).color(label_color));
     content.label(egui::RichText::new(value).size(16.0).strong());
 }
 
