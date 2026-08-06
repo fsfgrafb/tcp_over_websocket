@@ -84,7 +84,7 @@
 
 - **主力**：Windows 用户用 `towc_gui`（多隧道图形管理）；`towc.exe` 提供命令行/脚本场景
 - **Linux**：用 `towc`（控制台）；`tows` 部署内网（10.18.47.77 = Orange Pi 5 Plus aarch64）
-- 三程序共享同一版本号，一起发布（GitHub Release 打包 zip）
+- 三程序共享同一版本号，**起步版本 v0.5.0**（2026-08-06 用户确认；与内网现有 tows v0.5.0 编号衔接，虽协议不兼容但延续版本号），一起发布（GitHub Release 打包 zip）
 - 交叉编译目标：
   - `tows` / `towc`：`x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`（aarch64 为 tows 必需、towc 可选）
   - `towc_gui`：仅 `x86_64-pc-windows-msvc`
@@ -367,5 +367,6 @@ WS **二进制帧**：
   - towc 无参交互模式完善（v0.3 参数收集顺序 + v0.4 缓存/登录机制，§1.1）
   - 工程化：serde/serde_json 依赖、tracing 日志、src/protocol.rs 帧编解码模块、GUI 内嵌登录、断线由 WS 层判定（§5）
   - **必须完整阅读 git 历史版本**（§0）；**Rust 最佳实践 + 面向学习者**：代码简洁可读、中文注释、避免花哨技巧（§5 第 10 条）
+  - **起步版本 v0.5.0**（与内网现有 tows v0.5.0 编号衔接，§1.2）
 - 用户表示还会提供更多信息，收到后请更新本文档
 - 若有疑问，优先查阅 `C:\Development\test\docs\` 的详细记录
