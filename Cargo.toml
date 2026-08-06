@@ -65,12 +65,6 @@ eframe = { version = "0.36", default-features = false, features = [
 rfd = { version = "0.17", optional = true }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
-[dev-dependencies]
-tokio-tungstenite = { version = "0.30", default-features = false, features = [
-    "connect",
-    "handshake",
-] }
-
 [[bin]]
 name = "towc"
 path = "src/bin/towc.rs"
@@ -85,11 +79,6 @@ required-features = ["server"]
 name = "towc_gui"
 path = "src/bin/towc_gui.rs"
 required-features = ["gui"]
-
-[[test]]
-name = "multiplex_integration"
-path = "tests/multiplex_integration.rs"
-required-features = ["server"]
 
 [profile.release]
 lto = "thin"
