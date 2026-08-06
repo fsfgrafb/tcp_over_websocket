@@ -91,16 +91,29 @@ async fn login_or_restore_inner(
     preference: LoginPreference,
     server: Option<&Endpoint>,
 ) -> Result<SessionCookie> {
-    if let Some(session) = restore_cached_ticket().await
-        && match server {
-            Some(server) => validate_websocket_ticket(&session, server).await,
-            None => true,
-        }
-    {
+    let restored = match server {
+        Some(server) => restore_valid_cached_ticket_for_server(server).await,
+        None => restore_cached_ticket().await,
+    };
+    if let Some(session) = restored {
         prompt.status("reusing a valid WebVPN login cache");
         return Ok(session);
     }
 
+    login_with_preference(prompt, preference).await
+}
+
+pub async fn restore_valid_cached_ticket_for_server(server: &Endpoint) -> Option<SessionCookie> {
+    let session = restore_cached_ticket().await?;
+    validate_websocket_ticket(&session, server)
+        .await
+        .then_some(session)
+}
+
+pub async fn login_with_preference(
+    prompt: Arc<dyn AuthPrompt>,
+    preference: LoginPreference,
+) -> Result<SessionCookie> {
     prompt.status("WebVPN login required");
     let cookie = match preference {
         LoginPreference::Wechat => login_wechat(Arc::clone(&prompt)).await?,

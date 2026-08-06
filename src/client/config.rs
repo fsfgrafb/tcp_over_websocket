@@ -148,17 +148,6 @@ pub fn prompt_interactive() -> Result<ClientConfig> {
         parse_listen,
     )?;
 
-    let login = loop {
-        let value = prompt_line("login mobile/email (default: WeChat QR): ")?;
-        if value.is_empty() {
-            break LoginPreference::Wechat;
-        }
-        match LoginPreference::from_identity(&value) {
-            Ok(login) => break login,
-            Err(error) => tracing::warn!(target: "towc", "invalid input: {error}"),
-        }
-    };
-
     write_defaults(&InteractiveDefaults {
         version: 1,
         server: server.to_string(),
@@ -170,8 +159,21 @@ pub fn prompt_interactive() -> Result<ClientConfig> {
         server,
         target,
         listen,
-        login,
+        login: LoginPreference::Wechat,
     })
+}
+
+pub fn prompt_login() -> Result<LoginPreference> {
+    loop {
+        let value = prompt_line("login mobile/email (default: WeChat): ")?;
+        if value.is_empty() {
+            return Ok(LoginPreference::Wechat);
+        }
+        match LoginPreference::from_identity(&value) {
+            Ok(login) => return Ok(login),
+            Err(error) => tracing::warn!(target: "towc", "invalid input: {error}"),
+        }
+    }
 }
 
 fn prompt_endpoint(

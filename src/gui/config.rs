@@ -11,10 +11,8 @@ use crate::storage::{data_file, write_json};
 
 const CONFIG_FILE: &str = "config.json";
 const GUI_STATE_FILE: &str = "gui-state.json";
-const DEFAULT_TOWS_77: &str = "10.18.47.77:4489";
-const DEFAULT_TOWS_66: &str = "10.18.47.66:4489";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuiConfig {
     #[serde(default)]
@@ -68,29 +66,6 @@ pub struct ImportBundle {
     pub tunnels: Vec<TunnelConfig>,
     pub messages: Vec<String>,
     pub files_read: usize,
-}
-
-impl Default for GuiConfig {
-    fn default() -> Self {
-        Self {
-            tunnels: vec![
-                default_tunnel("77 SSH", DEFAULT_TOWS_77, "22", "14489"),
-                default_tunnel("77 Minecraft", DEFAULT_TOWS_77, "25565", "25565"),
-                default_tunnel("66 SSH", DEFAULT_TOWS_66, "22", "14490"),
-                default_tunnel("66 Minecraft", DEFAULT_TOWS_66, "25565", "25566"),
-            ],
-        }
-    }
-}
-
-fn default_tunnel(name: &str, tows: &str, target: &str, listen: &str) -> TunnelConfig {
-    TunnelConfig {
-        name: name.to_string(),
-        tows: tows.to_string(),
-        target: format!("127.0.0.1:{target}"),
-        listen: format!("127.0.0.1:{listen}"),
-        enabled: true,
-    }
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -166,10 +141,6 @@ pub fn save_default_config(config: &GuiConfig) -> Result<()> {
     let path = config_path().context("cannot locate configuration directory")?;
     validate_config(config)?;
     write_json(&path, config)
-}
-
-pub fn export_path() -> Option<PathBuf> {
-    data_file("tunnels-export.json")
 }
 
 pub fn export_tunnels(path: &Path, tunnels: Vec<TunnelConfig>) -> Result<()> {
@@ -378,15 +349,31 @@ const fn enabled_by_default() -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_group_two_tunnels_per_server() {
-        let config = GuiConfig::default();
-        let mut counts = HashMap::new();
-        for tunnel in config.tunnels {
-            *counts.entry(tunnel.tows).or_insert(0) += 1;
+    fn sample_config() -> GuiConfig {
+        GuiConfig {
+            tunnels: vec![
+                TunnelConfig {
+                    name: "77 SSH".to_string(),
+                    tows: "10.18.47.77:4489".to_string(),
+                    target: "127.0.0.1:22".to_string(),
+                    listen: "127.0.0.1:14489".to_string(),
+                    enabled: true,
+                },
+                TunnelConfig {
+                    name: "77 Minecraft".to_string(),
+                    tows: "10.18.47.77:4489".to_string(),
+                    target: "127.0.0.1:25565".to_string(),
+                    listen: "127.0.0.1:25565".to_string(),
+                    enabled: true,
+                },
+            ],
         }
-        assert_eq!(counts.len(), 2);
-        assert!(counts.into_values().all(|count| count == 2));
+    }
+
+    #[test]
+    fn defaults_do_not_create_tunnels() {
+        let config = GuiConfig::default();
+        assert!(config.tunnels.is_empty());
     }
 
     #[test]
@@ -418,10 +405,10 @@ mod tests {
 
     #[test]
     fn merge_supports_skip_overwrite_and_replace() {
-        let mut config = GuiConfig::default();
+        let mut config = sample_config();
         let incoming = TunnelConfig {
             name: "77 SSH".to_string(),
-            tows: DEFAULT_TOWS_77.to_string(),
+            tows: "10.18.47.77:4489".to_string(),
             target: "127.0.0.1:2222".to_string(),
             listen: "127.0.0.1:12222".to_string(),
             enabled: true,
@@ -451,7 +438,7 @@ mod tests {
             ImportBundle {
                 tunnels: vec![TunnelConfig {
                     name: "only".to_string(),
-                    tows: DEFAULT_TOWS_66.to_string(),
+                    tows: "10.18.47.66:4489".to_string(),
                     target: "127.0.0.1:22".to_string(),
                     listen: "127.0.0.1:15555".to_string(),
                     enabled: true,
@@ -467,7 +454,7 @@ mod tests {
 
     #[test]
     fn import_reports_existing_and_cross_file_duplicates() {
-        let config = GuiConfig::default();
+        let config = sample_config();
         let duplicate = config.tunnels[0].clone();
         let bundle = ImportBundle {
             tunnels: vec![duplicate.clone(), duplicate],
@@ -487,7 +474,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let selected = GuiConfig::default().tunnels.into_iter().take(2).collect();
+        let selected = sample_config().tunnels;
         export_tunnels(&path, selected).unwrap();
         let exported = parse_config(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(exported.tunnels.len(), 2);
@@ -501,7 +488,7 @@ mod tests {
 
     #[test]
     fn enabled_listen_conflicts_are_reported_by_name() {
-        let mut config = GuiConfig::default();
+        let mut config = sample_config();
         config.tunnels[1].listen = config.tunnels[0].listen.clone();
         let conflicts = listen_conflicts(&config);
         assert!(conflicts.contains("77 SSH"));

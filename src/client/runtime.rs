@@ -19,8 +19,11 @@ use crate::network::{
 use crate::protocol::{Frame, FrameType, MAX_DATA_LEN, MAX_TUNNELS};
 use crate::{APP_VERSION, init_tracing};
 
-use super::auth::{AuthPrompt, SessionCookie, login_or_restore_for_server, refresh_ticket};
-use super::config::{ParsedArgs, parse_args, prompt_interactive};
+use super::auth::{
+    AuthPrompt, SessionCookie, login_or_restore_for_server, login_with_preference, refresh_ticket,
+    restore_valid_cached_ticket_for_server,
+};
+use super::config::{ParsedArgs, parse_args, prompt_interactive, prompt_login};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const COOKIE_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
@@ -78,13 +81,13 @@ impl ClientObserver for TerminalUi {
 pub async fn run_cli() -> Result<()> {
     init_tracing("towc");
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let config = match parse_args(&args)? {
+    let (mut config, interactive) = match parse_args(&args)? {
         ParsedArgs::Help => {
             print_help();
             return Ok(());
         }
-        ParsedArgs::Interactive => prompt_interactive()?,
-        ParsedArgs::Run(config) => config,
+        ParsedArgs::Interactive => (prompt_interactive()?, true),
+        ParsedArgs::Run(config) => (config, false),
     };
 
     if !config.listen.is_loopback() {
@@ -93,7 +96,17 @@ pub async fn run_cli() -> Result<()> {
     let ui = Arc::new(TerminalUi);
     let auth: Arc<dyn AuthPrompt> = ui.clone();
     let observer: Arc<dyn ClientObserver> = ui;
-    let cookie = login_or_restore_for_server(auth, config.login, &config.server).await?;
+    let cookie = if interactive {
+        if let Some(cookie) = restore_valid_cached_ticket_for_server(&config.server).await {
+            auth.status("reusing a valid WebVPN login cache");
+            cookie
+        } else {
+            config.login = prompt_login()?;
+            login_with_preference(auth, config.login).await?
+        }
+    } else {
+        login_or_restore_for_server(auth, config.login, &config.server).await?
+    };
     let rule = ForwardRule {
         name: "towc".to_string(),
         target: config.target,
@@ -1302,7 +1315,7 @@ mod tests {
                 match message.unwrap() {
                     Message::Binary(bytes) => {
                         let frame = Frame::decode(&bytes).unwrap();
-                        if frame.kind == FrameType::Close && frame.tunnel_id != 0 {
+                        if frame.kind == FrameType::Open && frame.tunnel_id != 0 {
                             websocket
                                 .send(Message::Binary(
                                     Frame::new(FrameType::OpenOk, frame.tunnel_id, Vec::new())
