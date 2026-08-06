@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use eframe::egui;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, Instant};
@@ -50,6 +50,10 @@ enum WorkerEvent {
         reply: std_mpsc::Sender<String>,
     },
     Log(String),
+    Traffic {
+        uploaded: u64,
+        downloaded: u64,
+    },
     Finished(std::result::Result<(), String>),
 }
 
@@ -115,6 +119,13 @@ impl ClientObserver for GuiBridge {
         let _ = self
             .events
             .send(WorkerEvent::Tunnel(name.to_string(), message.to_string()));
+    }
+
+    fn traffic(&self, uploaded: u64, downloaded: u64) {
+        let _ = self.events.send(WorkerEvent::Traffic {
+            uploaded,
+            downloaded,
+        });
     }
 }
 
@@ -204,6 +215,8 @@ struct TowcApp {
     editing_snapshot: Option<GuiConfig>,
     connected_servers: HashSet<String>,
     cookie_cycle_started: Option<Instant>,
+    traffic_history: VecDeque<(u64, u64)>,
+    traffic_totals: Option<(u64, u64)>,
     restart_when_stopped: bool,
     logout_when_stopped: bool,
     tunnel_edits: Vec<TunnelEdit>,
@@ -254,6 +267,8 @@ impl TowcApp {
             editing_snapshot: None,
             connected_servers: HashSet::new(),
             cookie_cycle_started: None,
+            traffic_history: VecDeque::with_capacity(60),
+            traffic_totals: None,
             restart_when_stopped: false,
             logout_when_stopped: false,
             tunnel_edits,
@@ -298,6 +313,8 @@ impl TowcApp {
         self.tunnel_status.clear();
         self.connected_servers.clear();
         self.cookie_cycle_started = None;
+        self.traffic_history.clear();
+        self.traffic_totals = None;
 
         std::thread::spawn(move || {
             let bridge = Arc::new(GuiBridge {
@@ -631,6 +648,21 @@ impl TowcApp {
                     } else {
                         self.pending_code = Some((label, reply));
                     }
+                }
+                WorkerEvent::Traffic {
+                    uploaded,
+                    downloaded,
+                } => {
+                    let (previous_uploaded, previous_downloaded) =
+                        self.traffic_totals.unwrap_or((0, 0));
+                    self.traffic_history.push_back((
+                        uploaded.saturating_sub(previous_uploaded),
+                        downloaded.saturating_sub(previous_downloaded),
+                    ));
+                    if self.traffic_history.len() > 60 {
+                        self.traffic_history.pop_front();
+                    }
+                    self.traffic_totals = Some((uploaded, downloaded));
                 }
                 WorkerEvent::Log(message) => self.log(message),
                 WorkerEvent::Finished(result) => {
@@ -1025,9 +1057,17 @@ impl eframe::App for TowcApp {
                 .exact_height(48.0)
                 .resizable(false)
                 .show_separator_line(true)
+                .frame(
+                    egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
+                        left: 0,
+                        right: 0,
+                        top: 2,
+                        bottom: 0,
+                    }),
+                )
                 .show_inside(ui, |ui| {
                     ui.with_layout(
-                        egui::Layout::left_to_right(egui::Align::Center),
+                        egui::Layout::left_to_right(egui::Align::Max),
                         |ui| {
                         if ui.button("＋ 添加连接").clicked() {
                             self.open_new_connection_editor();
@@ -1035,9 +1075,8 @@ impl eframe::App for TowcApp {
                         if ui
                             .add_enabled(
                                 self.connected_since.is_some(),
-                                egui::Button::new("退出登录"),
+                                egui::Button::new("↪ 退出登录"),
                             )
-                            .on_hover_text("删除本机登录凭据并重新进行微信登录")
                             .clicked()
                         {
                             self.logout();
@@ -1342,25 +1381,30 @@ impl eframe::App for TowcApp {
                                             },
                                         );
                                     } else {
-                                        let enabled = self
-                                            .config
-                                            .tunnels
-                                            .iter()
-                                            .filter(|tunnel| tunnel.enabled)
-                                            .count();
-                                        let ready = self
+                                        traffic_chart(ui, &self.traffic_history);
+                                        ui.add_space(6.0);
+                                        let working = self
                                             .config
                                             .tunnels
                                             .iter()
                                             .filter(|tunnel| {
-                                                self.tunnel_status.get(&tunnel.name).is_some_and(
-                                                    |status| status.starts_with("ready:"),
-                                                )
+                                                tunnel.enabled
+                                                    && self
+                                                        .tunnel_status
+                                                        .get(&tunnel.name)
+                                                        .is_some_and(|status| {
+                                                            status.starts_with("ready:")
+                                                        })
                                             })
                                             .count();
+                                        let total = self.config.tunnels.len();
+                                        let (total_uploaded, total_downloaded) =
+                                            self.traffic_totals.unwrap_or_default();
+                                        let metric_width =
+                                            ((ui.available_width() - 12.0) / 3.0).max(1.0);
                                         egui::Grid::new("auth-metrics")
-                                            .num_columns(2)
-                                            .spacing([10.0, 10.0])
+                                            .num_columns(3)
+                                            .spacing([6.0, 8.0])
                                             .show(ui, |ui| {
                                                 metric_card(
                                                     ui,
@@ -1370,25 +1414,41 @@ impl eframe::App for TowcApp {
                                                             format_elapsed(since.elapsed())
                                                         })
                                                         .unwrap_or_else(|| "--:--:--".to_string()),
+                                                    metric_width,
                                                 );
                                                 metric_card(
                                                     ui,
-                                                    "隧道",
-                                                    format!("{ready} / {enabled}"),
+                                                    "活跃隧道",
+                                                    format!("{working} / {total}"),
+                                                    metric_width,
                                                 );
-                                                ui.end_row();
                                                 metric_card(
                                                     ui,
                                                     "保活连接",
                                                     self.connected_servers.len().to_string(),
+                                                    metric_width,
                                                 );
+                                                ui.end_row();
                                                 metric_card(
                                                     ui,
-                                                    "Cookie 刷新",
+                                                    "凭据刷新",
                                                     cookie_refresh_countdown(
                                                         self.cookie_cycle_started,
                                                         self.cookie_refresh_secs,
                                                     ),
+                                                    metric_width,
+                                                );
+                                                metric_card(
+                                                    ui,
+                                                    "累计上行",
+                                                    format_transfer_total(total_uploaded),
+                                                    metric_width,
+                                                );
+                                                metric_card(
+                                                    ui,
+                                                    "累计下行",
+                                                    format_transfer_total(total_downloaded),
+                                                    metric_width,
                                                 );
                                                 ui.end_row();
                                             });
@@ -2042,7 +2102,7 @@ impl eframe::App for TowcApp {
                             editor.request_initial_focus = false;
                         });
                         ui.add_space(10.0);
-                        ui.label("Cookie 刷新间隔");
+                        ui.label("凭据刷新间隔");
                         ui.horizontal(|ui| {
                             ui.add_sized(
                                 [INTERVAL_INPUT_WIDTH, 32.0],
@@ -2090,11 +2150,11 @@ impl eframe::App for TowcApp {
                             .cookie_refresh_secs
                             .trim()
                             .parse::<u64>()
-                            .context("Cookie 刷新间隔必须是整数")?
+                            .context("凭据刷新间隔必须是整数")?
                     };
                     if !(MIN_COOKIE_REFRESH_SECS..=MAX_COOKIE_REFRESH_SECS).contains(&value) {
                         bail!(
-                            "Cookie 刷新间隔必须在 {MIN_COOKIE_REFRESH_SECS}–{MAX_COOKIE_REFRESH_SECS} 秒之间"
+                            "凭据刷新间隔必须在 {MIN_COOKIE_REFRESH_SECS}–{MAX_COOKIE_REFRESH_SECS} 秒之间"
                         );
                     }
                     Ok(value)
@@ -2411,7 +2471,7 @@ fn cookie_refresh_countdown(cycle_started: Option<Instant>, interval_secs: u64) 
         return "--:--:--".to_string();
     };
     let remaining = interval_secs.saturating_sub(cycle_started.elapsed().as_secs());
-    format!("{} 后", format_elapsed(Duration::from_secs(remaining)))
+    format_elapsed(Duration::from_secs(remaining))
 }
 
 fn localize_log_line(line: &str) -> String {
@@ -2450,7 +2510,7 @@ fn localize_log_body(message: &str) -> String {
         "an unexpired verification code already exists; use it directly" => {
             "已有未过期的验证码，可直接使用"
         }
-        "WebVPN cookie refreshed" => "WebVPN Cookie 已刷新",
+        "WebVPN cookie refreshed" => "WebVPN 凭据已刷新",
         "all local listeners stopped" => "所有本地监听已停止",
         "disabled" => "已禁用",
         "peer closed" => "对端已关闭连接",
@@ -2504,15 +2564,15 @@ fn localize_log_body(message: &str) -> String {
         ("path does not exist: ", "路径不存在："),
         (
             "could not read WebVPN cookie cache; signing in again: ",
-            "无法读取 WebVPN Cookie 缓存，将重新登录：",
+            "无法读取 WebVPN 登录凭据，将重新登录：",
         ),
         (
             "cookie cache directory is unavailable",
-            "Cookie 缓存目录不可用",
+            "登录凭据目录不可用",
         ),
         (
             "could not save cookie cache; current session is unaffected: ",
-            "无法保存 Cookie 缓存，当前会话不受影响：",
+            "无法保存登录凭据，当前会话不受影响：",
         ),
     ] {
         if let Some(rest) = message.strip_prefix(prefix) {
@@ -2548,7 +2608,7 @@ fn localize_log_body(message: &str) -> String {
         .strip_prefix("Cookie keepalive interval updated to ")
         .and_then(|value| value.strip_suffix(" seconds"))
     {
-        return format!("Cookie 刷新间隔已更新为 {interval} 秒");
+        return format!("凭据刷新间隔已更新为 {interval} 秒");
     }
     message.to_string()
 }
@@ -2628,7 +2688,7 @@ mod log_tests {
         );
         assert_eq!(
             localize_log_line("[towc] WebVPN cookie refreshed"),
-            "[towc] WebVPN Cookie 已刷新"
+            "[towc] WebVPN 凭据已刷新"
         );
     }
 
@@ -2776,22 +2836,154 @@ fn status_indicator(ui: &mut egui::Ui, color: egui::Color32, detail: &str) {
     response.on_hover_text(capitalized);
 }
 
-fn metric_card(ui: &mut egui::Ui, label: &str, value: String) {
-    egui::Frame::new()
-        .fill(ui.visuals().faint_bg_color)
-        .inner_margin(12.0)
-        .corner_radius(8.0)
-        .show(ui, |ui| {
-            ui.allocate_ui_with_layout(
-                egui::vec2(150.0, 32.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.weak(label);
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(value).size(20.0).strong());
-                },
-            );
-        });
+fn metric_card(ui: &mut egui::Ui, label: &str, value: String, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 8.0, ui.visuals().faint_bg_color);
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt((label, "metric-card"))
+            .max_rect(rect.shrink2(egui::vec2(5.0, 4.0)))
+            .layout(
+                egui::Layout::top_down(egui::Align::Center).with_main_align(egui::Align::Center),
+            ),
+    );
+    content.spacing_mut().item_spacing.y = 1.0;
+    content.weak(label);
+    content.label(egui::RichText::new(value).size(16.0).strong());
+}
+
+fn traffic_chart(ui: &mut egui::Ui, history: &VecDeque<(u64, u64)>) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::hover());
+    let dark = ui.visuals().dark_mode;
+    let uploaded_color = if dark {
+        egui::Color32::from_rgb(76, 166, 255)
+    } else {
+        egui::Color32::from_rgb(0, 105, 190)
+    };
+    let downloaded_color = if dark {
+        egui::Color32::from_rgb(74, 205, 132)
+    } else {
+        egui::Color32::from_rgb(0, 135, 75)
+    };
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        5.0,
+        ui.visuals().faint_bg_color,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    let current = history.back().copied().unwrap_or_default();
+    painter.text(
+        rect.left_top() + egui::vec2(5.0, 3.0),
+        egui::Align2::LEFT_TOP,
+        format!("↑ {}", format_transfer_rate(current.0)),
+        egui::FontId::proportional(10.0),
+        uploaded_color,
+    );
+    painter.text(
+        rect.right_top() + egui::vec2(-5.0, 3.0),
+        egui::Align2::RIGHT_TOP,
+        format!("↓ {}", format_transfer_rate(current.1)),
+        egui::FontId::proportional(10.0),
+        downloaded_color,
+    );
+
+    let plot = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(4.0, 16.0),
+        rect.right_bottom() - egui::vec2(4.0, 4.0),
+    );
+    let grid_color = ui
+        .visuals()
+        .widgets
+        .noninteractive
+        .bg_stroke
+        .color
+        .gamma_multiply(0.45);
+    for fraction in [0.25_f32, 0.5, 0.75] {
+        let x = egui::lerp(plot.left()..=plot.right(), fraction);
+        painter.line_segment(
+            [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+            egui::Stroke::new(0.5, grid_color),
+        );
+    }
+    let middle_y = plot.center().y;
+    painter.line_segment(
+        [
+            egui::pos2(plot.left(), middle_y),
+            egui::pos2(plot.right(), middle_y),
+        ],
+        egui::Stroke::new(0.5, grid_color),
+    );
+
+    let maximum = history
+        .iter()
+        .map(|(uploaded, downloaded)| (*uploaded).max(*downloaded))
+        .max()
+        .unwrap_or(0)
+        .max(1) as f32;
+    let missing = 60_usize.saturating_sub(history.len());
+    let points = |select: fn(&(u64, u64)) -> u64| {
+        history
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| {
+                let position = missing + index;
+                let x = egui::lerp(
+                    plot.left()..=plot.right(),
+                    (position as f32 / 59.0).clamp(0.0, 1.0),
+                );
+                let y = plot.bottom() - (select(sample) as f32 / maximum) * plot.height();
+                egui::pos2(x, y)
+            })
+            .collect::<Vec<_>>()
+    };
+    painter.add(egui::Shape::line(
+        points(|sample| sample.0),
+        egui::Stroke::new(1.25, uploaded_color),
+    ));
+    painter.add(egui::Shape::line(
+        points(|sample| sample.1),
+        egui::Stroke::new(1.25, downloaded_color),
+    ));
+}
+
+fn format_transfer_rate(bytes_per_second: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes_per_second as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB/s", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB/s", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB/s", bytes / KIB)
+    } else {
+        format!("{bytes_per_second} B/s")
+    }
+}
+
+fn format_transfer_total(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes / TIB)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
 }
 
 fn qr_texture(context: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHandle> {

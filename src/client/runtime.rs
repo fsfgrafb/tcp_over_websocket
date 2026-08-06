@@ -2,7 +2,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -46,6 +49,13 @@ pub struct ServerGroup {
 pub trait ClientObserver: Send + Sync {
     fn status(&self, message: &str);
     fn tunnel_status(&self, name: &str, message: &str);
+    fn traffic(&self, _uploaded: u64, _downloaded: u64) {}
+}
+
+#[derive(Default)]
+struct TrafficCounters {
+    uploaded: AtomicU64,
+    downloaded: AtomicU64,
 }
 
 struct TerminalUi;
@@ -320,6 +330,7 @@ async fn run_dynamic_connection_groups(
     let mut pending = HashMap::<Endpoint, ConnectionGroup>::new();
     let mut tasks = JoinSet::<(Endpoint, u64, Result<()>)>::new();
     let mut next_generation = 1_u64;
+    let traffic = Arc::new(TrafficCounters::default());
     for group in groups.into_iter().filter(|group| !group.rules.is_empty()) {
         spawn_dynamic_group(
             group,
@@ -328,6 +339,7 @@ async fn run_dynamic_connection_groups(
             &mut controls,
             &mut tasks,
             &mut next_generation,
+            &traffic,
         );
     }
 
@@ -337,6 +349,10 @@ async fn run_dynamic_connection_groups(
     );
     let mut updates_open = true;
     let mut cookie_updates_open = true;
+    let mut traffic_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
 
     loop {
         tokio::select! {
@@ -426,6 +442,7 @@ async fn run_dynamic_connection_groups(
                             &mut controls,
                             &mut tasks,
                             &mut next_generation,
+                            &traffic,
                         );
                     }
                 }
@@ -439,6 +456,12 @@ async fn run_dynamic_connection_groups(
                     return Err(error.context("WebVPN cookie refresh failed"));
                 }
                 observer.status("WebVPN cookie refreshed");
+            }
+            _ = traffic_tick.tick() => {
+                observer.traffic(
+                    traffic.uploaded.load(Ordering::Relaxed),
+                    traffic.downloaded.load(Ordering::Relaxed),
+                );
             }
             changed = cookie_refresh_interval.changed(), if cookie_updates_open => {
                 if changed.is_ok() {
@@ -473,6 +496,7 @@ async fn run_dynamic_connection_groups(
                                 &mut controls,
                                 &mut tasks,
                                 &mut next_generation,
+                                &traffic,
                             );
                         }
                     }
@@ -498,6 +522,7 @@ fn spawn_dynamic_group(
     controls: &mut HashMap<Endpoint, DynamicControl>,
     tasks: &mut JoinSet<(Endpoint, u64, Result<()>)>,
     next_generation: &mut u64,
+    traffic: &Arc<TrafficCounters>,
 ) {
     let generation = *next_generation;
     *next_generation = next_generation.wrapping_add(1);
@@ -516,6 +541,7 @@ fn spawn_dynamic_group(
     );
     let cookie = cookie.clone();
     let group_observer = Arc::clone(observer);
+    let traffic = Arc::clone(traffic);
     tasks.spawn(async move {
         let status_rules = rules_rx.clone();
         let result = run_dynamic_tunnels_to_url(
@@ -526,6 +552,7 @@ fn spawn_dynamic_group(
             cookie,
             stop_rx,
             Arc::clone(&group_observer),
+            traffic,
         )
         .await;
         if let Err(error) = &result {
@@ -580,6 +607,7 @@ async fn run_tunnels_to_url(
         cookie,
         stop,
         observer,
+        None,
     )
     .await;
     drop(rules_tx);
@@ -594,6 +622,7 @@ async fn run_dynamic_tunnels_to_url(
     cookie: SessionCookie,
     stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
+    traffic: Arc<TrafficCounters>,
 ) -> Result<()> {
     run_controlled_tunnels_to_url(
         url,
@@ -604,6 +633,7 @@ async fn run_dynamic_tunnels_to_url(
         cookie,
         stop,
         observer,
+        Some(traffic),
     )
     .await
 }
@@ -617,6 +647,7 @@ async fn run_controlled_tunnels_to_url(
     cookie: SessionCookie,
     mut stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
+    traffic: Option<Arc<TrafficCounters>>,
 ) -> Result<()> {
     // 登录完成后先绑定全部端口；任何冲突都在建立 WS 前清晰报出。
     let mut listeners = Vec::new();
@@ -780,6 +811,7 @@ async fn run_controlled_tunnels_to_url(
                             &observer,
                             &mut tunnels,
                             &mut retired_ids,
+                            &traffic,
                         ).await {
                             writer.protocol_close(error.to_string()).await;
                             break Err(error);
@@ -911,12 +943,22 @@ async fn handle_ws_message(
     observer: &Arc<dyn ClientObserver>,
     tunnels: &mut HashMap<u16, Tunnel>,
     retired_ids: &mut HashSet<u16>,
+    traffic: &Option<Arc<TrafficCounters>>,
 ) -> Result<()> {
     match message {
         Message::Binary(bytes) => {
             let frame = Frame::decode(&bytes)?;
             frame.validate_server_to_client(true)?;
-            handle_frame(frame, writer, events, observer, tunnels, retired_ids).await
+            handle_frame(
+                frame,
+                writer,
+                events,
+                observer,
+                tunnels,
+                retired_ids,
+                traffic,
+            )
+            .await
         }
         Message::Ping(payload) => {
             writer.raw(Message::Pong(payload)).await;
@@ -936,6 +978,7 @@ async fn handle_frame(
     observer: &Arc<dyn ClientObserver>,
     tunnels: &mut HashMap<u16, Tunnel>,
     retired_ids: &mut HashSet<u16>,
+    traffic: &Option<Arc<TrafficCounters>>,
 ) -> Result<()> {
     if retired_ids.contains(&frame.tunnel_id) {
         match frame.kind {
@@ -969,8 +1012,14 @@ async fn handle_frame(
                 .set_nodelay(true)
                 .context("failed to enable TCP_NODELAY on local TCP stream")?;
             let flow = writer.register(frame.tunnel_id).await?;
-            let tunnel =
-                spawn_tcp_tasks(frame.tunnel_id, name.clone(), stream, flow, events.clone());
+            let tunnel = spawn_tcp_tasks(
+                frame.tunnel_id,
+                name.clone(),
+                stream,
+                flow,
+                events.clone(),
+                traffic.clone(),
+            );
             tunnels.insert(frame.tunnel_id, Tunnel::Open(tunnel));
             observer.tunnel_status(&name, &format!("stream {} established", frame.tunnel_id));
             Ok(())
@@ -987,6 +1036,7 @@ async fn handle_frame(
             Ok(())
         }
         FrameType::Data => {
+            let size = frame.payload.len() as u64;
             let tunnel = open_tunnel_mut(tunnels, frame.tunnel_id)?;
             if tunnel.remote_eof_seen {
                 bail!("stream {} received DATA after EOF", frame.tunnel_id);
@@ -1000,7 +1050,11 @@ async fn handle_frame(
                         "local TCP writer for stream {} has stopped",
                         frame.tunnel_id
                     )
-                })
+                })?;
+            if let Some(traffic) = traffic {
+                traffic.downloaded.fetch_add(size, Ordering::Relaxed);
+            }
+            Ok(())
         }
         FrameType::Eof => {
             let tunnel = open_tunnel_mut(tunnels, frame.tunnel_id)?;
@@ -1082,11 +1136,12 @@ fn spawn_tcp_tasks(
     stream: TcpStream,
     flow: FlowWriter,
     events: mpsc::Sender<TunnelEvent>,
+    traffic: Option<Arc<TrafficCounters>>,
 ) -> OpenTunnel {
     let (reader, writer) = stream.into_split();
     let (tcp_sender, receiver) = mpsc::channel(TCP_QUEUE_FRAMES);
     let read_events = events.clone();
-    let reader_task = tokio::spawn(read_tcp(id, reader, flow, read_events));
+    let reader_task = tokio::spawn(read_tcp(id, reader, flow, read_events, traffic));
     let writer_task = tokio::spawn(write_tcp(id, writer, receiver, events));
     OpenTunnel {
         name,
@@ -1104,6 +1159,7 @@ async fn read_tcp(
     mut reader: OwnedReadHalf,
     flow: FlowWriter,
     events: mpsc::Sender<TunnelEvent>,
+    traffic: Option<Arc<TrafficCounters>>,
 ) {
     let mut buffer = vec![0_u8; MAX_DATA_LEN];
     loop {
@@ -1121,6 +1177,9 @@ async fn read_tcp(
                     .expect("TCP chunk does not exceed the protocol limit");
                 if flow.send(frame).await.is_err() {
                     return;
+                }
+                if let Some(traffic) = &traffic {
+                    traffic.uploaded.fetch_add(size as u64, Ordering::Relaxed);
                 }
             }
             Err(error) if is_normal_close(&error) => {
