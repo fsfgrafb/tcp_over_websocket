@@ -74,6 +74,28 @@
   - `towc_gui`：仅 `x86_64-pc-windows-msvc`
 - **不采用 busybox 单二进制**（`tcpow server|client|gui`）：GUI 依赖会打进 Linux 版、体积增大、与 aarch64 交叉编译互相拖累
 
+### 1.3 towc_gui 配置文件（JSON，2026-08-06 用户确认）
+- **默认配置文件**：exe 同目录 `config.json`（便携优先），GUI 内可编辑
+- **结构**：
+```json
+{
+  "tows": "10.18.47.77:4489",
+  "tunnels": [
+    { "name": "SSH",      "target": "127.0.0.1:22",    "listen": "127.0.0.1:14489", "enabled": true },
+    { "name": "Minecraft", "target": "127.0.0.1:25565", "listen": "127.0.0.1:25565", "enabled": true }
+  ]
+}
+```
+- **字段**：
+  - `tows`：tows 地址 `ip[:port]`（可选，缺省 `10.18.47.77:4489`）
+  - 每条隧道：`name`（显示名/去重键，可选）、`target`（目标 `host:port`，必填）、`listen`（本地监听 `host:port`，必填）、`enabled`（可选，默认 true）
+- **拖拽导入**：拖入 `.json` 文件到窗口 → 导入其中的隧道列表
+- **批量导入**：一次拖入**多个** `.json` 文件（或含配置的文件夹）→ 全部导入
+- **导入策略**：默认**合并**（按 `name` 去重，同名提示覆盖/跳过），可选"整体替换"；本地监听端口冲突 → GUI 高亮提示
+- **校验**：导入时校验 JSON 合法性、必填字段、端口范围；非法文件 → 提示并跳过，不影响其余
+- **认证信息不入配置**（安全）：ticket/cookie 仍走既有缓存机制（§2.5），配置只存隧道列表与 tows 地址
+- 该 JSON 格式**预留 towc 未来配置文件模式复用**（§8：towc 可扩展配置文件多隧道），保证两端配置可互换
+
 ---
 
 ## 2. WebVPN 传输机制（全部为实测结论，2026-08-05 验证）
@@ -322,5 +344,6 @@ WS **二进制帧**：
   - 发布矩阵（§1.2）、命名保持 towc/tows/towc_gui、towc 保持单隧道
   - 版本协商 + 不兼容旧版（HELLO/HELLO_ACK，§3.0/§3.1）
   - EOF 半关闭帧 0x08（SSH 依赖，§3.1）；towc_gui 推荐 egui/eframe；开发顺序 tows→towc→towc_gui（§5）
+  - towc_gui JSON 配置文件 + 拖拽/批量导入（§1.3）
 - 用户表示还会提供更多信息，收到后请更新本文档
 - 若有疑问，优先查阅 `C:\Development\test\docs\` 的详细记录
