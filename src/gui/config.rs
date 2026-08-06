@@ -10,6 +10,7 @@ use crate::protocol::MAX_TUNNELS;
 use crate::storage::{data_file, write_json};
 
 const CONFIG_FILE: &str = "config.json";
+const GUI_STATE_FILE: &str = "gui-state.json";
 const DEFAULT_TOWS_77: &str = "10.18.47.77:4489";
 const DEFAULT_TOWS_66: &str = "10.18.47.66:4489";
 
@@ -18,6 +19,22 @@ const DEFAULT_TOWS_66: &str = "10.18.47.66:4489";
 pub struct GuiConfig {
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeSetting {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuiState {
+    pub theme: ThemeSetting,
+    pub selected_tunnels: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +95,28 @@ fn default_tunnel(name: &str, tows: &str, target: &str, listen: &str) -> TunnelC
 
 pub fn config_path() -> Option<PathBuf> {
     data_file(CONFIG_FILE)
+}
+
+pub fn load_gui_state() -> GuiState {
+    data_file(GUI_STATE_FILE)
+        .map(|path| load_gui_state_at(&path))
+        .unwrap_or_default()
+}
+
+fn load_gui_state_at(path: &Path) -> GuiState {
+    fs::read(path)
+        .ok()
+        .and_then(|contents| serde_json::from_slice(&contents).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_gui_state(state: &GuiState) -> Result<()> {
+    let path = data_file(GUI_STATE_FILE).context("cannot locate GUI state directory")?;
+    save_gui_state_at(&path, state)
+}
+
+fn save_gui_state_at(path: &Path, state: &GuiState) -> Result<()> {
+    write_json(path, state)
 }
 
 pub fn load_default_config() -> LoadedConfig {
@@ -348,6 +387,22 @@ mod tests {
         }
         assert_eq!(counts.len(), 2);
         assert!(counts.into_values().all(|count| count == 2));
+    }
+
+    #[test]
+    fn gui_state_persists_theme_and_selection() {
+        let state = GuiState {
+            theme: ThemeSetting::Light,
+            selected_tunnels: HashSet::from(["77 SSH".to_string(), "66 SSH".to_string()]),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "towc-gui-state-{}-{}.json",
+            std::process::id(),
+            fnv1a(b"gui-state-persistence")
+        ));
+        save_gui_state_at(&path, &state).unwrap();
+        assert_eq!(load_gui_state_at(&path), state);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

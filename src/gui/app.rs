@@ -13,9 +13,9 @@ use crate::client::{
 };
 
 use super::config::{
-    GuiConfig, ImportBundle, MergePolicy, TunnelConfig, export_path, export_tunnels,
-    import_conflicts, listen_conflicts, load_default_config, merge_import, read_import_paths,
-    save_default_config, validate_config,
+    GuiConfig, GuiState, ImportBundle, MergePolicy, ThemeSetting, TunnelConfig, export_path,
+    export_tunnels, import_conflicts, listen_conflicts, load_default_config, load_gui_state,
+    merge_import, read_import_paths, save_default_config, save_gui_state, validate_config,
 };
 
 pub fn run() -> Result<()> {
@@ -150,14 +150,18 @@ struct TowcApp {
     export_selected: HashSet<String>,
     auto_start_pending: bool,
     login_visible: bool,
-    theme: egui::ThemePreference,
+    theme: ThemeSetting,
     connected_since: Option<Instant>,
+    editing_snapshot: Option<GuiConfig>,
 }
 
 impl TowcApp {
     fn new(creation: &eframe::CreationContext<'_>) -> Self {
         install_chinese_font(&creation.egui_ctx);
-        creation.egui_ctx.set_theme(egui::ThemePreference::System);
+        let gui_state = load_gui_state();
+        creation
+            .egui_ctx
+            .set_theme(theme_preference(gui_state.theme));
         let loaded = load_default_config();
         let auto_start_pending =
             !loaded.save_blocked && loaded.config.tunnels.iter().any(|tunnel| tunnel.enabled);
@@ -178,11 +182,12 @@ impl TowcApp {
             code_input: String::new(),
             qr_texture: None,
             pending_import: None,
-            export_selected: HashSet::new(),
+            export_selected: gui_state.selected_tunnels,
             auto_start_pending,
             login_visible: false,
-            theme: egui::ThemePreference::System,
+            theme: gui_state.theme,
             connected_since: None,
+            editing_snapshot: None,
         };
         if let Some(warning) = app.warning.clone() {
             app.log(warning);
@@ -209,7 +214,7 @@ impl TowcApp {
         }
 
         let (event_tx, event_rx) = std_mpsc::channel();
-        let (stop_tx, stop_rx) = watch::channel(false);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
         let (updates_tx, updates_rx) = mpsc::unbounded_channel();
         let probe_server = groups[0].server.clone();
         self.events = Some(event_rx);
@@ -242,8 +247,15 @@ impl TowcApp {
                     .build()
                     .context("cannot create GUI async runtime")?
                     .block_on(async move {
-                        let cookie =
-                            login_or_restore_for_server(auth, preference, &probe_server).await?;
+                        let cookie = tokio::select! {
+                            result = login_or_restore_for_server(auth, preference, &probe_server) => result?,
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    return Ok(());
+                                }
+                                return Ok(());
+                            }
+                        };
                         run_dynamic_server_groups(groups, cookie, stop_rx, updates_rx, observer)
                             .await
                     })
@@ -293,51 +305,76 @@ impl TowcApp {
     }
 
     fn set_tunnel_enabled(&mut self, index: usize, enabled: bool) {
-        let previous = self.config.tunnels[index].enabled;
+        let previous_config = self.config.clone();
         self.config.tunnels[index].enabled = enabled;
-        if let Err(error) = validate_config(&self.config).and_then(|_| {
+        let name = self.config.tunnels[index].name.clone();
+        self.apply_config_change(
+            previous_config,
+            format!(
+                "tunnel {name} {}",
+                if enabled { "enabled" } else { "disabled" }
+            ),
+        );
+    }
+
+    fn persist_gui_state(&mut self) {
+        let state = GuiState {
+            theme: self.theme,
+            selected_tunnels: self.export_selected.clone(),
+        };
+        if let Err(error) = save_gui_state(&state) {
+            self.log(format!("cannot save GUI state: {error:#}"));
+        }
+    }
+
+    fn apply_config_change(&mut self, previous: GuiConfig, success: String) -> bool {
+        let validation = validate_config(&self.config).and_then(|_| {
             if listen_conflicts(&self.config).is_empty() {
                 Ok(())
             } else {
                 bail!("local listen address conflict")
             }
-        }) {
-            self.config.tunnels[index].enabled = previous;
-            self.log(format!("cannot toggle tunnel: {error:#}"));
-            return;
+        });
+        if let Err(error) = validation {
+            self.config = previous;
+            self.log(format!("configuration change rejected: {error:#}"));
+            return false;
         }
+        let runtime_groups = if self.running {
+            match self.server_groups() {
+                Ok(groups) => Some(groups),
+                Err(error) => {
+                    self.config = previous;
+                    self.log(format!("cannot apply configuration change: {error:#}"));
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         if !self.save_blocked
             && let Err(error) = save_default_config(&self.config)
         {
-            self.config.tunnels[index].enabled = previous;
-            self.log(format!("cannot save tunnel state: {error:#}"));
-            return;
+            self.config = previous;
+            self.log(format!("cannot save configuration change: {error:#}"));
+            return false;
         }
-        if self.running {
-            let groups = match self.server_groups() {
-                Ok(groups) => groups,
-                Err(error) => {
-                    self.config.tunnels[index].enabled = previous;
-                    self.log(format!("cannot apply tunnel state: {error:#}"));
-                    return;
-                }
-            };
+        if let Some(groups) = runtime_groups {
             if self
                 .updates
                 .as_ref()
                 .is_none_or(|updates| updates.send(groups).is_err())
             {
-                self.config.tunnels[index].enabled = previous;
-                self.log("runtime stopped; cannot hot-toggle tunnel".to_string());
-                return;
+                self.config = previous;
+                if !self.save_blocked {
+                    let _ = save_default_config(&self.config);
+                }
+                self.log("runtime stopped; cannot apply configuration change".to_string());
+                return false;
             }
         }
-        let tunnel = &self.config.tunnels[index];
-        self.log(format!(
-            "tunnel {} {}",
-            tunnel.name,
-            if enabled { "enabled" } else { "disabled" }
-        ));
+        self.log(success);
+        true
     }
 
     fn export_selected(&mut self) {
@@ -498,21 +535,23 @@ impl eframe::App for TowcApp {
         }
 
         egui::CentralPanel::default().show(context, |ui| {
+            let login_kind_before = self.login_kind;
+            ui.horizontal(|ui| {
+                ui.heading("认证状态");
+                ui.separator();
+                ui.label("主题");
+                let old_theme = self.theme;
+                ui.selectable_value(&mut self.theme, ThemeSetting::System, "跟随系统");
+                ui.selectable_value(&mut self.theme, ThemeSetting::Dark, "深色");
+                ui.selectable_value(&mut self.theme, ThemeSetting::Light, "浅色");
+                if self.theme != old_theme {
+                    context.set_theme(theme_preference(self.theme));
+                    self.persist_gui_state();
+                }
+            });
             ui.group(|ui| {
                 ui.set_min_height(290.0);
                 ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.heading("认证状态");
-                    ui.separator();
-                    ui.label("主题");
-                    let old_theme = self.theme;
-                    ui.selectable_value(&mut self.theme, egui::ThemePreference::System, "跟随系统");
-                    ui.selectable_value(&mut self.theme, egui::ThemePreference::Dark, "深色");
-                    ui.selectable_value(&mut self.theme, egui::ThemePreference::Light, "浅色");
-                    if self.theme != old_theme {
-                        context.set_theme(self.theme);
-                    }
-                });
                 if let Some(warning) = &self.warning {
                     ui.colored_label(egui::Color32::YELLOW, warning);
                     if self.save_blocked && ui.button("确认使用当前界面配置并允许保存").clicked()
@@ -530,26 +569,12 @@ impl eframe::App for TowcApp {
                 if self.login_visible {
                     ui.horizontal(|ui| {
                         ui.label("登录方式");
-                        ui.add_enabled_ui(!self.running, |ui| {
-                            ui.selectable_value(
-                                &mut self.login_kind,
-                                LoginKind::Wechat,
-                                "微信扫码",
-                            );
-                            ui.selectable_value(
-                                &mut self.login_kind,
-                                LoginKind::Mobile,
-                                "手机验证码",
-                            );
-                            ui.selectable_value(
-                                &mut self.login_kind,
-                                LoginKind::Email,
-                                "邮箱验证码",
-                            );
-                            if self.login_kind != LoginKind::Wechat {
-                                ui.text_edit_singleline(&mut self.identity);
-                            }
-                        });
+                        ui.selectable_value(&mut self.login_kind, LoginKind::Wechat, "微信扫码");
+                        ui.selectable_value(&mut self.login_kind, LoginKind::Mobile, "手机验证码");
+                        ui.selectable_value(&mut self.login_kind, LoginKind::Email, "邮箱验证码");
+                        if self.login_kind != LoginKind::Wechat {
+                            ui.text_edit_singleline(&mut self.identity);
+                        }
                     });
                 }
                 if let Some(texture) = &self.qr_texture {
@@ -587,12 +612,22 @@ impl eframe::App for TowcApp {
                     });
                 }
             });
+            if self.login_kind != login_kind_before && self.running && self.login_visible {
+                self.stop();
+                self.qr_texture = None;
+                self.status = "登录方式已切换，请点击“登录并启动”".to_string();
+            }
 
             ui.add_space(8.0);
             ui.heading("隧道配置");
+            let frame_config = self.config.clone();
             let conflicts = listen_conflicts(&self.config);
             let mut remove = None;
             let mut toggle = None;
+            let mut add_to_server = None;
+            let mut edit_started = false;
+            let mut edit_finished = false;
+            let mut selection_changed = false;
             let mut groups = Vec::<(String, Vec<usize>)>::new();
             for (index, tunnel) in self.config.tunnels.iter().enumerate() {
                 let server = parse_tows(&tunnel.tows)
@@ -607,25 +642,14 @@ impl eframe::App for TowcApp {
             for (server, indices) in groups {
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width());
-                    let mut edited_server = server.clone();
                     ui.horizontal(|ui| {
                         ui.heading("tows");
-                        ui.add_enabled_ui(!self.running, |ui| {
-                            ui.add_sized(
-                                [220.0, 24.0],
-                                egui::TextEdit::singleline(&mut edited_server),
-                            );
-                        });
+                        ui.monospace(&server);
                     });
-                    if edited_server != server {
-                        for index in &indices {
-                            self.config.tunnels[*index].tows = edited_server.clone();
-                        }
-                    }
                     egui::Grid::new(format!("tunnels-{server}"))
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.label("选择");
+                            ui.label("");
                             ui.label("启用");
                             ui.label("名称");
                             ui.label("目标");
@@ -641,29 +665,30 @@ impl eframe::App for TowcApp {
                                     } else {
                                         self.export_selected.remove(&tunnel.name);
                                     }
+                                    selection_changed = true;
                                 }
                                 let mut enabled = tunnel.enabled;
                                 if toggle_switch(ui, &mut enabled).changed() {
                                     toggle = Some((index, enabled));
                                 }
-                                ui.add_enabled_ui(!self.running, |ui| {
-                                    ui.add_sized(
-                                        [140.0, 22.0],
-                                        egui::TextEdit::singleline(&mut tunnel.name),
-                                    );
-                                });
-                                ui.add_enabled_ui(!self.running, |ui| {
-                                    ui.add_sized(
-                                        [190.0, 22.0],
-                                        egui::TextEdit::singleline(&mut tunnel.target),
-                                    );
-                                });
-                                ui.add_enabled_ui(!self.running, |ui| {
-                                    ui.add_sized(
-                                        [200.0, 22.0],
-                                        egui::TextEdit::singleline(&mut tunnel.listen),
-                                    );
-                                });
+                                let name_response = ui.add_sized(
+                                    [140.0, 22.0],
+                                    egui::TextEdit::singleline(&mut tunnel.name),
+                                );
+                                let target_response = ui.add_sized(
+                                    [190.0, 22.0],
+                                    egui::TextEdit::singleline(&mut tunnel.target),
+                                );
+                                let listen_response = ui.add_sized(
+                                    [200.0, 22.0],
+                                    egui::TextEdit::singleline(&mut tunnel.listen),
+                                );
+                                edit_started |= name_response.gained_focus()
+                                    || target_response.gained_focus()
+                                    || listen_response.gained_focus();
+                                edit_finished |= name_response.lost_focus()
+                                    || target_response.lost_focus()
+                                    || listen_response.lost_focus();
                                 if conflicts.contains(&tunnel.name) {
                                     ui.colored_label(egui::Color32::RED, "监听冲突");
                                 } else if parse_listen(&tunnel.listen)
@@ -671,20 +696,23 @@ impl eframe::App for TowcApp {
                                 {
                                     ui.colored_label(egui::Color32::YELLOW, "向局域网暴露");
                                 } else {
-                                    ui.label(
-                                        self.tunnel_status
-                                            .get(&tunnel.name)
-                                            .map(String::as_str)
-                                            .unwrap_or(if tunnel.enabled {
-                                                "等待连接"
-                                            } else {
-                                                "已禁用"
-                                            }),
-                                    );
+                                    let status = self
+                                        .tunnel_status
+                                        .get(&tunnel.name)
+                                        .map(String::as_str)
+                                        .unwrap_or(if tunnel.enabled {
+                                            "等待连接"
+                                        } else {
+                                            "已禁用"
+                                        });
+                                    ui.add_sized(
+                                        [170.0, 22.0],
+                                        egui::Label::new(status).truncate(),
+                                    )
+                                    .on_hover_text(status);
                                 }
                                 if ui
-                                    .add_enabled(
-                                        !self.running,
+                                    .add(
                                         egui::Button::new(
                                             egui::RichText::new("删除").color(egui::Color32::WHITE),
                                         )
@@ -697,34 +725,80 @@ impl eframe::App for TowcApp {
                                 ui.end_row();
                             }
                         });
+                    if ui.button("添加隧道").clicked() {
+                        add_to_server = Some(server.clone());
+                    }
                 });
                 ui.add_space(6.0);
+            }
+            if selection_changed {
+                self.persist_gui_state();
+            }
+            if edit_started && self.editing_snapshot.is_none() {
+                self.editing_snapshot = Some(frame_config.clone());
+            }
+            if edit_finished {
+                let previous = self
+                    .editing_snapshot
+                    .take()
+                    .unwrap_or_else(|| frame_config.clone());
+                let selected_before = self.export_selected.clone();
+                if self.apply_config_change(
+                    previous.clone(),
+                    "tunnel configuration updated".to_string(),
+                ) {
+                    for (old, new) in previous.tunnels.iter().zip(&self.config.tunnels) {
+                        if old.name != new.name && selected_before.contains(&old.name) {
+                            self.export_selected.remove(&old.name);
+                            self.export_selected.insert(new.name.clone());
+                        }
+                    }
+                    self.persist_gui_state();
+                }
             }
             if let Some((index, enabled)) = toggle {
                 self.set_tunnel_enabled(index, enabled);
             }
             if let Some(index) = remove {
+                let previous = self.config.clone();
                 let removed = self.config.tunnels.remove(index);
-                self.export_selected.remove(&removed.name);
-            }
-            if ui
-                .add_enabled(!self.running, egui::Button::new("添加隧道"))
-                .clicked()
-            {
-                let number = self.config.tunnels.len() + 1;
-                let tows = self
+                let server_still_exists = self
                     .config
                     .tunnels
-                    .last()
-                    .map(|tunnel| tunnel.tows.clone())
-                    .unwrap_or_else(|| "10.18.47.77:4489".to_string());
+                    .iter()
+                    .any(|tunnel| tunnel.tows == removed.tows);
+                if self.running && !server_still_exists {
+                    self.config = previous;
+                    self.log(
+                        "cannot delete the final tunnel of a connected tows group".to_string(),
+                    );
+                } else if self
+                    .apply_config_change(previous, format!("tunnel {} deleted", removed.name))
+                {
+                    self.export_selected.remove(&removed.name);
+                    self.tunnel_status.remove(&removed.name);
+                    self.persist_gui_state();
+                }
+            }
+            if let Some(tows) = add_to_server {
+                let previous = self.config.clone();
+                let mut number = self.config.tunnels.len() + 1;
+                while self
+                    .config
+                    .tunnels
+                    .iter()
+                    .any(|tunnel| tunnel.name == format!("隧道 {number}"))
+                {
+                    number += 1;
+                }
                 self.config.tunnels.push(TunnelConfig {
                     name: format!("隧道 {number}"),
                     tows,
                     target: "127.0.0.1:22".to_string(),
                     listen: format!("127.0.0.1:{}", 14489_u32 + number as u32),
-                    enabled: true,
+                    enabled: false,
                 });
+                self.apply_config_change(previous, "tunnel added".to_string());
             }
 
             if let Some(bundle) = &self.pending_import {
@@ -860,6 +934,14 @@ fn format_elapsed(elapsed: Duration) -> String {
         (seconds / 60) % 60,
         seconds % 60
     )
+}
+
+fn theme_preference(theme: ThemeSetting) -> egui::ThemePreference {
+    match theme {
+        ThemeSetting::System => egui::ThemePreference::System,
+        ThemeSetting::Dark => egui::ThemePreference::Dark,
+        ThemeSetting::Light => egui::ThemePreference::Light,
+    }
 }
 
 fn qr_texture(context: &egui::Context, bytes: &[u8]) -> Result<egui::TextureHandle> {
