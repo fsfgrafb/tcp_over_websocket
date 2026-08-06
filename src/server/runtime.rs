@@ -312,7 +312,7 @@ async fn handle_tunnel_event(
             tracing::warn!(target: "tunnel", "tunnel {id} TCP error: {reason}");
             if tunnels.contains_key(&id) {
                 writer
-                    .send(Frame::new(FrameType::Close, id, Vec::new())?)
+                    .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
                 remove_tunnel(id, writer, tunnels).await;
             }
@@ -430,7 +430,7 @@ async fn maybe_finish(
     );
     if finished {
         writer
-            .send(Frame::new(FrameType::Close, id, Vec::new())?)
+            .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
         remove_tunnel(id, writer, tunnels).await;
     }

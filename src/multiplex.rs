@@ -20,6 +20,7 @@ struct QueuedFrame {
 
 enum WriterCommand {
     Frame(Frame),
+    FrameAndRemove(Frame),
     Register(u16, mpsc::Receiver<QueuedFrame>),
     Remove(u16),
     ProtocolClose(String),
@@ -44,6 +45,14 @@ impl WsWriter {
     pub async fn send(&self, frame: Frame) -> Result<()> {
         self.commands
             .send(WriterCommand::Frame(frame))
+            .await
+            .map_err(|_| anyhow!("WebSocket writer task has stopped"))
+    }
+
+    /// Drop a stream's queued frames and then send its terminal control frame atomically.
+    pub async fn send_and_remove(&self, frame: Frame) -> Result<()> {
+        self.commands
+            .send(WriterCommand::FrameAndRemove(frame))
             .await
             .map_err(|_| anyhow!("WebSocket writer task has stopped"))
     }
@@ -206,6 +215,13 @@ where
             .send(Message::Binary(frame.encode().into()))
             .await
             .context("failed to send a WebSocket control frame")?,
+        WriterCommand::FrameAndRemove(frame) => {
+            flows.remove(&frame.tunnel_id);
+            order.retain(|existing| *existing != frame.tunnel_id);
+            sink.send(Message::Binary(frame.encode().into()))
+                .await
+                .context("failed to send a terminal WebSocket control frame")?;
+        }
         WriterCommand::Register(id, receiver) => {
             flows.insert(id, receiver);
             order.retain(|existing| *existing != id);

@@ -15,20 +15,21 @@ use crate::storage::BoundedLogWriter;
 
 use super::config::{
     ConnectionConfig, DEFAULT_WS_KEEPALIVE_SECS, GuiConfig, GuiState, ImportBundle,
-    MAX_COOKIE_REFRESH_SECS, MAX_WS_KEEPALIVE_SECS, MIN_COOKIE_REFRESH_SECS, MIN_WS_KEEPALIVE_SECS,
-    MergePolicy, ThemeSetting, TunnelConfig, export_tunnels, import_conflicts, listen_conflicts,
-    load_default_config, load_gui_state, merge_import, read_import_paths, save_default_config,
-    save_gui_state, validate_config,
+    MAX_COOKIE_REFRESH_SECS, MAX_WINDOW_HEIGHT, MAX_WS_KEEPALIVE_SECS, MIN_COOKIE_REFRESH_SECS,
+    MIN_WINDOW_HEIGHT, MIN_WS_KEEPALIVE_SECS, MergePolicy, ThemeSetting, TunnelConfig,
+    export_tunnels, import_conflicts, listen_conflicts, load_default_config, load_gui_state,
+    merge_import, read_import_paths, save_default_config, save_gui_state, validate_config,
 };
 
 const INTERVAL_INPUT_WIDTH: f32 = 80.0;
 
 pub fn run() -> Result<()> {
+    let gui_state = load_gui_state();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 740.0])
-            .with_min_inner_size([880.0, 500.0])
-            .with_max_inner_size([880.0, 900.0])
+            .with_inner_size([880.0, gui_state.window_height as f32])
+            .with_min_inner_size([880.0, MIN_WINDOW_HEIGHT as f32])
+            .with_max_inner_size([880.0, MAX_WINDOW_HEIGHT as f32])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -207,6 +208,7 @@ struct TowcApp {
     tunnel_edits: Vec<TunnelEdit>,
     connection_editor: Option<ConnectionEditor>,
     app_settings_editor: Option<AppSettingsEditor>,
+    window_height: u32,
 }
 
 impl TowcApp {
@@ -255,6 +257,7 @@ impl TowcApp {
             tunnel_edits,
             connection_editor: None,
             app_settings_editor: None,
+            window_height: gui_state.window_height,
         };
         if let Some(warning) = app.warning.clone() {
             app.log(warning);
@@ -403,6 +406,7 @@ impl TowcApp {
             theme: self.theme,
             selected_tunnels: HashSet::new(),
             cookie_refresh_secs: self.cookie_refresh_secs,
+            window_height: self.window_height,
         };
         if let Err(error) = save_gui_state(&state) {
             self.log(format!("无法保存界面设置：{error:#}"));
@@ -566,8 +570,10 @@ impl TowcApp {
                     self.log(message);
                 }
                 WorkerEvent::Tunnel(name, message) => {
-                    self.tunnel_status.insert(name.clone(), message.clone());
-                    self.log(format!("[tunnel] <{name}> {message}"));
+                    if updates_tunnel_state(&message) {
+                        self.tunnel_status.insert(name.clone(), message.clone());
+                    }
+                    self.log(format!("[{name}] {message}"));
                 }
                 WorkerEvent::Qr(bytes) => match qr_texture(context, &bytes) {
                     Ok(texture) => {
@@ -623,10 +629,7 @@ impl TowcApp {
     }
 
     fn log(&mut self, message: String) {
-        let message = if message.starts_with("[towc] ")
-            || message.starts_with("[tunnel] ")
-            || message.starts_with("[tows] ")
-        {
+        let message = if message.starts_with('[') && message.contains("] ") {
             message
         } else {
             format!("[towc] {message}")
@@ -945,6 +948,12 @@ impl TowcApp {
 
 impl eframe::App for TowcApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(height) =
+            context.input(|input| input.viewport().inner_rect.map(|rect| rect.height()))
+        {
+            self.window_height =
+                (height.round() as u32).clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT);
+        }
         self.poll_events(context);
         if self.auto_start_pending {
             self.auto_start_pending = false;
@@ -1489,7 +1498,23 @@ impl eframe::App for TowcApp {
                                     edit_connection = Some(connection_index);
                                 }
                                 ui.add_space(4.0);
-                                egui::Grid::new(format!("tunnels-{server}"))
+                                if indices.is_empty() {
+                                    let empty_width = ui.available_width();
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(empty_width, 104.0),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_space(8.0);
+                                            ui.heading("此连接尚无隧道");
+                                            ui.weak("启用隧道后将自动建立 WebSocket 保活。");
+                                            ui.add_space(8.0);
+                                            if ui.button("＋ 添加隧道").clicked() {
+                                                add_to_server = Some(server.clone());
+                                            }
+                                        },
+                                    );
+                                } else {
+                                    egui::Grid::new(format!("tunnels-{server}"))
                                     .min_row_height(26.0)
                                     .spacing([6.0, 2.0])
                                     .show(ui, |ui| {
@@ -1687,23 +1712,21 @@ impl eframe::App for TowcApp {
                                             ui.end_row();
                                         }
                                     });
-                                if indices.is_empty() {
-                                    ui.weak("此连接尚无隧道；未建立 WebSocket 保活。");
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(22.0, 22.0),
+                                        egui::Layout::centered_and_justified(
+                                            egui::Direction::LeftToRight,
+                                        ),
+                                        |ui| {
+                                            if compact_icon_button(ui, "+", false)
+                                                .on_hover_text("添加隧道")
+                                                .clicked()
+                                            {
+                                                add_to_server = Some(server.clone());
+                                            }
+                                        },
+                                    );
                                 }
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(22.0, 22.0),
-                                    egui::Layout::centered_and_justified(
-                                        egui::Direction::LeftToRight,
-                                    ),
-                                    |ui| {
-                                        if compact_icon_button(ui, "+", false)
-                                            .on_hover_text("添加隧道")
-                                            .clicked()
-                                        {
-                                            add_to_server = Some(server.clone());
-                                        }
-                                    },
-                                );
                             });
                         ui.add_space(6.0);
                     }
@@ -1715,7 +1738,7 @@ impl eframe::App for TowcApp {
                                 ui.set_min_width(ui.available_width());
                                 ui.vertical_centered(|ui| {
                                     ui.heading("尚未配置连接");
-                                    ui.label("导入配置，或先创建一个 tows 连接。");
+                                    ui.label("导入配置，或先添加一个 tows 连接。");
                                     ui.add_space(8.0);
                                     if ui.button("＋ 添加连接").clicked() {
                                         self.open_new_connection_editor();
@@ -2047,6 +2070,10 @@ impl eframe::App for TowcApp {
         }
         context.request_repaint_after(Duration::from_millis(100));
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_gui_state();
+    }
 }
 
 fn forward_rule(tunnel: &TunnelConfig) -> Result<ForwardRule> {
@@ -2324,19 +2351,25 @@ fn format_elapsed(elapsed: Duration) -> String {
 }
 
 fn localize_log_line(line: &str) -> String {
-    let Some((tag, body)) = line.split_once(' ') else {
-        return line.to_string();
-    };
-    if tag == "[tunnel]" {
-        if body.starts_with('<')
-            && let Some(end) = body.find("> ")
-        {
-            let tunnel = &body[..=end];
-            let detail = &body[end + 2..];
-            return format!("{tag} {tunnel} {}", localize_log_body(detail));
-        }
-    }
+    let (tag, body) = split_log_tag(line);
     format!("{tag} {}", localize_log_body(body))
+}
+
+fn split_log_tag(line: &str) -> (&str, &str) {
+    if line.starts_with('[')
+        && let Some(end) = line.find("] ")
+    {
+        return (&line[..=end], &line[end + 2..]);
+    }
+    line.split_once(' ').unwrap_or(("[towc]", line))
+}
+
+fn updates_tunnel_state(message: &str) -> bool {
+    message.starts_with("ready:")
+        || message == "disabled"
+        || message.starts_with("enable failed:")
+        || message.starts_with("listener failed:")
+        || (message.starts_with("tows ") && message.contains(" failed:"))
 }
 
 fn localize_log_body(message: &str) -> String {
@@ -2458,9 +2491,16 @@ fn localize_log_body(message: &str) -> String {
 }
 
 fn colored_log_line(ui: &mut egui::Ui, line: &str) {
-    let (tag, body) = line.split_once(' ').unwrap_or(("[towc]", line));
+    let (tag, body) = split_log_tag(line);
     let dark = ui.visuals().dark_mode;
     let tag_color = match tag {
+        "[towc]" => {
+            if dark {
+                egui::Color32::from_rgb(70, 190, 225)
+            } else {
+                egui::Color32::from_rgb(0, 105, 155)
+            }
+        }
         "[tunnel]" => {
             if dark {
                 egui::Color32::from_rgb(80, 210, 130)
@@ -2477,9 +2517,9 @@ fn colored_log_line(ui: &mut egui::Ui, line: &str) {
         }
         _ => {
             if dark {
-                egui::Color32::from_rgb(70, 190, 225)
+                egui::Color32::from_rgb(80, 210, 130)
             } else {
-                egui::Color32::from_rgb(0, 105, 155)
+                egui::Color32::from_rgb(20, 125, 70)
             }
         }
     };
@@ -2509,15 +2549,12 @@ fn colored_log_line(ui: &mut egui::Ui, line: &str) {
 
 #[cfg(test)]
 mod log_tests {
-    use super::localize_log_line;
+    use super::{localize_log_line, updates_tunnel_state};
 
     #[test]
     fn unicode_tunnel_names_are_preserved() {
-        assert_eq!(
-            localize_log_line("[tunnel] <隧道 4> disabled"),
-            "[tunnel] <隧道 4> 已禁用"
-        );
-        assert!(!localize_log_line("[tunnel] <隧道 4> 已启用").contains("\\u{"));
+        assert_eq!(localize_log_line("[隧道 4] disabled"), "[隧道 4] 已禁用");
+        assert!(!localize_log_line("[隧道 4] 已启用").contains("\\u{"));
     }
 
     #[test]
@@ -2530,6 +2567,21 @@ mod log_tests {
             localize_log_line("[towc] WebVPN cookie refreshed"),
             "[towc] WebVPN Cookie 已刷新"
         );
+    }
+
+    #[test]
+    fn stream_activity_does_not_replace_tunnel_health() {
+        assert!(updates_tunnel_state(
+            "ready: 127.0.0.1:14489 -> 10.18.47.77:4489 -> 127.0.0.1:80"
+        ));
+        assert!(updates_tunnel_state(
+            "tows 10.18.47.77:4489 failed: WebSocket disconnected"
+        ));
+        assert!(!updates_tunnel_state("stream 1 established"));
+        assert!(!updates_tunnel_state("bidirectional EOF"));
+        assert!(!updates_tunnel_state(
+            "open failed: target service refused the connection"
+        ));
     }
 }
 
@@ -2667,10 +2719,15 @@ fn metric_card(ui: &mut egui::Ui, label: &str, value: String) {
         .inner_margin(12.0)
         .corner_radius(8.0)
         .show(ui, |ui| {
-            ui.set_min_width(150.0);
-            ui.weak(label);
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(value).size(20.0).strong());
+            ui.allocate_ui_with_layout(
+                egui::vec2(150.0, 32.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.weak(label);
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(value).size(20.0).strong());
+                },
+            );
         });
 }
 

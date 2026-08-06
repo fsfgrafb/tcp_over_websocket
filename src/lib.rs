@@ -57,7 +57,26 @@ where
         mut writer: tracing_subscriber::fmt::format::Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        let tag = match event.metadata().target() {
+        let target = event.metadata().target();
+        if target == "tunnel" {
+            let mut fields = String::new();
+            context.field_format().format_fields(
+                tracing_subscriber::fmt::format::Writer::new(&mut fields),
+                event,
+            )?;
+            if let Some((name, body)) = fields.split_once(' ')
+                && name.starts_with('[')
+                && name.ends_with(']')
+            {
+                if writer.has_ansi_escapes() {
+                    write!(writer, "\x1b[32m{name}\x1b[0m {body}")?;
+                } else {
+                    write!(writer, "{name} {body}")?;
+                }
+                return writeln!(writer);
+            }
+        }
+        let tag = match target {
             "towc" => "towc",
             "tows" => "tows",
             "tunnel" => "tunnel",

@@ -75,7 +75,7 @@ impl ClientObserver for TerminalUi {
     }
 
     fn tunnel_status(&self, name: &str, message: &str) {
-        tracing::info!(target: "tunnel", "<{name}> {message}");
+        tracing::info!(target: "tunnel", "[{name}] {message}");
     }
 }
 
@@ -1059,7 +1059,7 @@ async fn handle_tunnel_event(
         TunnelEvent::TcpError(id, reason) => {
             if tunnels.contains_key(&id) {
                 writer
-                    .send(Frame::new(FrameType::Close, id, Vec::new())?)
+                    .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
                 retired_ids.insert(id);
                 remove_tunnel(
@@ -1193,7 +1193,7 @@ async fn maybe_finish(
     );
     if finished {
         writer
-            .send(Frame::new(FrameType::Close, id, Vec::new())?)
+            .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
         retired_ids.insert(id);
         remove_tunnel(id, writer, observer, tunnels, "bidirectional EOF").await;
@@ -1246,7 +1246,7 @@ async fn close_named(
         .collect::<Vec<_>>();
     for id in ids {
         writer
-            .send(Frame::new(FrameType::Close, id, Vec::new())?)
+            .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
         retired_ids.insert(id);
         remove_tunnel(id, writer, observer, tunnels, "").await;

@@ -17,6 +17,9 @@ pub const MAX_COOKIE_REFRESH_SECS: u64 = 840;
 pub const DEFAULT_WS_KEEPALIVE_SECS: u64 = 60;
 pub const MIN_WS_KEEPALIVE_SECS: u64 = 10;
 pub const MAX_WS_KEEPALIVE_SECS: u64 = 600;
+pub const DEFAULT_WINDOW_HEIGHT: u32 = 740;
+pub const MIN_WINDOW_HEIGHT: u32 = 500;
+pub const MAX_WINDOW_HEIGHT: u32 = 900;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +55,8 @@ pub struct GuiState {
     pub selected_tunnels: HashSet<String>,
     #[serde(default = "default_cookie_refresh_secs")]
     pub cookie_refresh_secs: u64,
+    #[serde(default = "default_window_height")]
+    pub window_height: u32,
 }
 
 impl Default for GuiState {
@@ -60,6 +65,7 @@ impl Default for GuiState {
             theme: ThemeSetting::System,
             selected_tunnels: HashSet::new(),
             cookie_refresh_secs: DEFAULT_COOKIE_REFRESH_SECS,
+            window_height: DEFAULT_WINDOW_HEIGHT,
         }
     }
 }
@@ -115,6 +121,9 @@ fn load_gui_state_at(path: &Path) -> GuiState {
     state.cookie_refresh_secs = state
         .cookie_refresh_secs
         .clamp(MIN_COOKIE_REFRESH_SECS, MAX_COOKIE_REFRESH_SECS);
+    state.window_height = state
+        .window_height
+        .clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT);
     state.selected_tunnels.clear();
     state
 }
@@ -130,7 +139,14 @@ fn save_gui_state_at(path: &Path, state: &GuiState) -> Result<()> {
             "cookie refresh interval must be between {MIN_COOKIE_REFRESH_SECS} and {MAX_COOKIE_REFRESH_SECS} seconds"
         );
     }
+    if !(MIN_WINDOW_HEIGHT..=MAX_WINDOW_HEIGHT).contains(&state.window_height) {
+        bail!("window height must be between {MIN_WINDOW_HEIGHT} and {MAX_WINDOW_HEIGHT} pixels");
+    }
     write_json(path, state)
+}
+
+const fn default_window_height() -> u32 {
+    DEFAULT_WINDOW_HEIGHT
 }
 
 pub fn load_default_config() -> LoadedConfig {
@@ -491,6 +507,7 @@ mod tests {
             theme: ThemeSetting::Light,
             selected_tunnels: HashSet::from(["77 SSH".to_string(), "66 SSH".to_string()]),
             cookie_refresh_secs: DEFAULT_COOKIE_REFRESH_SECS,
+            window_height: 680,
         };
         let path = std::env::temp_dir().join(format!(
             "towc-gui-state-{}-{}.json",
@@ -503,6 +520,7 @@ mod tests {
         let loaded = load_gui_state_at(&path);
         assert_eq!(loaded.theme, ThemeSetting::Light);
         assert_eq!(loaded.cookie_refresh_secs, DEFAULT_COOKIE_REFRESH_SECS);
+        assert_eq!(loaded.window_height, 680);
         assert!(loaded.selected_tunnels.is_empty());
         fs::remove_file(path).unwrap();
     }
