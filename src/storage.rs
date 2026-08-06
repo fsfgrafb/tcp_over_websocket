@@ -34,8 +34,11 @@ pub fn data_file(name: &str) -> Option<PathBuf> {
 
 /// 同目录写临时文件后原子替换，避免中途退出留下半份 JSON。
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path.parent().context("目标文件没有父目录")?;
-    fs::create_dir_all(parent).with_context(|| format!("无法创建数据目录 {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .context("destination file has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create data directory {}", parent.display()))?;
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,7 +47,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .context("目标文件名不是有效 Unicode")?;
+        .context("destination file name is not valid Unicode")?;
     let temporary = parent.join(format!(".{file_name}.{nonce}.tmp"));
 
     let result = (|| -> Result<()> {
@@ -52,9 +55,10 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .with_context(|| format!("无法创建临时文件 {}", temporary.display()))?;
-        file.write_all(contents).context("无法写入临时文件")?;
-        file.sync_all().context("无法同步临时文件")?;
+            .with_context(|| format!("failed to create temporary file {}", temporary.display()))?;
+        file.write_all(contents)
+            .context("failed to write temporary file")?;
+        file.sync_all().context("failed to sync temporary file")?;
         replace_file(&temporary, path)?;
         Ok(())
     })();
@@ -69,7 +73,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     fs::rename(source, destination).with_context(|| {
         format!(
-            "无法原子替换 {} -> {}",
+            "failed to atomically replace {} -> {}",
             source.display(),
             destination.display()
         )
@@ -100,7 +104,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     };
     if succeeded == 0 {
         bail!(
-            "无法原子替换 {destination_display}: {}",
+            "failed to atomically replace {destination_display}: {}",
             std::io::Error::last_os_error()
         );
     }
@@ -108,12 +112,12 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let mut json = serde_json::to_vec_pretty(value).context("无法序列化 JSON")?;
+    let mut json = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
     json.push(b'\n');
     atomic_write(path, &json)
 }
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    let contents = fs::read(path).with_context(|| format!("无法读取 {}", path.display()))?;
-    serde_json::from_slice(&contents).with_context(|| format!("无法解析 {}", path.display()))
+    let contents = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }

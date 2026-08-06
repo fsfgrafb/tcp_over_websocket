@@ -51,11 +51,11 @@ impl fmt::Display for ConnectFailure {
         match self {
             Self::CookieExpired { location } => write!(
                 formatter,
-                "WebVPN 登录已失效，请重新启动并登录（location: {location}）"
+                "WebVPN login has expired; restart and sign in again (location: {location})"
             ),
             Self::WebVpnFailed { location } => write!(
                 formatter,
-                "WebVPN 无法连接 tows，请检查地址、端口和服务状态（location: {location}）"
+                "WebVPN could not reach tows; check the address, port, and service (location: {location})"
             ),
             Self::Other(error) => write!(formatter, "{error:#}"),
         }
@@ -75,8 +75,8 @@ pub fn build_webvpn_ws_url(server: &Endpoint) -> Result<String> {
 
 #[cfg(feature = "client")]
 fn encrypt_webvpn_host(host: &str) -> Result<String> {
-    let cipher =
-        Aes128::new_from_slice(WEBVPN_AES_KEY).map_err(|_| anyhow!("无法初始化 AES-128"))?;
+    let cipher = Aes128::new_from_slice(WEBVPN_AES_KEY)
+        .map_err(|_| anyhow!("failed to initialize AES-128"))?;
     let mut feedback = *WEBVPN_AES_KEY;
     let mut ciphertext = Vec::with_capacity(host.len());
 
@@ -110,12 +110,12 @@ pub async fn connect_websocket(
 ) -> std::result::Result<ClientWebSocket, ConnectFailure> {
     install_crypto_provider();
     let mut request = url.into_client_request().map_err(|error| {
-        ConnectFailure::Other(anyhow!(error).context("无法创建 WebSocket 请求"))
+        ConnectFailure::Other(anyhow!(error).context("failed to build WebSocket request"))
     })?;
     request.headers_mut().insert(
         COOKIE,
         HeaderValue::from_str(cookie).map_err(|error| {
-            ConnectFailure::Other(anyhow!(error).context("缓存 Cookie 格式无效"))
+            ConnectFailure::Other(anyhow!(error).context("cached cookie is invalid"))
         })?,
     );
 
@@ -134,13 +134,13 @@ pub async fn connect_websocket(
                 Err(ConnectFailure::CookieExpired { location })
             } else {
                 Err(ConnectFailure::Other(anyhow!(
-                    "WebSocket 握手返回 HTTP {}，location: {location}",
+                    "WebSocket handshake returned HTTP {} (location: {location})",
                     response.status()
                 )))
             }
         }
         Err(error) => Err(ConnectFailure::Other(
-            anyhow!(error).context("WebSocket 连接失败"),
+            anyhow!(error).context("WebSocket connection failed"),
         )),
     }
 }
@@ -163,27 +163,29 @@ where
     websocket
         .send(Message::Binary(hello.encode().into()))
         .await
-        .context("发送 HELLO 失败")?;
+        .context("failed to send HELLO")?;
 
     let message = tokio::time::timeout(HANDSHAKE_TIMEOUT, websocket.next())
         .await
-        .map_err(|_| anyhow!("等待 HELLO_ACK 超时；请将 tows 升级到 v0.5.1 或更高版本"))?
-        .context("tows 在 HELLO_ACK 前关闭了连接")??;
+        .map_err(|_| anyhow!("timed out waiting for HELLO_ACK; upgrade tows to v0.5.1 or later"))?
+        .context("tows closed the connection before HELLO_ACK")??;
     let Message::Binary(bytes) = message else {
         if matches!(&message, Message::Text(text) if text.as_str() == OLD_TOWS_MESSAGE) {
-            return Err(anyhow!("检测到旧版 tows 文本协议；请先升级服务端"));
+            return Err(anyhow!(
+                "legacy text-based tows protocol detected; upgrade the server"
+            ));
         }
-        return Err(anyhow!("HELLO_ACK 必须使用 WebSocket Binary 消息"));
+        return Err(anyhow!("HELLO_ACK must be a WebSocket Binary message"));
     };
     let ack = Frame::decode(&bytes)?;
     ack.validate_server_to_client(false)?;
     let (version, server_program) = ack.version()?;
     if version != PROTOCOL_VERSION {
         return Err(anyhow!(
-            "协议版本不匹配：客户端 v{PROTOCOL_VERSION}，服务端 v{version}（{server_program}）；请升级 tows"
+            "protocol version mismatch: client v{PROTOCOL_VERSION}, server v{version} ({server_program}); upgrade tows"
         ));
     }
-    tracing::info!("协议握手完成，对端：{server_program}");
+    tracing::info!(target: "tunnel", "protocol handshake complete; peer={server_program}");
     Ok(())
 }
 
@@ -194,10 +196,10 @@ where
 {
     let message = tokio::time::timeout(HANDSHAKE_TIMEOUT, websocket.next())
         .await
-        .map_err(|_| anyhow!("等待 HELLO 超时"))?
-        .context("客户端在 HELLO 前关闭了连接")??;
+        .map_err(|_| anyhow!("timed out waiting for HELLO"))?
+        .context("client closed the connection before HELLO")??;
     let Message::Binary(bytes) = message else {
-        return Err(anyhow!("连接首帧不是 Binary HELLO"));
+        return Err(anyhow!("first connection frame is not a Binary HELLO"));
     };
     let hello = Frame::decode(&bytes)?;
     hello.validate_client_to_server(false)?;
@@ -205,26 +207,28 @@ where
     websocket
         .send(Message::Binary(Frame::hello_ack(program)?.encode().into()))
         .await
-        .context("发送 HELLO_ACK 失败")?;
-    tracing::info!("收到 {client_program} 的协议 v{version} HELLO");
+        .context("failed to send HELLO_ACK")?;
+    tracing::info!(target: "tunnel", "received protocol v{version} HELLO from {client_program}");
     Ok(version)
 }
 
 /// 接受 WebSocket；记录路径仅用于诊断，新协议不从路径读取目标。
 #[allow(clippy::result_large_err)]
 pub async fn accept_websocket(stream: TcpStream) -> Result<(WebSocketStream<TcpStream>, String)> {
-    stream.set_nodelay(true).context("无法启用 TCP_NODELAY")?;
+    stream
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY")?;
     let path = Arc::new(Mutex::new(None::<String>));
     let captured = Arc::clone(&path);
     let websocket = accept_hdr_async(stream, move |request: &ServerRequest, response| {
-        *captured.lock().expect("路径锁中毒") = Some(request.uri().path().to_string());
+        *captured.lock().expect("path mutex poisoned") = Some(request.uri().path().to_string());
         Ok(response)
     })
     .await
-    .context("WebSocket 握手失败")?;
+    .context("WebSocket handshake failed")?;
     let requested = path
         .lock()
-        .expect("路径锁中毒")
+        .expect("path mutex poisoned")
         .take()
         .unwrap_or_else(|| "/".to_string());
     Ok((websocket, requested))

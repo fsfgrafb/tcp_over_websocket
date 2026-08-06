@@ -44,12 +44,12 @@ pub fn parse_args(args: &[String]) -> Result<ParsedArgs> {
         return Ok(ParsedArgs::Help);
     }
     if args[0].starts_with('-') {
-        bail!("唯一位置参数 <tows-host[:port]> 必须放在第一位");
+        bail!("the only positional argument <tows-host[:port]> must come first");
     }
 
-    let server = parse_tows(&args[0]).context("无效 tows 地址")?;
-    let mut target = parse_target(DEFAULT_TARGET).expect("内置目标合法");
-    let mut listen = parse_listen(DEFAULT_LISTEN).expect("内置监听合法");
+    let server = parse_tows(&args[0]).context("invalid tows address")?;
+    let mut target = parse_target(DEFAULT_TARGET).expect("built-in target is valid");
+    let mut listen = parse_listen(DEFAULT_LISTEN).expect("built-in listen address is valid");
     let mut login = LoginPreference::Wechat;
     let mut seen_target = false;
     let mut seen_listen = false;
@@ -64,26 +64,26 @@ pub fn parse_args(args: &[String]) -> Result<ParsedArgs> {
         index += 1;
         let value = args
             .get(index)
-            .with_context(|| format!("{flag} 缺少参数值"))?;
+            .with_context(|| format!("{flag} requires a value"))?;
         if value.starts_with('-') {
-            bail!("{flag} 缺少参数值");
+            bail!("{flag} requires a value");
         }
         match flag.as_str() {
             "--target" if !seen_target => {
-                target = parse_target(value).context("无效 --target")?;
+                target = parse_target(value).context("invalid --target")?;
                 seen_target = true;
             }
             "--listen" if !seen_listen => {
-                listen = parse_listen(value).context("无效 --listen")?;
+                listen = parse_listen(value).context("invalid --listen")?;
                 seen_listen = true;
             }
             "--login" if !seen_login => {
                 login = LoginPreference::from_identity(value)?;
                 seen_login = true;
             }
-            "--target" | "--listen" | "--login" => bail!("{flag} 只能出现一次"),
-            _ if flag.starts_with('-') => bail!("未知参数: {flag}"),
-            _ => bail!("意外的位置参数: {flag}"),
+            "--target" | "--listen" | "--login" => bail!("{flag} may only appear once"),
+            _ if flag.starts_with('-') => bail!("unknown option: {flag}"),
+            _ => bail!("unexpected positional argument: {flag}"),
         }
         index += 1;
     }
@@ -119,14 +119,14 @@ pub fn prompt_interactive() -> Result<ClientConfig> {
         };
         match parse_tows(&value) {
             Ok(server) => break server,
-            Err(error) => eprintln!("[输入] {error}"),
+            Err(error) => tracing::warn!(target: "towc", "invalid input: {error}"),
         }
     };
 
     let location = reqwest::Url::parse(&build_webvpn_ws_url(&server)?)?
         .path()
         .to_string();
-    println!("WebVPN location: {location}");
+    tracing::info!(target: "towc", "WebVPN location: {location}");
 
     let target_default = cached
         .as_ref()
@@ -155,7 +155,7 @@ pub fn prompt_interactive() -> Result<ClientConfig> {
         }
         match LoginPreference::from_identity(&value) {
             Ok(login) => break login,
-            Err(error) => eprintln!("[输入] {error}"),
+            Err(error) => tracing::warn!(target: "towc", "invalid input: {error}"),
         }
     };
 
@@ -184,18 +184,22 @@ fn prompt_endpoint(
         let value = if value.is_empty() { default } else { &value };
         match parser(value) {
             Ok(endpoint) => return Ok(endpoint),
-            Err(error) => eprintln!("[输入] {error}"),
+            Err(error) => tracing::warn!(target: "towc", "invalid input: {error}"),
         }
     }
 }
 
 fn prompt_line(prompt: &str) -> Result<String> {
     print!("{prompt}");
-    io::stdout().flush().context("无法刷新输入提示")?;
+    io::stdout()
+        .flush()
+        .context("failed to flush input prompt")?;
     let mut value = String::new();
-    let count = io::stdin().read_line(&mut value).context("无法读取输入")?;
+    let count = io::stdin()
+        .read_line(&mut value)
+        .context("failed to read input")?;
     if count == 0 {
-        bail!("输入已结束");
+        bail!("input stream closed");
     }
     Ok(value.trim().to_string())
 }
@@ -206,14 +210,14 @@ fn read_defaults() -> Option<InteractiveDefaults> {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
         Err(error) => {
-            tracing::warn!("读取交互缓存失败，不影响启动: {error}");
+            tracing::warn!(target: "towc", "could not read interactive defaults; continuing: {error}");
             return None;
         }
     };
     let defaults: InteractiveDefaults = match serde_json::from_slice(&contents) {
         Ok(defaults) => defaults,
         Err(error) => {
-            tracing::warn!("交互缓存损坏，改用内置默认值: {error}");
+            tracing::warn!(target: "towc", "interactive defaults are corrupt; using built-in defaults: {error}");
             return None;
         }
     };
@@ -222,7 +226,7 @@ fn read_defaults() -> Option<InteractiveDefaults> {
         || parse_target(&defaults.target).is_err()
         || parse_listen(&defaults.listen_addr).is_err()
     {
-        tracing::warn!("交互缓存版本或地址无效，改用内置默认值");
+        tracing::warn!(target: "towc", "interactive defaults have an invalid version or address; using built-in defaults");
         return None;
     }
     Some(defaults)
@@ -230,11 +234,11 @@ fn read_defaults() -> Option<InteractiveDefaults> {
 
 fn write_defaults(defaults: &InteractiveDefaults) {
     let Some(path) = data_file(DEFAULTS_FILE) else {
-        tracing::warn!("找不到交互缓存目录，不影响启动");
+        tracing::warn!(target: "towc", "interactive defaults directory is unavailable; continuing");
         return;
     };
     if let Err(error) = write_json(&path, defaults) {
-        tracing::warn!("写入交互缓存失败，不影响启动: {error:#}");
+        tracing::warn!(target: "towc", "could not save interactive defaults; continuing: {error:#}");
     }
 }
 
@@ -262,7 +266,7 @@ mod tests {
             "3389",
         ]))
         .unwrap() else {
-            panic!("应解析为运行模式")
+            panic!("expected run mode")
         };
         assert_eq!(config.server.to_string(), "host.example:4489");
         assert_eq!(config.target.to_string(), "127.0.0.1:3389");

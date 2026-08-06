@@ -37,7 +37,7 @@ impl TryFrom<u8> for FrameType {
             0x06 => Ok(Self::OpenFail),
             0x07 => Ok(Self::HelloAck),
             0x08 => Ok(Self::Eof),
-            other => bail!("未知帧类型 0x{other:02x}"),
+            other => bail!("unknown frame type 0x{other:02x}"),
         }
     }
 }
@@ -52,7 +52,7 @@ pub struct Frame {
 impl Frame {
     pub fn new(kind: FrameType, tunnel_id: u16, payload: Vec<u8>) -> Result<Self> {
         if payload.len() > MAX_PAYLOAD_LEN {
-            bail!("帧负载超过 65,535 字节");
+            bail!("frame payload exceeds 65,535 bytes");
         }
         let frame = Self {
             kind,
@@ -73,7 +73,7 @@ impl Frame {
 
     fn version_frame(kind: FrameType, program: &str) -> Result<Self> {
         if program.is_empty() {
-            bail!("程序版本字符串不能为空");
+            bail!("program version string cannot be empty");
         }
         let mut payload = Vec::with_capacity(2 + program.len());
         payload.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
@@ -92,14 +92,14 @@ impl Frame {
 
     pub fn decode(encoded: &[u8]) -> Result<Self> {
         if encoded.len() < HEADER_LEN {
-            bail!("帧长度小于 {HEADER_LEN} 字节");
+            bail!("frame is shorter than the {HEADER_LEN}-byte header");
         }
         let kind = FrameType::try_from(encoded[0])?;
         let tunnel_id = u16::from_be_bytes([encoded[1], encoded[2]]);
         let payload_len = u16::from_be_bytes([encoded[3], encoded[4]]) as usize;
         if encoded.len() != HEADER_LEN + payload_len {
             bail!(
-                "帧长度不匹配：声明 {payload_len} 字节，实际 {} 字节",
+                "frame length mismatch: declared {payload_len} payload bytes, received {}",
                 encoded.len() - HEADER_LEN
             );
         }
@@ -108,7 +108,7 @@ impl Frame {
 
     pub fn version(&self) -> Result<(u16, &str)> {
         if !matches!(self.kind, FrameType::Hello | FrameType::HelloAck) {
-            bail!("当前帧不是版本协商帧");
+            bail!("frame is not a version negotiation frame");
         }
         let version = u16::from_be_bytes([self.payload[0], self.payload[1]]);
         let program = std::str::from_utf8(&self.payload[2..]).context_utf8()?;
@@ -117,7 +117,7 @@ impl Frame {
 
     pub fn validate_client_to_server(&self, handshake_done: bool) -> Result<()> {
         if !handshake_done && self.kind != FrameType::Hello {
-            bail!("握手前客户端只能发送 HELLO");
+            bail!("the client may only send HELLO before the handshake");
         }
         if handshake_done
             && matches!(
@@ -125,14 +125,17 @@ impl Frame {
                 FrameType::Hello | FrameType::HelloAck | FrameType::OpenOk | FrameType::OpenFail
             )
         {
-            bail!("客户端发送了方向错误或重复的 {:?} 帧", self.kind);
+            bail!(
+                "the client sent a duplicate or wrong-direction {:?} frame",
+                self.kind
+            );
         }
         Ok(())
     }
 
     pub fn validate_server_to_client(&self, handshake_done: bool) -> Result<()> {
         if !handshake_done && self.kind != FrameType::HelloAck {
-            bail!("握手前服务端只能发送 HELLO_ACK");
+            bail!("the server may only send HELLO_ACK before the handshake");
         }
         if handshake_done
             && matches!(
@@ -140,7 +143,10 @@ impl Frame {
                 FrameType::Hello | FrameType::HelloAck | FrameType::Open | FrameType::Ping
             )
         {
-            bail!("服务端发送了方向错误或重复的 {:?} 帧", self.kind);
+            bail!(
+                "the server sent a duplicate or wrong-direction {:?} frame",
+                self.kind
+            );
         }
         Ok(())
     }
@@ -151,37 +157,39 @@ impl Frame {
             FrameType::Hello | FrameType::HelloAck | FrameType::Ping
         );
         if connection_level && self.tunnel_id != 0 {
-            bail!("连接级帧的 tunnel_id 必须为 0");
+            bail!("connection-level frames must use tunnel_id 0");
         }
         if !connection_level && (self.tunnel_id == 0 || self.tunnel_id == u16::MAX) {
-            bail!("流级帧的 tunnel_id 必须在 1..=65534 范围内");
+            bail!("stream-level frames must use tunnel_id 1..=65534");
         }
 
         match self.kind {
             FrameType::Hello | FrameType::HelloAck => {
                 if self.payload.len() < 3 || self.payload.len() > MAX_VERSION_PAYLOAD_LEN {
-                    bail!("版本协商负载必须包含版本号和非空程序版本，且不超过 128 字节");
+                    bail!(
+                        "version payload must contain a version and non-empty program name within 128 bytes"
+                    );
                 }
                 std::str::from_utf8(&self.payload[2..])
-                    .map_err(|_| anyhow!("程序版本字符串不是合法 UTF-8"))?;
+                    .map_err(|_| anyhow!("program version string is not valid UTF-8"))?;
             }
             FrameType::Open => {
                 if self.payload.is_empty() || self.payload.len() > MAX_OPEN_LEN {
-                    bail!("OPEN 目标长度必须为 1..=255 字节");
+                    bail!("OPEN target length must be 1..=255 bytes");
                 }
                 std::str::from_utf8(&self.payload)
-                    .map_err(|_| anyhow!("OPEN 目标不是合法 UTF-8"))?;
+                    .map_err(|_| anyhow!("OPEN target is not valid UTF-8"))?;
             }
             FrameType::OpenFail => {
                 if self.payload.len() > MAX_ERROR_LEN {
-                    bail!("OPEN_FAIL 错误文本不能超过 256 字节");
+                    bail!("OPEN_FAIL text cannot exceed 256 bytes");
                 }
                 std::str::from_utf8(&self.payload)
-                    .map_err(|_| anyhow!("OPEN_FAIL 错误文本不是合法 UTF-8"))?;
+                    .map_err(|_| anyhow!("OPEN_FAIL text is not valid UTF-8"))?;
             }
             FrameType::Close | FrameType::Ping | FrameType::OpenOk | FrameType::Eof => {
                 if !self.payload.is_empty() {
-                    bail!("{:?} 帧的负载必须为空", self.kind);
+                    bail!("{:?} frame payload must be empty", self.kind);
                 }
             }
             FrameType::Data => {}
@@ -196,7 +204,7 @@ trait Utf8Context<'a> {
 
 impl<'a> Utf8Context<'a> for std::result::Result<&'a str, std::str::Utf8Error> {
     fn context_utf8(self) -> Result<&'a str> {
-        self.map_err(|_| anyhow!("程序版本字符串不是合法 UTF-8"))
+        self.map_err(|_| anyhow!("program version string is not valid UTF-8"))
     }
 }
 

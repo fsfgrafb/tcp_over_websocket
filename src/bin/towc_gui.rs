@@ -1,12 +1,14 @@
 #[cfg(windows)]
 fn main() {
+    tcp_over_websocket::init_tracing("towc");
     if let Err(error) = tcp_over_websocket::gui::run() {
-        eprintln!("[towc_gui] {error:#}");
+        tracing::error!(target: "towc", "{error:#}");
         std::process::exit(1);
     }
 }
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("towc_gui 仅支持 Windows");
+    tcp_over_websocket::init_tracing("towc");
+    tracing::error!(target: "towc", "towc_gui is only supported on Windows");
 }

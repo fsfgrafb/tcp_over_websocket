@@ -18,13 +18,53 @@ pub mod server;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 初始化命令行日志。重复调用不会报错。
-pub fn init_tracing() {
+#[derive(Clone, Copy)]
+struct TaggedEventFormatter {
+    default_tag: &'static str,
+}
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for TaggedEventFormatter
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    N: for<'writer> tracing_subscriber::fmt::FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let tag = match event.metadata().target() {
+            "towc" => "towc",
+            "tows" => "tows",
+            "tunnel" => "tunnel",
+            _ => self.default_tag,
+        };
+        if writer.has_ansi_escapes() {
+            let color = match tag {
+                "towc" => 36,
+                "tunnel" => 32,
+                "tows" => 35,
+                _ => 37,
+            };
+            write!(writer, "\x1b[{color}m[{tag}]\x1b[0m ")?;
+        } else {
+            write!(writer, "[{tag}] ")?;
+        }
+        context
+            .field_format()
+            .format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+/// Initialize CLI logging. Calling this more than once is harmless.
+pub fn init_tracing(default_tag: &'static str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
+        .with_ansi(true)
+        .event_format(TaggedEventFormatter { default_tag })
         .try_init();
 }

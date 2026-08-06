@@ -235,8 +235,10 @@ impl TowcApp {
             let observer: Arc<dyn ClientObserver> = bridge;
             let writer_events = event_tx.clone();
             let subscriber = tracing_subscriber::fmt()
-                .without_time()
-                .with_target(false)
+                .with_ansi(false)
+                .event_format(crate::TaggedEventFormatter {
+                    default_tag: "towc",
+                })
                 .with_writer(move || GuiLogWriter {
                     events: writer_events.clone(),
                 })

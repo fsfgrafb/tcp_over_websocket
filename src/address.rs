@@ -42,10 +42,10 @@ impl Endpoint {
     pub async fn resolve(&self) -> Result<SocketAddr> {
         let mut addresses = lookup_host((self.host.as_str(), self.port))
             .await
-            .with_context(|| format!("无法解析地址 {self}"))?;
+            .with_context(|| format!("failed to resolve address {self}"))?;
         addresses
             .next()
-            .with_context(|| format!("地址 {self} 没有可用的 IP"))
+            .with_context(|| format!("address {self} did not resolve to an IP"))
     }
 }
 
@@ -63,19 +63,19 @@ impl fmt::Display for Endpoint {
 pub fn parse_tows(value: &str) -> Result<Endpoint> {
     let value = value.trim();
     if value.chars().all(|character| character.is_ascii_digit()) {
-        bail!("tows 地址不能只写端口；请写 host 或 host:port");
+        bail!("a tows address must be a host or host:port, not a bare port");
     }
     parse_host_port(value, Some(DEFAULT_TOWS_PORT), "tows")
 }
 
 /// 解析目标地址。纯端口等价于 127.0.0.1:port。
 pub fn parse_target(value: &str) -> Result<Endpoint> {
-    parse_port_shorthand(value, "目标")
+    parse_port_shorthand(value, "target ")
 }
 
 /// 解析本地监听地址。纯端口等价于 127.0.0.1:port。
 pub fn parse_listen(value: &str) -> Result<Endpoint> {
-    parse_port_shorthand(value, "监听")
+    parse_port_shorthand(value, "listen ")
 }
 
 fn parse_port_shorthand(value: &str, label: &str) -> Result<Endpoint> {
@@ -88,60 +88,61 @@ fn parse_port_shorthand(value: &str, label: &str) -> Result<Endpoint> {
 
 fn parse_host_port(value: &str, default_port: Option<u16>, label: &str) -> Result<Endpoint> {
     if value.is_empty() {
-        bail!("{label}地址不能为空");
+        bail!("{label}address cannot be empty");
     }
 
     if let Some(after_open) = value.strip_prefix('[') {
         let close = after_open
             .find(']')
-            .ok_or_else(|| anyhow!("{label} IPv6 地址缺少右方括号"))?;
+            .ok_or_else(|| anyhow!("{label}IPv6 address is missing a closing bracket"))?;
         let host = &after_open[..close];
         host.parse::<Ipv6Addr>()
-            .with_context(|| format!("无效的 {label} IPv6 地址: {host}"))?;
+            .with_context(|| format!("invalid {label}IPv6 address: {host}"))?;
         let suffix = &after_open[close + 1..];
-        let port = if suffix.is_empty() {
-            default_port.context(format!("{label}地址必须包含端口"))?
-        } else {
-            parse_port(
-                suffix
-                    .strip_prefix(':')
-                    .ok_or_else(|| anyhow!("{label} IPv6 地址右方括号后只能跟 :port"))?,
-            )?
-        };
+        let port =
+            if suffix.is_empty() {
+                default_port.context(format!("{label}address must include a port"))?
+            } else {
+                parse_port(suffix.strip_prefix(':').ok_or_else(|| {
+                    anyhow!("only :port may follow a bracketed {label}IPv6 address")
+                })?)?
+            };
         return Endpoint::new(host, port);
     }
 
     let colon_count = value.bytes().filter(|byte| *byte == b':').count();
     match colon_count {
         0 => {
-            let port = default_port.context(format!("{label}地址必须包含端口"))?;
+            let port = default_port.context(format!("{label}address must include a port"))?;
             Endpoint::new(value, port)
         }
         1 => {
-            let (host, port) = value.rsplit_once(':').expect("已确认地址中恰好有一个冒号");
+            let (host, port) = value
+                .rsplit_once(':')
+                .expect("exactly one colon was checked");
             if host.trim().is_empty() {
-                bail!("{label}地址缺少主机名");
+                bail!("{label}address is missing a host");
             }
             Endpoint::new(host.trim(), parse_port(port.trim())?)
         }
-        _ => bail!("裸 IPv6 地址存在歧义，请使用 [addr] 或 [addr]:port"),
+        _ => bail!("an unbracketed IPv6 address is ambiguous; use [addr] or [addr]:port"),
     }
 }
 
 fn parse_port(value: &str) -> Result<u16> {
     if value.is_empty() {
-        bail!("端口不能为空");
+        bail!("port cannot be empty");
     }
     let port = value
         .parse::<u16>()
-        .with_context(|| format!("无效端口: {value}"))?;
+        .with_context(|| format!("invalid port: {value}"))?;
     validate_port(port)?;
     Ok(port)
 }
 
 fn validate_port(port: u16) -> Result<()> {
     if port == 0 {
-        bail!("端口必须在 1..=65535 范围内");
+        bail!("port must be in the range 1..=65535");
     }
     Ok(())
 }
@@ -149,10 +150,10 @@ fn validate_port(port: u16) -> Result<()> {
 fn validate_host(host: &str) -> Result<()> {
     let host = host.trim();
     if host.is_empty() {
-        bail!("主机名不能为空");
+        bail!("host cannot be empty");
     }
     if host.contains(['/', '?', '#', '[', ']']) || host.chars().any(char::is_whitespace) {
-        bail!("无效主机名: {host}");
+        bail!("invalid host: {host}");
     }
     Ok(())
 }

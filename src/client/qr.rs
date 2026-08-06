@@ -6,9 +6,9 @@ const MODULES: u32 = 41;
 /// 微信当前返回 41×41 模块二维码；按图像暗色区域采样并输出终端块字符。
 pub fn print(image_bytes: &[u8]) -> Result<()> {
     let image = image::load_from_memory(image_bytes)
-        .context("无法解析微信二维码图片")?
+        .context("failed to decode WeChat QR image")?
         .to_luma8();
-    let modules = sample(&image).context("无法识别微信二维码模块")?;
+    let modules = sample(&image).context("failed to detect WeChat QR modules")?;
     println!();
     for y in 0..MODULES + 4 {
         for x in 0..MODULES + 4 {

@@ -40,7 +40,7 @@ ssh -p 14489 user@localhost
 完整参数格式：
 
 ```text
-towc <tows-host[:port]> --target <host:port|port> --listen <host:port|port> --login <手机号|邮箱>
+towc <tows-host[:port]> --target <host:port|port> --listen <host:port|port> --login <mobile|email>
 ```
 
 三个 flag 可任意排序。示例：
@@ -75,6 +75,8 @@ IPv6 必须使用 `[addr]` 或 `[addr]:port`。目标和监听可只写端口，
 - Linux：`$XDG_CACHE_HOME/tcp_over_websocket/`；未设置时使用 `~/.cache/tcp_over_websocket/`。
 
 程序每 60 秒发送一条协议 PING，并每 10 分钟全局刷新一次 WebVPN Cookie。来源 IP 变化、ticket 过期、保活失败或 WS 断开后不会自动重新登录：`towc` 退出；`towc_gui` 停止全部监听并保留窗口、配置和日志，等待手动再次启动。
+
+控制台日志正文统一使用 ASCII 英文，避免不支持中文的终端出现乱码。每行日志以彩色组件标签开头：`[towc]` 表示客户端生命周期与认证，`[tunnel]` 表示连接和转发流，`[tows]` 表示服务端生命周期；GUI 日志面板使用相同标签但不包含 ANSI 转义序列。
 
 ## towc_gui
 

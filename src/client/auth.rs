@@ -38,7 +38,7 @@ impl LoginPreference {
         } else if value.contains('@') && !value.chars().any(char::is_whitespace) {
             Ok(Self::Email(value.to_string()))
         } else {
-            bail!("登录值必须是手机号或邮箱地址");
+            bail!("login identity must be a mobile number or email address");
         }
     }
 }
@@ -55,11 +55,11 @@ pub struct SessionCookie(pub(crate) Arc<Mutex<String>>);
 
 impl SessionCookie {
     pub fn snapshot(&self) -> String {
-        self.0.lock().expect("Cookie 锁中毒").clone()
+        self.0.lock().expect("cookie mutex poisoned").clone()
     }
 
     pub(crate) fn replace(&self, cookie: String) {
-        *self.0.lock().expect("Cookie 锁中毒") = cookie;
+        *self.0.lock().expect("cookie mutex poisoned") = cookie;
     }
 }
 
@@ -76,11 +76,11 @@ pub async fn login_or_restore(
     if let Some(cookie) = read_cached_ticket()
         && validate_cached_ticket(&cookie).await.unwrap_or(false)
     {
-        prompt.status("已复用有效的 WebVPN 登录缓存");
+        prompt.status("reusing a valid WebVPN login cache");
         return Ok(SessionCookie(Arc::new(Mutex::new(cookie))));
     }
 
-    prompt.status("需要登录 WebVPN");
+    prompt.status("WebVPN login required");
     let cookie = match preference {
         LoginPreference::Wechat => login_wechat(Arc::clone(&prompt)).await?,
         LoginPreference::Mobile(mobile) => {
@@ -100,7 +100,7 @@ fn login_client(jar: Arc<reqwest::cookie::Jar>) -> Result<Client> {
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::limited(12))
         .build()
-        .context("无法创建 WebVPN 登录客户端")
+        .context("failed to create WebVPN login client")
 }
 
 async fn fresh_login_client() -> Result<(Client, Arc<reqwest::cookie::Jar>, String)> {
@@ -110,9 +110,9 @@ async fn fresh_login_client() -> Result<(Client, Arc<reqwest::cookie::Jar>, Stri
         .get(CAS_LOGIN)
         .send()
         .await
-        .context("无法打开 CAS 登录页")?
+        .context("failed to open CAS login page")?
         .error_for_status()
-        .context("CAS 登录页返回错误")?;
+        .context("CAS login page returned an error")?;
     let _ = response.bytes().await;
     client
         .get(format!(
@@ -121,14 +121,14 @@ async fn fresh_login_client() -> Result<(Client, Arc<reqwest::cookie::Jar>, Stri
         .header(REFERER, format!("{WEBVPN_ROOT}fingerprint"))
         .send()
         .await
-        .context("无法激活 WebVPN 指纹")?
+        .context("failed to activate WebVPN fingerprint")?
         .error_for_status()
-        .context("WebVPN 指纹激活失败")?;
+        .context("WebVPN fingerprint activation failed")?;
     let html = client
         .get(CAS_LOGIN)
         .send()
         .await
-        .context("指纹激活后无法重开 CAS 登录页")?
+        .context("failed to reopen CAS login page after fingerprint activation")?
         .error_for_status()?
         .text()
         .await?;
@@ -137,7 +137,7 @@ async fn fresh_login_client() -> Result<(Client, Arc<reqwest::cookie::Jar>, Stri
 
 async fn login_wechat(prompt: Arc<dyn AuthPrompt>) -> Result<String> {
     let (client, jar, _) = fresh_login_client().await?;
-    prompt.status("正在获取微信二维码");
+    prompt.status("requesting WeChat QR code");
     let state = format!("towc{}", unix_millis());
     let redirect = format!(
         "https://cas.szut.edu.cn/cas/login?service={}&client_name=WeiXinClient",
@@ -155,25 +155,25 @@ async fn login_wechat(prompt: Arc<dyn AuthPrompt>) -> Result<String> {
         .get(qr_page_url)
         .send()
         .await
-        .context("无法访问微信二维码页面")?
+        .context("failed to access WeChat QR page")?
         .error_for_status()?
         .text()
         .await?;
-    let uuid = extract_wechat_uuid(&page).context("微信页面中没有二维码 UUID")?;
+    let uuid = extract_wechat_uuid(&page).context("WeChat page did not contain a QR UUID")?;
     let image = client
         .get(format!("https://open.weixin.qq.com/connect/qrcode/{uuid}"))
         .send()
         .await
-        .context("无法下载微信二维码")?
+        .context("failed to download WeChat QR code")?
         .error_for_status()?
         .bytes()
         .await?
         .to_vec();
     prompt.show_qr(image)?;
-    prompt.status("请用微信扫码并在手机上确认");
+    prompt.status("scan the WeChat QR code and confirm on your phone");
 
     let code = poll_wechat(&client, &uuid, &prompt).await?;
-    prompt.status("微信已确认，正在激活 WebVPN ticket");
+    prompt.status("WeChat confirmed; activating WebVPN ticket");
     let mut callback = Url::parse(&redirect)?;
     callback
         .query_pairs_mut()
@@ -183,10 +183,10 @@ async fn login_wechat(prompt: Arc<dyn AuthPrompt>) -> Result<String> {
         .get(callback)
         .send()
         .await
-        .context("CAS 微信回调失败")?
+        .context("CAS WeChat callback failed")?
         .error_for_status()?;
     ensure_not_login_page(response.url().as_str())?;
-    ticket_from_jar(&jar).context("微信登录完成但没有获得 WebVPN ticket")
+    ticket_from_jar(&jar).context("WeChat login completed without a WebVPN ticket")
 }
 
 async fn poll_wechat(client: &Client, uuid: &str, prompt: &Arc<dyn AuthPrompt>) -> Result<String> {
@@ -204,30 +204,30 @@ async fn poll_wechat(client: &Client, uuid: &str, prompt: &Arc<dyn AuthPrompt>) 
             .timeout(Duration::from_secs(35))
             .send()
             .await
-            .context("轮询微信扫码状态失败")?
+            .context("failed to poll WeChat QR status")?
             .error_for_status()?
             .text()
             .await?;
         let status = extract_js_number(&body, "wx_errcode")
-            .with_context(|| format!("无法解析微信扫码状态: {}", redact_code(&body)))?;
+            .with_context(|| format!("failed to parse WeChat QR status: {}", redact_code(&body)))?;
         last = Some(status);
         match status {
             405 => {
                 return extract_js_string(&body, "wx_code")
                     .filter(|code| !code.is_empty())
-                    .context("微信确认后没有返回回调 code");
+                    .context("WeChat confirmation did not return a callback code");
             }
             404 => {
-                prompt.status("二维码已扫描，等待手机确认");
+                prompt.status("QR code scanned; waiting for phone confirmation");
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
             408 | 500 => tokio::time::sleep(Duration::from_millis(1800)).await,
-            403 => bail!("微信扫码登录已取消"),
-            402 => bail!("微信二维码已过期，请重新登录"),
+            403 => bail!("WeChat QR login was cancelled"),
+            402 => bail!("WeChat QR code expired; sign in again"),
             _ => tokio::time::sleep(Duration::from_millis(1800)).await,
         }
     }
-    bail!("等待微信扫码超时")
+    bail!("timed out waiting for WeChat QR login")
 }
 
 async fn login_verification(
@@ -237,11 +237,11 @@ async fn login_verification(
 ) -> Result<String> {
     let (client, jar, mut html) = fresh_login_client().await?;
     let (path, key, label) = if mobile {
-        ("v2/services/sedsms", "mobile", "手机")
+        ("v2/services/sedsms", "mobile", "mobile")
     } else {
-        ("v2/services/sendEmailYzm", "email", "邮箱")
+        ("v2/services/sendEmailYzm", "email", "email")
     };
-    prompt.status(&format!("正在发送{label}验证码"));
+    prompt.status(&format!("sending {label} verification code"));
     let mut send_url = Url::parse(&cas_url(path))?;
     send_url.query_pairs_mut().append_pair(key, &username);
     let response = client
@@ -253,10 +253,10 @@ async fn login_verification(
         .await?;
     let result = response.trim().trim_matches('"');
     match result {
-        "success" => prompt.status("验证码已发送"),
-        "valid" => prompt.status("已有未过期验证码，请直接使用"),
-        "unbind" => bail!("该{label}未绑定学校账号"),
-        other => bail!("验证码服务返回错误: {other}"),
+        "success" => prompt.status("verification code sent"),
+        "valid" => prompt.status("an unexpired verification code already exists; use it directly"),
+        "unbind" => bail!("this {label} identity is not linked to the school account"),
+        other => bail!("verification service returned an error: {other}"),
     }
 
     let key = client
@@ -266,17 +266,17 @@ async fn login_verification(
         .error_for_status()?
         .json::<PublicKeyResponse>()
         .await
-        .context("无法解析 CAS RSA 公钥")?;
+        .context("failed to parse CAS RSA public key")?;
     let code = tokio::task::block_in_place(|| prompt.request_code(label))?;
     if code.trim().is_empty() {
-        bail!("验证码不能为空");
+        bail!("verification code cannot be empty");
     }
     let reversed: String = code.trim().chars().rev().collect();
     let encrypted = rsa_encrypt(&reversed, &key.modulus, &key.exponent)?;
 
     for attempt in 0..2 {
-        let execution =
-            extract_input_value(&html, "execution").context("CAS 登录页缺少 execution token")?;
+        let execution = extract_input_value(&html, "execution")
+            .context("CAS login page is missing execution token")?;
         let response = client
             .post(CAS_LOGIN)
             .header(ORIGIN, "https://webvpn.szut.edu.cn")
@@ -290,20 +290,23 @@ async fn login_verification(
             ])
             .send()
             .await
-            .context("提交 CAS 验证码登录失败")?
+            .context("failed to submit CAS verification-code login")?
             .error_for_status()?;
         let final_url = response.url().to_string();
         html = response.text().await?;
         if !final_url.contains("/cas/login") || extract_input_value(&html, "execution").is_none() {
             ensure_not_login_page(&final_url)?;
-            return ticket_from_jar(&jar).context("验证码登录完成但没有获得 WebVPN ticket");
+            return ticket_from_jar(&jar)
+                .context("verification-code login completed without a WebVPN ticket");
         }
         if attempt == 0 {
-            prompt.status("CAS 尚未接受验证码，使用新的 execution 重试一次");
+            prompt.status(
+                "CAS did not accept the code yet; retrying once with a new execution token",
+            );
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
     }
-    bail!("CAS 未接受验证码，请检查验证码是否正确")
+    bail!("CAS rejected the verification code; check the code and try again")
 }
 
 pub(crate) async fn refresh_ticket(cookie: &SessionCookie) -> Result<()> {
@@ -322,10 +325,12 @@ pub(crate) async fn refresh_ticket(cookie: &SessionCookie) -> Result<()> {
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .context("Cookie 保活请求失败")?;
+        .context("cookie refresh request failed")?;
     ensure_not_login_page(response.url().as_str())?;
-    response.error_for_status().context("Cookie 保活返回错误")?;
-    let refreshed = ticket_from_jar(&jar).context("Cookie 保活后 ticket 消失")?;
+    response
+        .error_for_status()
+        .context("cookie refresh returned an error")?;
+    let refreshed = ticket_from_jar(&jar).context("ticket disappeared after cookie refresh")?;
     if refreshed != cookie.snapshot() {
         cookie.replace(refreshed.clone());
         write_cached_ticket(&refreshed);
@@ -352,7 +357,7 @@ fn ticket_from_jar(jar: &reqwest::cookie::Jar) -> Option<String> {
 }
 
 fn seed_jar(jar: &reqwest::cookie::Jar, cookie: &str) {
-    let url = Url::parse(WEBVPN_ROOT).expect("固定 WebVPN URL 合法");
+    let url = Url::parse(WEBVPN_ROOT).expect("static WebVPN URL is valid");
     jar.add_cookie_str(cookie, &url);
 }
 
@@ -373,7 +378,7 @@ fn read_cached_ticket() -> Option<String> {
         Ok(_) => None,
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
-            tracing::warn!("读取 WebVPN Cookie 缓存失败，不影响重新登录: {error}");
+            tracing::warn!(target: "towc", "could not read WebVPN cookie cache; signing in again: {error}");
             None
         }
     }
@@ -381,11 +386,11 @@ fn read_cached_ticket() -> Option<String> {
 
 fn write_cached_ticket(cookie: &str) {
     let Some(path) = data_file(COOKIE_FILE) else {
-        tracing::warn!("找不到 Cookie 缓存目录");
+        tracing::warn!(target: "towc", "cookie cache directory is unavailable");
         return;
     };
     if let Err(error) = atomic_write(&path, format!("{cookie}\n").as_bytes()) {
-        tracing::warn!("写入 Cookie 缓存失败，不影响当前会话: {error:#}");
+        tracing::warn!(target: "towc", "could not save cookie cache; current session is unaffected: {error:#}");
     }
 }
 
@@ -476,9 +481,10 @@ fn attr(fragment: &str, name: &str) -> Option<String> {
 }
 
 fn rsa_encrypt(plain: &str, modulus_hex: &str, exponent_hex: &str) -> Result<String> {
-    let modulus = BigUint::parse_bytes(modulus_hex.as_bytes(), 16).context("无效 RSA modulus")?;
+    let modulus =
+        BigUint::parse_bytes(modulus_hex.as_bytes(), 16).context("invalid RSA modulus")?;
     let exponent =
-        BigUint::parse_bytes(exponent_hex.as_bytes(), 16).context("无效 RSA exponent")?;
+        BigUint::parse_bytes(exponent_hex.as_bytes(), 16).context("invalid RSA exponent")?;
     let mut codes: Vec<u16> = plain.encode_utf16().collect();
     codes.resize(codes.len().div_ceil(RSA_CHUNK_SIZE) * RSA_CHUNK_SIZE, 0);
     let mut encrypted = Vec::new();
@@ -501,7 +507,7 @@ fn rsa_encrypt(plain: &str, modulus_hex: &str, exponent_hex: &str) -> Result<Str
 
 fn ensure_not_login_page(url: &str) -> Result<()> {
     if url.contains("webvpn.szut.edu.cn/login") || url.contains("logoutByIpChange=true") {
-        bail!("WebVPN 登录未生效或来源 IP 已变化，请重新登录");
+        bail!("WebVPN login is no longer valid or the source IP changed; sign in again");
     }
     Ok(())
 }
@@ -515,7 +521,7 @@ fn unix_millis() -> u128 {
 
 fn url_encode(value: &str) -> String {
     Url::parse_with_params("https://x.invalid/", [("v", value)])
-        .expect("固定 URL 合法")
+        .expect("static URL is valid")
         .query()
         .and_then(|query| query.strip_prefix("v="))
         .unwrap_or_default()

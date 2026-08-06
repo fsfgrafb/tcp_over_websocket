@@ -42,7 +42,7 @@ struct TerminalUi;
 
 impl AuthPrompt for TerminalUi {
     fn status(&self, message: &str) {
-        tracing::info!("{message}");
+        tracing::info!(target: "towc", "{message}");
     }
 
     fn show_qr(&self, image: Vec<u8>) -> Result<()> {
@@ -51,7 +51,7 @@ impl AuthPrompt for TerminalUi {
 
     fn request_code(&self, label: &str) -> Result<String> {
         use std::io::Write;
-        print!("请输入{label}验证码: ");
+        print!("Enter the {label} verification code: ");
         std::io::stdout().flush()?;
         let mut code = String::new();
         std::io::stdin().read_line(&mut code)?;
@@ -61,16 +61,16 @@ impl AuthPrompt for TerminalUi {
 
 impl ClientObserver for TerminalUi {
     fn status(&self, message: &str) {
-        tracing::info!("{message}");
+        tracing::info!(target: "towc", "{message}");
     }
 
     fn tunnel_status(&self, name: &str, message: &str) {
-        tracing::info!("[{name}] {message}");
+        tracing::info!(target: "tunnel", "[{name}] {message}");
     }
 }
 
 pub async fn run_cli() -> Result<()> {
-    init_tracing();
+    init_tracing("towc");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = match parse_args(&args)? {
         ParsedArgs::Help => {
@@ -82,10 +82,7 @@ pub async fn run_cli() -> Result<()> {
     };
 
     if !config.listen.is_loopback() {
-        tracing::warn!(
-            "监听 {} 不是回环地址，将向局域网暴露本地端口",
-            config.listen
-        );
+        tracing::warn!(target: "towc", "listen address {} is not loopback; the local port will be exposed to the LAN", config.listen);
     }
     let ui = Arc::new(TerminalUi);
     let auth: Arc<dyn AuthPrompt> = ui.clone();
@@ -112,10 +109,10 @@ pub async fn run_tunnels(
     observer: Arc<dyn ClientObserver>,
 ) -> Result<()> {
     if rules.is_empty() {
-        bail!("没有启用的隧道");
+        bail!("no tunnels are enabled");
     }
     if rules.len() > MAX_TUNNELS {
-        bail!("单条 WebSocket 最多配置 {MAX_TUNNELS} 条隧道");
+        bail!("one WebSocket supports at most {MAX_TUNNELS} tunnels");
     }
     let url = build_webvpn_ws_url(&server)?;
     run_tunnels_to_url(url, server, rules, cookie, stop, observer).await
@@ -133,18 +130,21 @@ async fn run_tunnels_to_url(
     let mut listeners = Vec::new();
     for rule in rules {
         let address = rule.listen.resolve().await?;
-        let listener = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("无法监听 {}（端口可能已占用）", rule.listen))?;
+        let listener = TcpListener::bind(address).await.with_context(|| {
+            format!(
+                "failed to listen on {} (the port may be in use)",
+                rule.listen
+            )
+        })?;
         listeners.push((rule, listener));
     }
 
-    observer.status("正在连接 WebVPN WebSocket");
+    observer.status("connecting to WebVPN WebSocket");
     let mut websocket = connect_websocket(&url, &cookie.snapshot())
         .await
         .map_err(|error| anyhow!(error))?;
     client_handshake(&mut websocket, &format!("towc {APP_VERSION}")).await?;
-    observer.status(&format!("已连接 tows {server}"));
+    observer.status(&format!("connected to tows {server}"));
 
     let (sink, mut source) = websocket.split();
     let (writer, mut writer_task) = spawn_writer(sink);
@@ -177,7 +177,7 @@ async fn run_tunnels_to_url(
             if let Err(error) = refresh_ticket(&keepalive_cookie).await {
                 let _ = keepalive_events
                     .send(TunnelEvent::SessionError(format!(
-                        "WebVPN Cookie 保活失败: {error:#}"
+                        "WebVPN cookie refresh failed: {error:#}"
                     )))
                     .await;
                 return;
@@ -205,12 +205,12 @@ async fn run_tunnels_to_url(
             local = open_rx.recv() => {
                 let Some(local) = local else { break Ok(()) };
                 if tunnels.len() >= MAX_TUNNELS {
-                    observer.tunnel_status(&local.name, "连接被拒绝：已达到 64 条并发流上限");
+                    observer.tunnel_status(&local.name, "connection rejected: 64 concurrent streams are already open");
                     continue;
                 }
                 let id = allocate_id(&tunnels, &mut next_id)?;
                 writer.send(Frame::new(FrameType::Open, id, local.target.to_string().into_bytes())?).await?;
-                observer.tunnel_status(&local.name, &format!("正在建立流 {id}"));
+                observer.tunnel_status(&local.name, &format!("opening stream {id}"));
                 tunnels.insert(id, Tunnel::Opening(OpeningTunnel {
                     stream: Some(local.stream),
                     name: local.name,
@@ -229,8 +229,8 @@ async fn run_tunnels_to_url(
                             break Err(error);
                         }
                     }
-                    Some(Err(error)) => break Err(anyhow!(error).context("WebSocket 读取失败；请重新启动并登录")),
-                    None => break Err(anyhow!("WebSocket 已断开；请重新启动并登录")),
+                    Some(Err(error)) => break Err(anyhow!(error).context("WebSocket read failed; restart and sign in again")),
+                    None => break Err(anyhow!("WebSocket disconnected; restart and sign in again")),
                 }
             }
             event = event_rx.recv() => {
@@ -241,9 +241,9 @@ async fn run_tunnels_to_url(
             }
             writer_result = &mut writer_task => {
                 break match writer_result {
-                    Ok(Ok(())) => Err(anyhow!("WebSocket 写任务已停止")),
-                    Ok(Err(error)) => Err(error.context("WebSocket 写任务失败")),
-                    Err(error) => Err(anyhow!(error).context("WebSocket 写任务异常结束")),
+                    Ok(Ok(())) => Err(anyhow!("WebSocket writer task stopped")),
+                    Ok(Err(error)) => Err(error.context("WebSocket writer task failed")),
+                    Err(error) => Err(anyhow!(error).context("WebSocket writer task terminated unexpectedly")),
                 };
             }
         }
@@ -318,7 +318,7 @@ async fn accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
-                        observer.tunnel_status(&rule.name, &format!("本地连接 {peer}"));
+                        observer.tunnel_status(&rule.name, &format!("local connection from {peer}"));
                         if sender.send(LocalOpen {
                             stream,
                             target: rule.target.clone(),
@@ -328,7 +328,7 @@ async fn accept_loop(
                         }
                     }
                     Err(error) => {
-                        observer.tunnel_status(&rule.name, &format!("监听失败: {error}"));
+                        observer.tunnel_status(&rule.name, &format!("listener failed: {error}"));
                         return;
                     }
                 }
@@ -355,11 +355,11 @@ async fn handle_ws_message(
             Ok(())
         }
         Message::Pong(_) => Ok(()),
-        Message::Close(frame) => bail!("服务端关闭 WebSocket: {frame:?}"),
+        Message::Close(frame) => bail!("server closed the WebSocket: {frame:?}"),
         Message::Text(text) if text.as_str() == "连接成功" => {
-            bail!("检测到旧版 tows 文本协议；请升级服务端")
+            bail!("legacy text-based tows protocol detected; upgrade the server")
         }
-        Message::Text(_) => bail!("协议只接受 WebSocket Binary 消息"),
+        Message::Text(_) => bail!("the protocol only accepts WebSocket Binary messages"),
         Message::Frame(_) => Ok(()),
     }
 }
@@ -374,59 +374,74 @@ async fn handle_frame(
     match frame.kind {
         FrameType::OpenOk => {
             let Some(Tunnel::Opening(opening)) = tunnels.get_mut(&frame.tunnel_id) else {
-                bail!("OPEN_OK 指向未知或非 opening 流 {}", frame.tunnel_id);
+                bail!(
+                    "OPEN_OK refers to unknown or non-opening stream {}",
+                    frame.tunnel_id
+                );
             };
-            let stream = opening.stream.take().context("本地 TCP 已被取走")?;
+            let stream = opening
+                .stream
+                .take()
+                .context("local TCP stream was already taken")?;
             let name = opening.name.clone();
             stream
                 .set_nodelay(true)
-                .context("无法启用本地 TCP_NODELAY")?;
+                .context("failed to enable TCP_NODELAY on local TCP stream")?;
             let flow = writer.register(frame.tunnel_id).await?;
             let tunnel =
                 spawn_tcp_tasks(frame.tunnel_id, name.clone(), stream, flow, events.clone());
             tunnels.insert(frame.tunnel_id, Tunnel::Open(tunnel));
-            observer.tunnel_status(&name, &format!("流 {} 已建立", frame.tunnel_id));
+            observer.tunnel_status(&name, &format!("stream {} established", frame.tunnel_id));
             Ok(())
         }
         FrameType::OpenFail => {
             let Some(Tunnel::Opening(opening)) = tunnels.remove(&frame.tunnel_id) else {
-                bail!("OPEN_FAIL 指向未知或非 opening 流 {}", frame.tunnel_id);
+                bail!(
+                    "OPEN_FAIL refers to unknown or non-opening stream {}",
+                    frame.tunnel_id
+                );
             };
             let reason = std::str::from_utf8(&frame.payload)?;
-            observer.tunnel_status(&opening.name, &format!("建立失败: {reason}"));
+            observer.tunnel_status(&opening.name, &format!("open failed: {reason}"));
             Ok(())
         }
         FrameType::Data => {
             let tunnel = open_tunnel_mut(tunnels, frame.tunnel_id)?;
             if tunnel.remote_eof_seen {
-                bail!("流 {} 在 EOF 后又收到 DATA", frame.tunnel_id);
+                bail!("stream {} received DATA after EOF", frame.tunnel_id);
             }
             tunnel
                 .tcp_sender
                 .send(TcpCommand::Data(frame.payload))
                 .await
-                .map_err(|_| anyhow!("流 {} 的本地 TCP 写任务已停止", frame.tunnel_id))
+                .map_err(|_| {
+                    anyhow!(
+                        "local TCP writer for stream {} has stopped",
+                        frame.tunnel_id
+                    )
+                })
         }
         FrameType::Eof => {
             let tunnel = open_tunnel_mut(tunnels, frame.tunnel_id)?;
             if tunnel.remote_eof_seen {
-                bail!("流 {} 收到重复 EOF", frame.tunnel_id);
+                bail!("stream {} received duplicate EOF", frame.tunnel_id);
             }
             tunnel.remote_eof_seen = true;
-            tunnel
-                .tcp_sender
-                .send(TcpCommand::Eof)
-                .await
-                .map_err(|_| anyhow!("流 {} 的本地 TCP 写任务已停止", frame.tunnel_id))?;
+            tunnel.tcp_sender.send(TcpCommand::Eof).await.map_err(|_| {
+                anyhow!(
+                    "local TCP writer for stream {} has stopped",
+                    frame.tunnel_id
+                )
+            })?;
             maybe_finish(frame.tunnel_id, writer, observer, tunnels).await
         }
         FrameType::Close => {
             if tunnels.contains_key(&frame.tunnel_id) {
-                remove_tunnel(frame.tunnel_id, writer, observer, tunnels, "对端关闭").await;
+                remove_tunnel(frame.tunnel_id, writer, observer, tunnels, "peer closed").await;
             }
             Ok(())
         }
-        _ => bail!("服务端发送了不允许的 {:?} 帧", frame.kind),
+        _ => bail!("server sent a disallowed {:?} frame", frame.kind),
     }
 }
 
@@ -440,7 +455,7 @@ async fn handle_tunnel_event(
     match event {
         TunnelEvent::OpenTimeout(id) => {
             if let Some(Tunnel::Opening(opening)) = tunnels.remove(&id) {
-                observer.tunnel_status(&opening.name, "OPEN 等待超过 15 秒");
+                observer.tunnel_status(&opening.name, "OPEN timed out after 15 seconds");
                 writer
                     .send(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
@@ -468,7 +483,7 @@ async fn handle_tunnel_event(
                     writer,
                     observer,
                     tunnels,
-                    &format!("TCP 错误: {reason}"),
+                    &format!("TCP error: {reason}"),
                 )
                 .await;
             }
@@ -511,7 +526,8 @@ async fn read_tcp(
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => {
-                let eof = Frame::new(FrameType::Eof, id, Vec::new()).expect("固定 EOF 合法");
+                let eof =
+                    Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
@@ -519,13 +535,14 @@ async fn read_tcp(
             }
             Ok(size) => {
                 let frame = Frame::new(FrameType::Data, id, buffer[..size].to_vec())
-                    .expect("TCP 分片不超过协议上限");
+                    .expect("TCP chunk does not exceed the protocol limit");
                 if flow.send(frame).await.is_err() {
                     return;
                 }
             }
             Err(error) if is_normal_close(&error) => {
-                let eof = Frame::new(FrameType::Eof, id, Vec::new()).expect("固定 EOF 合法");
+                let eof =
+                    Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
@@ -574,8 +591,8 @@ async fn write_tcp(
 fn open_tunnel_mut(tunnels: &mut HashMap<u16, Tunnel>, id: u16) -> Result<&mut OpenTunnel> {
     match tunnels.get_mut(&id) {
         Some(Tunnel::Open(tunnel)) => Ok(tunnel),
-        Some(Tunnel::Opening(_)) => bail!("流 {id} 尚未 OPEN_OK 就收到数据"),
-        None => bail!("帧指向未知 tunnel_id {id}"),
+        Some(Tunnel::Opening(_)) => bail!("stream {id} received data before OPEN_OK"),
+        None => bail!("frame refers to unknown tunnel_id {id}"),
     }
 }
 
@@ -594,7 +611,7 @@ async fn maybe_finish(
         writer
             .send(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
-        remove_tunnel(id, writer, observer, tunnels, "双向 EOF").await;
+        remove_tunnel(id, writer, observer, tunnels, "bidirectional EOF").await;
     }
     Ok(())
 }
@@ -643,7 +660,7 @@ fn allocate_id(tunnels: &HashMap<u16, Tunnel>, next: &mut u16) -> Result<u16> {
             return Ok(candidate);
         }
     }
-    bail!("没有可用的 tunnel_id")
+    bail!("no tunnel_id is available")
 }
 
 fn is_normal_close(error: &io::Error) -> bool {
@@ -659,7 +676,7 @@ fn is_normal_close(error: &io::Error) -> bool {
 
 fn print_help() {
     println!(
-        "用法:\n  towc\n  towc <tows-host[:port]> [--target <host:port|port>] [--listen <host:port|port>] [--login <手机号|邮箱>]\n\n默认值:\n  tows 端口 4489\n  --target 127.0.0.1:22\n  --listen 127.0.0.1:14489\n  未指定 --login 时使用微信扫码；有效缓存始终优先复用。"
+        "Usage:\n  towc\n  towc <tows-host[:port]> [--target <host:port|port>] [--listen <host:port|port>] [--login <mobile|email>]\n\nDefaults:\n  tows port: 4489\n  --target 127.0.0.1:22\n  --listen 127.0.0.1:14489\n  Without --login, WeChat QR is used; a valid cache is always reused first."
     );
 }
 

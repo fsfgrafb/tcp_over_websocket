@@ -3,7 +3,7 @@ name = "tcp_over_websocket"
 version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"
-description = "通过 SZUT WebVPN 转发任意 TCP 流量"
+description = "Forward arbitrary TCP streams through SZUT WebVPN"
 license = "MIT"
 readme = "README.md"
 

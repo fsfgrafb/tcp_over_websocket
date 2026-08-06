@@ -45,7 +45,7 @@ impl WsWriter {
         self.commands
             .send(WriterCommand::Frame(frame))
             .await
-            .map_err(|_| anyhow!("WebSocket 写任务已经停止"))
+            .map_err(|_| anyhow!("WebSocket writer task has stopped"))
     }
 
     pub async fn register(&self, tunnel_id: u16) -> Result<FlowWriter> {
@@ -53,7 +53,7 @@ impl WsWriter {
         self.commands
             .send(WriterCommand::Register(tunnel_id, receiver))
             .await
-            .map_err(|_| anyhow!("WebSocket 写任务已经停止"))?;
+            .map_err(|_| anyhow!("WebSocket writer task has stopped"))?;
         Ok(FlowWriter {
             sender,
             notify: Arc::clone(&self.notify),
@@ -92,7 +92,7 @@ impl FlowWriter {
         self.enqueue(frame, Some(sent)).await?;
         receiver
             .await
-            .map_err(|_| anyhow!("WebSocket 写任务在发送帧前停止"))
+            .map_err(|_| anyhow!("WebSocket writer stopped before sending the frame"))
     }
 
     async fn enqueue(
@@ -104,7 +104,7 @@ impl FlowWriter {
         let permit = Arc::clone(&self.total_bytes)
             .acquire_many_owned(bytes)
             .await
-            .context("WebSocket 总发送队列已经关闭")?;
+            .context("WebSocket control queue is closed")?;
         self.sender
             .send(QueuedFrame {
                 frame,
@@ -112,7 +112,7 @@ impl FlowWriter {
                 sent,
             })
             .await
-            .map_err(|_| anyhow!("当前隧道的 WebSocket 发送队列已经关闭"))?;
+            .map_err(|_| anyhow!("WebSocket queue for this tunnel is closed"))?;
         self.notify.notify_one();
         Ok(())
     }
@@ -153,7 +153,7 @@ where
                         Ok(queued) => {
                             sink.send(Message::Binary(queued.frame.encode().into()))
                                 .await
-                                .context("发送 WebSocket 数据帧失败")?;
+                                .context("failed to send a WebSocket data frame")?;
                             if let Some(sent) = queued.sent {
                                 let _ = sent.send(());
                             }
@@ -205,7 +205,7 @@ where
         WriterCommand::Frame(frame) => sink
             .send(Message::Binary(frame.encode().into()))
             .await
-            .context("发送 WebSocket 控制帧失败")?,
+            .context("failed to send a WebSocket control frame")?,
         WriterCommand::Register(id, receiver) => {
             flows.insert(id, receiver);
             order.retain(|existing| *existing != id);
@@ -232,7 +232,7 @@ where
         WriterCommand::Raw(message) => sink
             .send(message)
             .await
-            .context("发送 WebSocket 控制消息失败")?,
+            .context("failed to send a WebSocket control message")?,
     }
     Ok(false)
 }

@@ -39,11 +39,11 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        match websocket.next().await.context("WebSocket 提前结束")?? {
+        match websocket.next().await.context("WebSocket ended early")?? {
             Message::Binary(bytes) => return Frame::decode(&bytes),
             Message::Ping(payload) => websocket.send(Message::Pong(payload)).await?,
             Message::Pong(_) => {}
-            other => anyhow::bail!("意外 WebSocket 消息: {other:?}"),
+            other => anyhow::bail!("unexpected WebSocket message: {other:?}"),
         }
     }
 }
@@ -225,7 +225,7 @@ async fn client_rejects_a_different_protocol_version() -> Result<()> {
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("协议版本不匹配"));
+    assert!(error.contains("protocol version mismatch"));
     Ok(())
 }
 
@@ -234,7 +234,10 @@ async fn server_rejects_clients_that_never_send_hello() -> Result<()> {
     let (url, stop) = start_tows().await?;
     let (mut websocket, _) = tokio_tungstenite::connect_async(url).await?;
     let ended = tokio::time::timeout(std::time::Duration::from_secs(6), websocket.next()).await;
-    assert!(ended.is_ok(), "服务端未在 5 秒 HELLO 时限后关闭连接");
+    assert!(
+        ended.is_ok(),
+        "server did not close after the 5-second HELLO deadline"
+    );
     let _ = stop.send(true);
     Ok(())
 }
@@ -295,7 +298,10 @@ async fn bulk_stream_does_not_starve_an_interactive_stream() -> Result<()> {
             bulk_frames += 1;
         }
     }
-    assert!(bulk_frames < 64, "交互流直到大流量全部发送完才得到调度");
+    assert!(
+        bulk_frames < 64,
+        "interactive stream was not scheduled until the bulk stream drained"
+    );
     let _ = stop.send(true);
     Ok(())
 }
