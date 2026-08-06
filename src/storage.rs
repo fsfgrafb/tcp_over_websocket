@@ -8,6 +8,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::{
+    fs::Permissions,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+};
 
 pub const APP_DIRECTORY: &str = "tcp_over_websocket";
 pub const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
@@ -62,8 +67,7 @@ impl BoundedLogWriter {
         let mut line_start = self.line_start.lock().expect("log line mutex poisoned");
         let (bytes, next_line_start) = timestamp_lines(bytes, *line_start);
         let parent = self.path.parent().context("log path has no parent")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+        create_parent_directory(parent)?;
 
         let current_len = fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
         if current_len.saturating_add(bytes.len() as u64) > MAX_LOG_BYTES {
@@ -127,8 +131,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .context("destination file has no parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    create_parent_directory(parent)?;
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -141,9 +144,11 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let temporary = parent.join(format!(".{file_name}.{nonce}.tmp"));
 
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
             .open(&temporary)
             .with_context(|| format!("failed to create temporary file {}", temporary.display()))?;
         file.write_all(contents)
@@ -157,6 +162,21 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn create_parent_directory(parent: &Path) -> Result<()> {
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    #[cfg(unix)]
+    if data_dir().as_deref() == Some(parent) {
+        fs::set_permissions(parent, Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to restrict data directory permissions {}",
+                parent.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -251,5 +271,26 @@ mod tests {
         assert!(lines[1].ends_with(" second"));
         assert_eq!(lines[0].matches("] ").count(), 1);
         assert_eq!(lines[1].matches("] ").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "tow-private-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        atomic_write(&path, b"private").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(path).unwrap();
     }
 }

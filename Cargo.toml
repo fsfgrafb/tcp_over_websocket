@@ -6,6 +6,9 @@ rust-version = "1.85"
 description = "Forward arbitrary TCP streams through SZUT WebVPN"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/fsfgrafb/tcp_over_websocket"
+homepage = "https://github.com/fsfgrafb/tcp_over_websocket"
+documentation = "https://github.com/fsfgrafb/tcp_over_websocket/blob/main/README.md"
 
 [features]
 default = ["client", "server"]

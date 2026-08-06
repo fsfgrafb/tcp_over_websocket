@@ -16,7 +16,6 @@ pub enum FrameType {
     Open = 0x01,
     Data = 0x02,
     Close = 0x03,
-    Ping = 0x04,
     OpenOk = 0x05,
     OpenFail = 0x06,
     HelloAck = 0x07,
@@ -32,7 +31,6 @@ impl TryFrom<u8> for FrameType {
             0x01 => Ok(Self::Open),
             0x02 => Ok(Self::Data),
             0x03 => Ok(Self::Close),
-            0x04 => Ok(Self::Ping),
             0x05 => Ok(Self::OpenOk),
             0x06 => Ok(Self::OpenFail),
             0x07 => Ok(Self::HelloAck),
@@ -140,7 +138,7 @@ impl Frame {
         if handshake_done
             && matches!(
                 self.kind,
-                FrameType::Hello | FrameType::HelloAck | FrameType::Open | FrameType::Ping
+                FrameType::Hello | FrameType::HelloAck | FrameType::Open
             )
         {
             bail!(
@@ -152,10 +150,7 @@ impl Frame {
     }
 
     fn validate_shape(&self) -> Result<()> {
-        let connection_level = matches!(
-            self.kind,
-            FrameType::Hello | FrameType::HelloAck | FrameType::Ping
-        );
+        let connection_level = matches!(self.kind, FrameType::Hello | FrameType::HelloAck);
         if connection_level && self.tunnel_id != 0 {
             bail!("connection-level frames must use tunnel_id 0");
         }
@@ -187,7 +182,7 @@ impl Frame {
                 std::str::from_utf8(&self.payload)
                     .map_err(|_| anyhow!("OPEN_FAIL text is not valid UTF-8"))?;
             }
-            FrameType::Close | FrameType::Ping | FrameType::OpenOk | FrameType::Eof => {
+            FrameType::Close | FrameType::OpenOk | FrameType::Eof => {
                 if !self.payload.is_empty() {
                     bail!("{:?} frame payload must be empty", self.kind);
                 }

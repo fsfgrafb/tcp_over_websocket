@@ -4,7 +4,7 @@
 
 ## 连接握手
 
-客户端建立 WebSocket 后必须先发送 Binary HELLO；服务端最多等待 5 秒并回复 Binary HELLO_ACK。双方比较协议版本，当前 `PROTOCOL_VERSION = 2`。
+客户端建立 WebSocket 后必须先发送 Binary HELLO；服务端最多等待 5 秒并回复 Binary HELLO_ACK。双方记录对端协议版本，版本不一致时写入警告日志但继续连接；当前 `PROTOCOL_VERSION = 2`。
 
 HELLO 或 HELLO_ACK 的 payload 为：
 
@@ -12,7 +12,7 @@ HELLO 或 HELLO_ACK 的 payload 为：
 [2B protocol_version, big-endian][non-empty UTF-8 program name]
 ```
 
-握手超时、消息类型错误或协议版本不同都会终止整条连接。
+握手超时或消息类型错误会终止整条连接。版本号用于诊断，不参与兼容性分支。
 
 ## 帧格式
 
@@ -30,7 +30,7 @@ HELLO 或 HELLO_ACK 的 payload 为：
 | `0x01` | OPEN | towc → tows | UTF-8 目标地址 |
 | `0x02` | DATA | 双向 | TCP 数据 |
 | `0x03` | CLOSE | 双向 | 空 |
-| `0x04` | PING | towc → tows | 空 |
+| `0x04` | 保留 | — | 不得发送 |
 | `0x05` | OPEN_OK | tows → towc | 空 |
 | `0x06` | OPEN_FAIL | tows → towc | UTF-8 错误原因 |
 | `0x07` | HELLO_ACK | tows → towc | 协议版本和程序名 |
@@ -54,7 +54,7 @@ GUI 热禁用一条隧道时，会停止该规则的本地监听并向其所有�
 
 ## 心跳与背压
 
-客户端在每条 WebSocket 上每 60 秒独立发送一条 PING。PING 只维持空闲连接，不要求响应；断线由 WebSocket close 或读写错误判定。同一客户端可以同时连接多个 tows，每条连接的握手、PING、流编号空间、背压和故障范围互相独立。
+客户端在每条 WebSocket 上按配置间隔独立发送标准 WebSocket Ping，并要求在下一次 Ping 前收到 WebSocket Pong；超时、WebSocket close 或读写错误都会判定连接断开。同一客户端可以同时连接多个 tows，每条连接的握手、心跳、流编号空间、背压和故障范围互相独立。
 
 WebVPN Cookie 刷新不属于本协议。客户端会话共享一个 Cookie，并每 10 分钟执行一次刷新；单条 WebSocket 断开只终止它承载的隧道，Cookie 刷新失败则终止使用该会话的全部连接。
 

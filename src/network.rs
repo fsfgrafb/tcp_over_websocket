@@ -30,6 +30,8 @@ pub const WEBVPN_HOST: &str = "webvpn.szut.edu.cn";
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "client")]
+const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(feature = "client")]
 const WEBVPN_AES_KEY: &[u8; 16] = b"wrdvpnisthebest!";
 #[cfg(feature = "client")]
 const WEBVPN_ENCRYPTED_PREFIX: &str = "77726476706e69737468656265737421";
@@ -117,7 +119,12 @@ pub async fn connect_websocket(
         })?,
     );
 
-    match connect_async(request).await {
+    let connected = tokio::time::timeout(WEBSOCKET_CONNECT_TIMEOUT, connect_async(request))
+        .await
+        .map_err(|_| {
+            ConnectFailure::Other(anyhow!("WebSocket connection timed out after 15 seconds"))
+        })?;
+    match connected {
         Ok((websocket, _)) => Ok(websocket),
         Err(WebSocketError::Http(response)) => {
             let location = response
@@ -174,9 +181,7 @@ where
     ack.validate_server_to_client(false)?;
     let (version, server_program) = ack.version()?;
     if version != PROTOCOL_VERSION {
-        return Err(anyhow!(
-            "protocol version mismatch: client v{PROTOCOL_VERSION}, server v{version} ({server_program})"
-        ));
+        tracing::warn!(target: "towc", "protocol version differs: towc v{PROTOCOL_VERSION}, peer v{version} ({server_program}); continuing");
     }
     tracing::info!(target: "tunnel", "protocol handshake complete; peer={server_program}");
     Ok(())
@@ -197,6 +202,9 @@ where
     let hello = Frame::decode(&bytes)?;
     hello.validate_client_to_server(false)?;
     let (version, client_program) = hello.version()?;
+    if version != PROTOCOL_VERSION {
+        tracing::warn!(target: "tows", "protocol version differs: tows v{PROTOCOL_VERSION}, peer v{version} ({client_program}); continuing");
+    }
     websocket
         .send(Message::Binary(Frame::hello_ack(program)?.encode().into()))
         .await

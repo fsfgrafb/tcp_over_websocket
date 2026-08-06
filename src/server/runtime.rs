@@ -3,11 +3,12 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -18,6 +19,8 @@ use crate::protocol::{Frame, FrameType, MAX_DATA_LEN, MAX_TUNNELS};
 use crate::{APP_VERSION, init_tracing};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CLIENT_CONNECTIONS: usize = 1024;
 const TCP_QUEUE_FRAMES: usize = 16;
 const HTTP_PROBE_RESPONSE: &[u8] =
     b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -57,6 +60,7 @@ pub async fn run_cli() -> Result<()> {
 
 /// 在给定监听器上运行服务端。公开此入口以便不接触 WebVPN 的本地集成测试。
 pub async fn serve(listener: TcpListener, mut stop: watch::Receiver<bool>) -> Result<()> {
+    let connection_slots = Arc::new(Semaphore::new(MAX_CLIENT_CONNECTIONS));
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -67,7 +71,13 @@ pub async fn serve(listener: TcpListener, mut stop: watch::Receiver<bool>) -> Re
             }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("failed to accept connection")?;
+                let Ok(slot) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                    tracing::warn!(target: "tows", "connection limit reached; rejecting {peer}");
+                    drop(stream);
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _slot = slot;
                     if let Err(error) = handle_connection(stream, peer).await {
                         tracing::warn!(target: "tunnel", "connection {peer} ended: {error:#}");
                     }
@@ -78,13 +88,18 @@ pub async fn serve(listener: TcpListener, mut stop: watch::Receiver<bool>) -> Re
 }
 
 async fn handle_connection(mut stream: TcpStream, peer: SocketAddr) -> Result<()> {
-    if !is_websocket_upgrade(&stream).await? {
+    let is_upgrade = tokio::time::timeout(UPGRADE_TIMEOUT, is_websocket_upgrade(&stream))
+        .await
+        .map_err(|_| anyhow!("timed out waiting for an HTTP request"))??;
+    if !is_upgrade {
         stream.write_all(HTTP_PROBE_RESPONSE).await?;
         stream.shutdown().await?;
         return Ok(());
     }
 
-    let (mut websocket, path) = accept_websocket(stream).await?;
+    let (mut websocket, path) = tokio::time::timeout(UPGRADE_TIMEOUT, accept_websocket(stream))
+        .await
+        .map_err(|_| anyhow!("timed out waiting for a WebSocket upgrade"))??;
     let version = server_handshake(&mut websocket, &format!("tows {APP_VERSION}")).await?;
     tracing::info!(target: "tunnel", "peer={peer} path={path} protocol=v{version}");
 
@@ -256,11 +271,13 @@ async fn handle_frame(
         }
         FrameType::Close => {
             if tunnels.contains_key(&frame.tunnel_id) {
+                writer
+                    .send_and_remove(Frame::new(FrameType::Close, frame.tunnel_id, Vec::new())?)
+                    .await?;
                 remove_tunnel(frame.tunnel_id, writer, tunnels).await;
             }
             Ok(())
         }
-        FrameType::Ping => Ok(()),
         _ => bail!("client sent a disallowed {:?} frame", frame.kind),
     }
 }

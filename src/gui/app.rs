@@ -1054,20 +1054,20 @@ impl eframe::App for TowcApp {
         let old_theme = self.theme;
         egui::CentralPanel::default().show(context, |ui| {
             egui::TopBottomPanel::bottom("fixed-bottom-actions")
-                .exact_height(48.0)
+                .exact_height(52.0)
                 .resizable(false)
                 .show_separator_line(true)
                 .frame(
                     egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin {
                         left: 0,
                         right: 0,
-                        top: 2,
-                        bottom: 0,
+                        top: 4,
+                        bottom: 4,
                     }),
                 )
                 .show_inside(ui, |ui| {
                     ui.with_layout(
-                        egui::Layout::left_to_right(egui::Align::Max),
+                        egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                         if ui.button("＋ 添加连接").clicked() {
                             self.open_new_connection_editor();
@@ -1787,13 +1787,11 @@ impl eframe::App for TowcApp {
                                                 } else {
                                                     "disabled"
                                                 });
-                                            let color = if !name_valid {
-                                                egui::Color32::from_rgb(225, 72, 72)
-                                            } else if !target_valid {
-                                                egui::Color32::from_rgb(225, 72, 72)
-                                            } else if !listen_valid {
-                                                egui::Color32::from_rgb(225, 72, 72)
-                                            } else if conflicts.contains(&tunnel.name) {
+                                            let color = if !name_valid
+                                                || !target_valid
+                                                || !listen_valid
+                                                || conflicts.contains(&tunnel.name)
+                                            {
                                                 egui::Color32::from_rgb(225, 72, 72)
                                             } else if parse_listen(&tunnel.listen)
                                                 .is_ok_and(|listen| !listen.is_loopback())
@@ -1865,10 +1863,10 @@ impl eframe::App for TowcApp {
                     if edit_changed && self.editing_snapshot.is_none() {
                         self.editing_snapshot = Some(frame_config.clone());
                     }
-                    if edit_finished {
-                        if let Some(previous) = self.editing_snapshot.take()
-                            && previous != self.config
-                        {
+                    if edit_finished
+                        && let Some(previous) = self.editing_snapshot.take()
+                        && previous != self.config
+                    {
                             let selected_before = self.export_selected.clone();
                             if self.apply_config_change(
                                 previous.clone(),
@@ -1886,7 +1884,6 @@ impl eframe::App for TowcApp {
                             } else {
                                 self.tunnel_edits = tunnel_edits(&self.config);
                             }
-                        }
                     }
                     if let Some((index, enabled)) = toggle {
                         self.set_tunnel_enabled(index, enabled);
@@ -2670,44 +2667,6 @@ fn colored_log_line(ui: &mut egui::Ui, line: &str) {
     ui.add(egui::Label::new(job).wrap());
 }
 
-#[cfg(test)]
-mod log_tests {
-    use super::{localize_log_line, updates_tunnel_state};
-
-    #[test]
-    fn unicode_tunnel_names_are_preserved() {
-        assert_eq!(localize_log_line("[隧道 4] disabled"), "[隧道 4] 已禁用");
-        assert!(!localize_log_line("[隧道 4] 已启用").contains("\\u{"));
-    }
-
-    #[test]
-    fn common_runtime_messages_are_localized() {
-        assert_eq!(
-            localize_log_line("[towc] connected to tows 10.18.47.77:4489"),
-            "[towc] 已连接 tows 10.18.47.77:4489"
-        );
-        assert_eq!(
-            localize_log_line("[towc] WebVPN cookie refreshed"),
-            "[towc] WebVPN 凭据已刷新"
-        );
-    }
-
-    #[test]
-    fn stream_activity_does_not_replace_tunnel_health() {
-        assert!(updates_tunnel_state(
-            "ready: 127.0.0.1:14489 -> 10.18.47.77:4489 -> 127.0.0.1:80"
-        ));
-        assert!(updates_tunnel_state(
-            "tows 10.18.47.77:4489 failed: WebSocket disconnected"
-        ));
-        assert!(!updates_tunnel_state("stream 1 established"));
-        assert!(!updates_tunnel_state("bidirectional EOF"));
-        assert!(!updates_tunnel_state(
-            "open failed: target service refused the connection"
-        ));
-    }
-}
-
 fn apply_gui_style(context: &egui::Context) {
     context.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
@@ -3024,5 +2983,43 @@ fn install_chinese_font(context: &egui::Context) {
         }
         context.set_fonts(fonts);
         return;
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::{localize_log_line, updates_tunnel_state};
+
+    #[test]
+    fn unicode_tunnel_names_are_preserved() {
+        assert_eq!(localize_log_line("[隧道 4] disabled"), "[隧道 4] 已禁用");
+        assert!(!localize_log_line("[隧道 4] 已启用").contains("\\u{"));
+    }
+
+    #[test]
+    fn common_runtime_messages_are_localized() {
+        assert_eq!(
+            localize_log_line("[towc] connected to tows 10.18.47.77:4489"),
+            "[towc] 已连接 tows 10.18.47.77:4489"
+        );
+        assert_eq!(
+            localize_log_line("[towc] WebVPN cookie refreshed"),
+            "[towc] WebVPN 凭据已刷新"
+        );
+    }
+
+    #[test]
+    fn stream_activity_does_not_replace_tunnel_health() {
+        assert!(updates_tunnel_state(
+            "ready: 127.0.0.1:14489 -> 10.18.47.77:4489 -> 127.0.0.1:80"
+        ));
+        assert!(updates_tunnel_state(
+            "tows 10.18.47.77:4489 failed: WebSocket disconnected"
+        ));
+        assert!(!updates_tunnel_state("stream 1 established"));
+        assert!(!updates_tunnel_state("bidirectional EOF"));
+        assert!(!updates_tunnel_state(
+            "open failed: target service refused the connection"
+        ));
     }
 }

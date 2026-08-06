@@ -544,15 +544,18 @@ fn spawn_dynamic_group(
     let traffic = Arc::clone(traffic);
     tasks.spawn(async move {
         let status_rules = rules_rx.clone();
-        let result = run_dynamic_tunnels_to_url(
-            group.url,
-            server.clone(),
+        let result = run_controlled_tunnels_to_url(
+            ControlledTunnelContext {
+                url: group.url,
+                server: server.clone(),
+                heartbeat_interval,
+                cookie,
+                observer: Arc::clone(&group_observer),
+                traffic: Some(traffic),
+            },
             rules_rx,
-            heartbeat_interval,
-            cookie,
+            true,
             stop_rx,
-            Arc::clone(&group_observer),
-            traffic,
         )
         .await;
         if let Err(error) = &result {
@@ -599,56 +602,46 @@ async fn run_tunnels_to_url(
 ) -> Result<()> {
     let (rules_tx, rules_rx) = watch::channel(rules);
     let result = run_controlled_tunnels_to_url(
-        url,
-        server,
+        ControlledTunnelContext {
+            url,
+            server,
+            heartbeat_interval,
+            cookie,
+            observer,
+            traffic: None,
+        },
         rules_rx,
         false,
-        heartbeat_interval,
-        cookie,
         stop,
-        observer,
-        None,
     )
     .await;
     drop(rules_tx);
     result
 }
 
-async fn run_dynamic_tunnels_to_url(
+struct ControlledTunnelContext {
     url: String,
     server: Endpoint,
-    rules: watch::Receiver<Vec<ForwardRule>>,
     heartbeat_interval: Duration,
     cookie: SessionCookie,
-    stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
-    traffic: Arc<TrafficCounters>,
-) -> Result<()> {
-    run_controlled_tunnels_to_url(
-        url,
-        server,
-        rules,
-        true,
-        heartbeat_interval,
-        cookie,
-        stop,
-        observer,
-        Some(traffic),
-    )
-    .await
+    traffic: Option<Arc<TrafficCounters>>,
 }
 
 async fn run_controlled_tunnels_to_url(
-    url: String,
-    server: Endpoint,
+    context: ControlledTunnelContext,
     mut rules: watch::Receiver<Vec<ForwardRule>>,
     dynamic: bool,
-    heartbeat_interval: Duration,
-    cookie: SessionCookie,
     mut stop: watch::Receiver<bool>,
-    observer: Arc<dyn ClientObserver>,
-    traffic: Option<Arc<TrafficCounters>>,
 ) -> Result<()> {
+    let ControlledTunnelContext {
+        url,
+        server,
+        heartbeat_interval,
+        cookie,
+        observer,
+        traffic,
+    } = context;
     // 登录完成后先绑定全部端口；任何冲突都在建立 WS 前清晰报出。
     let mut listeners = Vec::new();
     let initial_rules = rules.borrow().clone();

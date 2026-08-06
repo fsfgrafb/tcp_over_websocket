@@ -155,6 +155,32 @@ async fn open_failure_does_not_break_an_existing_stream() -> Result<()> {
 }
 
 #[tokio::test]
+async fn server_acknowledges_a_client_initiated_close() -> Result<()> {
+    let target = start_echo_server().await?;
+    let (url, stop) = start_tows().await?;
+    let mut websocket = connect_client(&url).await?;
+    websocket
+        .send(Message::Binary(
+            Frame::new(FrameType::Open, 17, target.into_bytes())?
+                .encode()
+                .into(),
+        ))
+        .await?;
+    assert_eq!(next_frame(&mut websocket).await?.kind, FrameType::OpenOk);
+    websocket
+        .send(Message::Binary(
+            Frame::new(FrameType::Close, 17, Vec::new())?
+                .encode()
+                .into(),
+        ))
+        .await?;
+    let closed = next_frame(&mut websocket).await?;
+    assert_eq!((closed.kind, closed.tunnel_id), (FrameType::Close, 17));
+    let _ = stop.send(true);
+    Ok(())
+}
+
+#[tokio::test]
 async fn eof_half_close_keeps_the_reverse_direction_readable() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let target = listener.local_addr()?.to_string();
@@ -205,7 +231,7 @@ async fn eof_half_close_keeps_the_reverse_direction_readable() -> Result<()> {
 }
 
 #[tokio::test]
-async fn client_rejects_a_different_protocol_version() -> Result<()> {
+async fn client_logs_and_accepts_a_different_protocol_version() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     tokio::spawn(async move {
@@ -221,11 +247,32 @@ async fn client_rejects_a_different_protocol_version() -> Result<()> {
             .unwrap();
     });
     let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/")).await?;
-    let error = tcp_over_websocket::network::client_handshake(&mut websocket, "test-client")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("protocol version mismatch"));
+    tcp_over_websocket::network::client_handshake(&mut websocket, "test-client").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_logs_and_accepts_a_different_protocol_version() -> Result<()> {
+    let target = start_echo_server().await?;
+    let (url, stop) = start_tows().await?;
+    let (mut websocket, _) = tokio_tungstenite::connect_async(url).await?;
+    let mut payload = 99_u16.to_be_bytes().to_vec();
+    payload.extend_from_slice(b"future-client");
+    websocket
+        .send(Message::Binary(
+            Frame::new(FrameType::Hello, 0, payload)?.encode().into(),
+        ))
+        .await?;
+    assert_eq!(next_frame(&mut websocket).await?.kind, FrameType::HelloAck);
+    websocket
+        .send(Message::Binary(
+            Frame::new(FrameType::Open, 23, target.into_bytes())?
+                .encode()
+                .into(),
+        ))
+        .await?;
+    assert_eq!(next_frame(&mut websocket).await?.kind, FrameType::OpenOk);
+    let _ = stop.send(true);
     Ok(())
 }
 

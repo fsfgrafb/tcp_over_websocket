@@ -25,6 +25,7 @@ const COOKIE_FILE: &str = "webvpn.cookie";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36";
 const RSA_CHUNK_SIZE: usize = 62;
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginPreference {
@@ -132,6 +133,7 @@ fn login_client(jar: Arc<reqwest::cookie::Jar>) -> Result<Client> {
         .cookie_provider(jar)
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::limited(12))
+        .timeout(HTTP_REQUEST_TIMEOUT)
         .build()
         .context("failed to create WebVPN login client")
 }
@@ -396,6 +398,7 @@ async fn validate_protected_session(cookie: &SessionCookie) -> bool {
         .cookie_provider(jar)
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(HTTP_REQUEST_TIMEOUT)
         .build()
     else {
         return false;
@@ -457,6 +460,17 @@ fn valid_ticket_format(cookie: &str) -> bool {
 
 fn read_cached_ticket() -> Option<String> {
     let path = data_file(COOKIE_FILE)?;
+    #[cfg(unix)]
+    if path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = path.parent()?;
+        if let Err(error) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(0o600)))
+        {
+            tracing::warn!(target: "towc", "could not restrict WebVPN cookie cache permissions; signing in again: {error}");
+            return None;
+        }
+    }
     match fs::read_to_string(path) {
         Ok(value) if valid_ticket_format(value.trim()) => Some(value.trim().to_string()),
         Ok(_) => None,
