@@ -1,0 +1,97 @@
+[package]
+name = "tcp_over_websocket"
+version = "0.5.1"
+edition = "2024"
+rust-version = "1.95"
+description = "Forward arbitrary TCP streams through SZUT WebVPN"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/fsfgrafb/tcp_over_websocket"
+homepage = "https://github.com/fsfgrafb/tcp_over_websocket"
+documentation = "https://github.com/fsfgrafb/tcp_over_websocket/blob/main/README.md"
+
+[features]
+default = ["client", "server"]
+client = [
+    "dep:aes",
+    "dep:image",
+    "dep:num-bigint",
+    "dep:reqwest",
+    "dep:rustls",
+    "tokio-tungstenite/connect",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
+]
+server = []
+gui = ["client", "dep:eframe", "dep:rfd"]
+
+[dependencies]
+anyhow = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+aes = { version = "0.9", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"], optional = true }
+num-bigint = { version = "0.5", optional = true }
+reqwest = { version = "0.13", default-features = false, features = [
+    "cookies",
+    "form",
+    "json",
+    "rustls",
+], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+], optional = true }
+rfd = { version = "0.17", optional = true }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+] }
+
+[[bin]]
+name = "towc"
+path = "src/bin/towc.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "tows"
+path = "src/bin/tows.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "towc_gui"
+path = "src/bin/towc_gui.rs"
+required-features = ["gui"]
+
+[[test]]
+name = "multiplex_integration"
+path = "tests/multiplex_integration.rs"
+required-features = ["server"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
