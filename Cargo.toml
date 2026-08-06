@@ -1,0 +1,80 @@
+[package]
+name = "tcp_over_websocket"
+version = "0.5.1"
+edition = "2024"
+rust-version = "1.85"
+description = "通过 SZUT WebVPN 转发任意 TCP 流量"
+license = "MIT"
+readme = "README.md"
+
+[features]
+default = ["client", "server"]
+client = [
+    "dep:aes",
+    "dep:image",
+    "dep:num-bigint",
+    "dep:reqwest",
+    "dep:rustls",
+    "tokio-tungstenite/connect",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
+]
+server = []
+gui = ["client", "dep:eframe"]
+
+[dependencies]
+anyhow = "1"
+futures-util = { version = "0.3", features = ["sink"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+aes = { version = "0.8", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+num-bigint = { version = "0.4", optional = true }
+reqwest = { version = "0.12", default-features = false, features = [
+    "cookies",
+    "json",
+    "rustls-tls",
+], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.32.3", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+], optional = true }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[[bin]]
+name = "towc"
+path = "src/bin/towc.rs"
+required-features = ["client"]
+
+[[bin]]
+name = "tows"
+path = "src/bin/tows.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "towc_gui"
+path = "src/bin/towc_gui.rs"
+required-features = ["gui"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
