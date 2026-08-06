@@ -981,14 +981,6 @@ async fn handle_frame(
     traffic: &Option<Arc<TrafficCounters>>,
 ) -> Result<()> {
     if retired_ids.contains(&frame.tunnel_id) {
-        if matches!(frame.kind, FrameType::Data | FrameType::Eof | FrameType::Close) {
-            tracing::info!(
-                target: "towc",
-                "diagnostic: received {:?} for retired stream {}",
-                frame.kind,
-                frame.tunnel_id
-            );
-        }
         match frame.kind {
             FrameType::Close | FrameType::OpenFail => {
                 retired_ids.remove(&frame.tunnel_id);
@@ -1002,19 +994,6 @@ async fn handle_frame(
             _ => bail!("server sent a disallowed {:?} frame", frame.kind),
         }
         return Ok(());
-    }
-    if matches!(frame.kind, FrameType::Data | FrameType::Eof)
-        && !tunnels.contains_key(&frame.tunnel_id)
-    {
-        let mut active_ids = tunnels.keys().copied().collect::<Vec<_>>();
-        active_ids.sort_unstable();
-        let mut retired_ids = retired_ids.iter().copied().collect::<Vec<_>>();
-        retired_ids.sort_unstable();
-        bail!(
-            "{:?} frame refers to unknown tunnel_id {}; active_ids={active_ids:?}; retired_ids={retired_ids:?}",
-            frame.kind,
-            frame.tunnel_id
-        );
     }
     match frame.kind {
         FrameType::OpenOk => {
@@ -1046,7 +1025,7 @@ async fn handle_frame(
             Ok(())
         }
         FrameType::OpenFail => {
-            let Some(Tunnel::Opening(opening)) = tunnels.remove(&frame.tunnel_id) else {
+            let Some(opening) = remove_opening_tunnel(tunnels, frame.tunnel_id) else {
                 bail!(
                     "OPEN_FAIL refers to unknown or non-opening stream {}",
                     frame.tunnel_id
@@ -1078,11 +1057,6 @@ async fn handle_frame(
             Ok(())
         }
         FrameType::Eof => {
-            tracing::info!(
-                target: "towc",
-                "diagnostic: received EOF for active stream {}",
-                frame.tunnel_id
-            );
             let tunnel = open_tunnel_mut(tunnels, frame.tunnel_id)?;
             if tunnel.remote_eof_seen {
                 bail!("stream {} received duplicate EOF", frame.tunnel_id);
@@ -1097,12 +1071,6 @@ async fn handle_frame(
             maybe_finish(frame.tunnel_id, writer, observer, tunnels, retired_ids).await
         }
         FrameType::Close => {
-            tracing::info!(
-                target: "towc",
-                "diagnostic: received CLOSE for stream {}; active={}",
-                frame.tunnel_id,
-                tunnels.contains_key(&frame.tunnel_id)
-            );
             if tunnels.contains_key(&frame.tunnel_id) {
                 remove_tunnel(frame.tunnel_id, writer, observer, tunnels, "peer closed").await;
             }
@@ -1122,7 +1090,7 @@ async fn handle_tunnel_event(
 ) -> Result<()> {
     match event {
         TunnelEvent::OpenTimeout(id) => {
-            if let Some(Tunnel::Opening(opening)) = tunnels.remove(&id) {
+            if let Some(opening) = remove_opening_tunnel(tunnels, id) {
                 observer.tunnel_status(&opening.name, "OPEN timed out after 15 seconds");
                 writer
                     .send(Frame::new(FrameType::Close, id, Vec::new())?)
@@ -1144,10 +1112,6 @@ async fn handle_tunnel_event(
         }
         TunnelEvent::TcpError(id, reason) => {
             if tunnels.contains_key(&id) {
-                tracing::info!(
-                    target: "towc",
-                    "diagnostic: sending CLOSE for stream {id} after local TCP error: {reason}"
-                );
                 writer
                     .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
@@ -1204,10 +1168,6 @@ async fn read_tcp(
                 let eof =
                     Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
-                    tracing::info!(
-                        target: "towc",
-                        "diagnostic: sent EOF for stream {id} after local TCP EOF"
-                    );
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
                 return;
@@ -1226,10 +1186,6 @@ async fn read_tcp(
                 let eof =
                     Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
-                    tracing::info!(
-                        target: "towc",
-                        "diagnostic: sent EOF for stream {id} after normal local TCP close"
-                    );
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
                 return;
@@ -1282,6 +1238,16 @@ fn open_tunnel_mut(tunnels: &mut HashMap<u16, Tunnel>, id: u16) -> Result<&mut O
     }
 }
 
+fn remove_opening_tunnel(tunnels: &mut HashMap<u16, Tunnel>, id: u16) -> Option<OpeningTunnel> {
+    if !matches!(tunnels.get(&id), Some(Tunnel::Opening(_))) {
+        return None;
+    }
+    match tunnels.remove(&id) {
+        Some(Tunnel::Opening(opening)) => Some(opening),
+        _ => unreachable!("tunnel state changed without releasing the mutable map reference"),
+    }
+}
+
 async fn maybe_finish(
     id: u16,
     writer: &WsWriter,
@@ -1295,10 +1261,6 @@ async fn maybe_finish(
             if tunnel.local_eof_sent && tunnel.remote_eof_seen && tunnel.tcp_writer_done
     );
     if finished {
-        tracing::info!(
-            target: "towc",
-            "diagnostic: sending CLOSE for stream {id} after bidirectional EOF"
-        );
         writer
             .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
@@ -1316,15 +1278,6 @@ async fn remove_tunnel(
     reason: &str,
 ) {
     if let Some(tunnel) = tunnels.remove(&id) {
-        let name = match &tunnel {
-            Tunnel::Opening(opening) => opening.name.as_str(),
-            Tunnel::Open(open) => open.name.as_str(),
-        };
-        tracing::info!(
-            target: "towc",
-            "diagnostic: removed stream {id} <{name}>; reason={}",
-            if reason.is_empty() { "unspecified" } else { reason }
-        );
         match tunnel {
             Tunnel::Opening(opening) => {
                 if !reason.is_empty() {
@@ -1361,10 +1314,6 @@ async fn close_named(
         })
         .collect::<Vec<_>>();
     for id in ids {
-        tracing::info!(
-            target: "towc",
-            "diagnostic: sending CLOSE for stream {id} after configuration change"
-        );
         writer
             .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
@@ -1464,6 +1413,45 @@ mod tests {
         assert_eq!(allocate_id(&tunnels, &retired_ids, &mut next).unwrap(), 2);
         next = u16::MAX;
         assert_eq!(allocate_id(&tunnels, &retired_ids, &mut next).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn open_timeout_only_removes_a_stream_that_is_still_opening() {
+        let (tcp_sender, _tcp_receiver) = mpsc::channel(1);
+        let reader_task = tokio::spawn(std::future::pending::<()>());
+        let writer_task = tokio::spawn(std::future::pending::<()>());
+        let mut tunnels = HashMap::from([(
+            1,
+            Tunnel::Open(OpenTunnel {
+                name: "established".to_string(),
+                tcp_sender,
+                reader_task,
+                writer_task,
+                local_eof_sent: false,
+                remote_eof_seen: false,
+                tcp_writer_done: false,
+            }),
+        )]);
+
+        assert!(remove_opening_tunnel(&mut tunnels, 1).is_none());
+        assert!(matches!(tunnels.get(&1), Some(Tunnel::Open(_))));
+
+        tunnels.insert(
+            2,
+            Tunnel::Opening(OpeningTunnel {
+                stream: None,
+                name: "opening".to_string(),
+            }),
+        );
+        assert_eq!(
+            remove_opening_tunnel(&mut tunnels, 2).map(|opening| opening.name),
+            Some("opening".to_string())
+        );
+
+        if let Some(Tunnel::Open(open)) = tunnels.remove(&1) {
+            open.reader_task.abort();
+            open.writer_task.abort();
+        }
     }
 
     #[test]

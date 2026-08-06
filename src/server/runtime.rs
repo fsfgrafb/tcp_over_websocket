@@ -184,17 +184,6 @@ async fn handle_frame(
     events: &mpsc::Sender<TunnelEvent>,
     tunnels: &mut HashMap<u16, Tunnel>,
 ) -> Result<()> {
-    if matches!(frame.kind, FrameType::Data | FrameType::Eof)
-        && !tunnels.contains_key(&frame.tunnel_id)
-    {
-        let mut active_ids = tunnels.keys().copied().collect::<Vec<_>>();
-        active_ids.sort_unstable();
-        bail!(
-            "{:?} frame refers to unknown tunnel_id {}; active_ids={active_ids:?}",
-            frame.kind,
-            frame.tunnel_id
-        );
-    }
     match frame.kind {
         FrameType::Open => {
             if tunnels.contains_key(&frame.tunnel_id) {
@@ -253,11 +242,6 @@ async fn handle_frame(
                 .map_err(|_| anyhow!("TCP writer for tunnel {} has stopped", frame.tunnel_id))
         }
         FrameType::Eof => {
-            tracing::info!(
-                target: "tunnel",
-                "diagnostic: received EOF for active tunnel {}",
-                frame.tunnel_id
-            );
             let tunnel = open_tunnel_mut(tunnels, frame.tunnel_id)?;
             if tunnel.remote_eof_seen {
                 bail!("tunnel {} received duplicate EOF", frame.tunnel_id);
@@ -271,12 +255,6 @@ async fn handle_frame(
             maybe_finish(frame.tunnel_id, writer, tunnels).await
         }
         FrameType::Close => {
-            tracing::info!(
-                target: "tunnel",
-                "diagnostic: received CLOSE for tunnel {}; active={}",
-                frame.tunnel_id,
-                tunnels.contains_key(&frame.tunnel_id)
-            );
             if tunnels.contains_key(&frame.tunnel_id) {
                 remove_tunnel(frame.tunnel_id, writer, tunnels).await;
             }
@@ -333,10 +311,6 @@ async fn handle_tunnel_event(
         TunnelEvent::TcpError(id, reason) => {
             tracing::warn!(target: "tunnel", "tunnel {id} TCP error: {reason}");
             if tunnels.contains_key(&id) {
-                tracing::info!(
-                    target: "tunnel",
-                    "diagnostic: sending CLOSE for tunnel {id} after target TCP error"
-                );
                 writer
                     .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
@@ -381,10 +355,6 @@ async fn read_tcp(
                 let eof =
                     Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
-                    tracing::info!(
-                        target: "tunnel",
-                        "diagnostic: sent EOF for tunnel {id} after target TCP EOF"
-                    );
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
                 return;
@@ -400,10 +370,6 @@ async fn read_tcp(
                 let eof =
                     Frame::new(FrameType::Eof, id, Vec::new()).expect("static EOF frame is valid");
                 if flow.send_flushed(eof).await.is_ok() {
-                    tracing::info!(
-                        target: "tunnel",
-                        "diagnostic: sent EOF for tunnel {id} after normal target TCP close"
-                    );
                     let _ = events.send(TunnelEvent::LocalEof(id)).await;
                 }
                 return;
@@ -463,10 +429,6 @@ async fn maybe_finish(
             if tunnel.local_eof_sent && tunnel.remote_eof_seen && tunnel.tcp_writer_done
     );
     if finished {
-        tracing::info!(
-            target: "tunnel",
-            "diagnostic: sending CLOSE for tunnel {id} after bidirectional EOF"
-        );
         writer
             .send_and_remove(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
@@ -476,19 +438,9 @@ async fn maybe_finish(
 }
 
 async fn remove_tunnel(id: u16, writer: &WsWriter, tunnels: &mut HashMap<u16, Tunnel>) {
-    if let Some(tunnel) = tunnels.remove(&id) {
-        let state = match &tunnel {
-            Tunnel::Opening => "opening",
-            Tunnel::Open(_) => "open",
-        };
-        tracing::info!(
-            target: "tunnel",
-            "diagnostic: removed tunnel {id}; previous_state={state}"
-        );
-        if let Tunnel::Open(tunnel) = tunnel {
-            tunnel.reader_task.abort();
-            tunnel.writer_task.abort();
-        }
+    if let Some(Tunnel::Open(tunnel)) = tunnels.remove(&id) {
+        tunnel.reader_task.abort();
+        tunnel.writer_task.abort();
     }
     writer.remove(id).await;
 }
