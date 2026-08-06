@@ -50,6 +50,8 @@ HELLO 或 HELLO_ACK 的 payload 为：
 
 读到本地 TCP EOF 时发送 EOF。收到 EOF 后执行 TCP 写方向 shutdown，但继续读取反方向数据。双方 EOF 完成且排队数据写完后发送 CLOSE；TCP 错误则立即发送 CLOSE。WebSocket 断开时释放其全部 TCP 流。
 
+GUI 热禁用一条隧道时，会停止该规则的本地监听并向其所有活动 tunnel_id 发送 CLOSE。本地主动关闭的 ID 在收到对端终止帧前不会复用；已在途的 OPEN_OK、DATA 或 EOF 会被丢弃，避免单条隧道的关闭竞态升级为连接级协议错误。
+
 ## 心跳与背压
 
 客户端在每条 WebSocket 上每 60 秒独立发送一条 PING。PING 只维持空闲连接，不要求响应；断线由 WebSocket close 或读写错误判定。同一客户端可以同时连接多个 tows，每条连接的握手、PING、流编号空间、背压和故障范围互相独立。

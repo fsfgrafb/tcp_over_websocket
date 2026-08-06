@@ -127,6 +127,19 @@ pub fn save_default_config(config: &GuiConfig) -> Result<()> {
     write_json(&path, config)
 }
 
+pub fn export_path() -> Option<PathBuf> {
+    data_file("tunnels-export.json")
+}
+
+pub fn export_tunnels(path: &Path, tunnels: Vec<TunnelConfig>) -> Result<()> {
+    if tunnels.is_empty() {
+        bail!("至少选择一条隧道才能导出");
+    }
+    let config = GuiConfig { tunnels };
+    validate_config(&config)?;
+    write_json(path, &config)
+}
+
 pub fn parse_config(contents: &[u8]) -> Result<GuiConfig> {
     let mut config: GuiConfig = serde_json::from_slice(contents).context("JSON 格式错误")?;
     assign_missing_names(&mut config.tunnels);
@@ -211,10 +224,12 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
 }
 
 pub fn merge_import(config: &mut GuiConfig, bundle: ImportBundle, policy: MergePolicy) {
-    if policy == MergePolicy::ReplaceAll {
-        config.tunnels = bundle.tunnels;
-        return;
-    }
+    let policy = if policy == MergePolicy::ReplaceAll {
+        config.tunnels.clear();
+        MergePolicy::OverwriteExisting
+    } else {
+        policy
+    };
 
     for incoming in bundle.tunnels {
         if let Some(index) = config
@@ -229,6 +244,24 @@ pub fn merge_import(config: &mut GuiConfig, bundle: ImportBundle, policy: MergeP
             config.tunnels.push(incoming);
         }
     }
+}
+
+pub fn import_conflicts(config: &GuiConfig, bundle: &ImportBundle) -> Vec<String> {
+    let existing = config
+        .tunnels
+        .iter()
+        .map(|tunnel| tunnel.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut conflicts = Vec::new();
+    for tunnel in &bundle.tunnels {
+        if !seen.insert(tunnel.name.as_str()) || existing.contains(tunnel.name.as_str()) {
+            conflicts.push(tunnel.name.clone());
+        }
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
 }
 
 fn collect_json_files(path: &Path, files: &mut Vec<PathBuf>, messages: &mut Vec<String>) {
@@ -352,6 +385,52 @@ mod tests {
             MergePolicy::OverwriteExisting,
         );
         assert_eq!(config.tunnels[0].target, "127.0.0.1:2222");
+        merge_import(
+            &mut config,
+            ImportBundle {
+                tunnels: vec![TunnelConfig {
+                    name: "only".to_string(),
+                    tows: DEFAULT_TOWS_66.to_string(),
+                    target: "127.0.0.1:22".to_string(),
+                    listen: "127.0.0.1:15555".to_string(),
+                    enabled: true,
+                }],
+                messages: vec![],
+                files_read: 1,
+            },
+            MergePolicy::ReplaceAll,
+        );
+        assert_eq!(config.tunnels.len(), 1);
+        assert_eq!(config.tunnels[0].name, "only");
+    }
+
+    #[test]
+    fn import_reports_existing_and_cross_file_duplicates() {
+        let config = GuiConfig::default();
+        let duplicate = config.tunnels[0].clone();
+        let bundle = ImportBundle {
+            tunnels: vec![duplicate.clone(), duplicate],
+            messages: vec![],
+            files_read: 2,
+        };
+        assert_eq!(import_conflicts(&config, &bundle), vec!["77 SSH"]);
+    }
+
+    #[test]
+    fn export_writes_selected_tunnels_to_one_config() {
+        let path = std::env::temp_dir().join(format!(
+            "tow-export-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let selected = GuiConfig::default().tunnels.into_iter().take(2).collect();
+        export_tunnels(&path, selected).unwrap();
+        let exported = parse_config(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(exported.tunnels.len(), 2);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

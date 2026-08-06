@@ -19,14 +19,14 @@ use crate::network::{
 use crate::protocol::{Frame, FrameType, MAX_DATA_LEN, MAX_TUNNELS};
 use crate::{APP_VERSION, init_tracing};
 
-use super::auth::{AuthPrompt, SessionCookie, login_or_restore, refresh_ticket};
+use super::auth::{AuthPrompt, SessionCookie, login_or_restore_for_server, refresh_ticket};
 use super::config::{ParsedArgs, parse_args, prompt_interactive};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const COOKIE_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 const TCP_QUEUE_FRAMES: usize = 16;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardRule {
     pub name: String,
     pub target: Endpoint,
@@ -93,7 +93,7 @@ pub async fn run_cli() -> Result<()> {
     let ui = Arc::new(TerminalUi);
     let auth: Arc<dyn AuthPrompt> = ui.clone();
     let observer: Arc<dyn ClientObserver> = ui;
-    let cookie = login_or_restore(auth, config.login).await?;
+    let cookie = login_or_restore_for_server(auth, config.login, &config.server).await?;
     let rule = ForwardRule {
         name: "towc".to_string(),
         target: config.target,
@@ -134,6 +134,26 @@ pub async fn run_server_groups(
         })
         .collect::<Result<Vec<_>>>()?;
     run_connection_groups(groups, cookie, stop, observer).await
+}
+
+pub async fn run_dynamic_server_groups(
+    groups: Vec<ServerGroup>,
+    cookie: SessionCookie,
+    stop: watch::Receiver<bool>,
+    updates: mpsc::UnboundedReceiver<Vec<ServerGroup>>,
+    observer: Arc<dyn ClientObserver>,
+) -> Result<()> {
+    let groups = groups
+        .into_iter()
+        .map(|group| {
+            Ok(ConnectionGroup {
+                url: build_webvpn_ws_url(&group.server)?,
+                server: group.server,
+                rules: group.rules,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    run_dynamic_connection_groups(groups, cookie, stop, updates, observer).await
 }
 
 struct ConnectionGroup {
@@ -240,17 +260,173 @@ async fn run_connection_groups(
     }
 }
 
+async fn run_dynamic_connection_groups(
+    groups: Vec<ConnectionGroup>,
+    cookie: SessionCookie,
+    mut stop: watch::Receiver<bool>,
+    mut updates: mpsc::UnboundedReceiver<Vec<ServerGroup>>,
+    observer: Arc<dyn ClientObserver>,
+) -> Result<()> {
+    validate_connection_groups(&groups, true)?;
+
+    let total = groups.len();
+    let (session_stop_tx, session_stop_rx) = watch::channel(false);
+    let mut controls = HashMap::new();
+    let mut tasks = JoinSet::new();
+    for group in groups {
+        let server = group.server;
+        let (rules_tx, rules_rx) = watch::channel(group.rules);
+        controls.insert(server.clone(), rules_tx);
+        let cookie = cookie.clone();
+        let group_stop = session_stop_rx.clone();
+        let group_observer = Arc::clone(&observer);
+        tasks.spawn(async move {
+            let result = run_dynamic_tunnels_to_url(
+                group.url,
+                server.clone(),
+                rules_rx,
+                cookie,
+                group_stop,
+                group_observer,
+            )
+            .await;
+            (server, result)
+        });
+    }
+
+    let mut refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + COOKIE_REFRESH_INTERVAL,
+        COOKIE_REFRESH_INTERVAL,
+    );
+    let mut failures = Vec::new();
+    let mut updates_open = true;
+
+    while !tasks.is_empty() {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    let _ = session_stop_tx.send(true);
+                    while tasks.join_next().await.is_some() {}
+                    return Ok(());
+                }
+            }
+            update = async {
+                if updates_open {
+                    updates.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                let Some(groups) = update else {
+                    updates_open = false;
+                    continue;
+                };
+                let requested = groups
+                    .into_iter()
+                    .map(|group| (group.server, group.rules))
+                    .collect::<HashMap<_, _>>();
+                if requested.len() != controls.len()
+                    || requested.keys().any(|server| !controls.contains_key(server))
+                {
+                    observer.status("tunnel update rejected: tows addresses cannot change while running");
+                    continue;
+                }
+                for (server, sender) in &controls {
+                    let rules = requested.get(server).cloned().unwrap_or_default();
+                    if rules.len() > MAX_TUNNELS {
+                        observer.status(&format!("tunnel update rejected: tows {server} exceeds {MAX_TUNNELS} rules"));
+                        continue;
+                    }
+                    let _ = sender.send(rules);
+                }
+            }
+            _ = refresh.tick() => {
+                if let Err(error) = refresh_ticket(&cookie).await {
+                    let _ = session_stop_tx.send(true);
+                    while tasks.join_next().await.is_some() {}
+                    return Err(error.context("WebVPN cookie refresh failed"));
+                }
+                observer.status("WebVPN cookie refreshed");
+            }
+            joined = tasks.join_next() => {
+                let Some(joined) = joined else { break };
+                match joined {
+                    Ok((_server, Ok(()))) => {}
+                    Ok((server, Err(error))) => {
+                        failures.push(format!("tows {server} failed: {error:#}"));
+                    }
+                    Err(error) => failures.push(format!("tows task failed: {error}")),
+                }
+                observer.status(&format!("{}/{} tows connections active", tasks.len(), total));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("all tows connections stopped: {}", failures.join("; "))
+    }
+}
+
+fn validate_connection_groups(groups: &[ConnectionGroup], allow_empty: bool) -> Result<()> {
+    if groups.is_empty() {
+        bail!("no tows server groups are configured");
+    }
+    let mut servers = HashSet::new();
+    for group in groups {
+        if !allow_empty && group.rules.is_empty() {
+            bail!("tows {} has no enabled tunnels", group.server);
+        }
+        if group.rules.len() > MAX_TUNNELS {
+            bail!("tows {} has more than {MAX_TUNNELS} tunnels", group.server);
+        }
+        if !servers.insert(group.server.clone()) {
+            bail!("duplicate tows server group: {}", group.server);
+        }
+    }
+    Ok(())
+}
+
 async fn run_tunnels_to_url(
     url: String,
     server: Endpoint,
     rules: Vec<ForwardRule>,
+    cookie: SessionCookie,
+    stop: watch::Receiver<bool>,
+    observer: Arc<dyn ClientObserver>,
+) -> Result<()> {
+    let (rules_tx, rules_rx) = watch::channel(rules);
+    let result =
+        run_controlled_tunnels_to_url(url, server, rules_rx, false, cookie, stop, observer).await;
+    drop(rules_tx);
+    result
+}
+
+async fn run_dynamic_tunnels_to_url(
+    url: String,
+    server: Endpoint,
+    rules: watch::Receiver<Vec<ForwardRule>>,
+    cookie: SessionCookie,
+    stop: watch::Receiver<bool>,
+    observer: Arc<dyn ClientObserver>,
+) -> Result<()> {
+    run_controlled_tunnels_to_url(url, server, rules, true, cookie, stop, observer).await
+}
+
+async fn run_controlled_tunnels_to_url(
+    url: String,
+    server: Endpoint,
+    mut rules: watch::Receiver<Vec<ForwardRule>>,
+    dynamic: bool,
     cookie: SessionCookie,
     mut stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
 ) -> Result<()> {
     // 登录完成后先绑定全部端口；任何冲突都在建立 WS 前清晰报出。
     let mut listeners = Vec::new();
-    for rule in rules {
+    let initial_rules = rules.borrow().clone();
+    for rule in initial_rules {
         let address = rule.listen.resolve().await?;
         let listener = TcpListener::bind(address).await.with_context(|| {
             format!(
@@ -272,8 +448,9 @@ async fn run_tunnels_to_url(
     let (writer, mut writer_task) = spawn_writer(sink);
     let (open_tx, mut open_rx) = mpsc::channel::<LocalOpen>(MAX_TUNNELS * 2);
     let (event_tx, mut event_rx) = mpsc::channel::<TunnelEvent>(256);
-    let mut accept_tasks = Vec::new();
+    let mut accept_tasks = HashMap::new();
     for (rule, listener) in listeners {
+        let name = rule.name.clone();
         let sender = open_tx.clone();
         let observer = Arc::clone(&observer);
         let task_stop = stop.clone();
@@ -281,13 +458,18 @@ async fn run_tunnels_to_url(
             &rule.name,
             &format!("ready: {} -> {} -> {}", rule.listen, server, rule.target),
         );
-        accept_tasks.push(tokio::spawn(accept_loop(
-            rule, listener, sender, task_stop, observer,
-        )));
+        let task = tokio::spawn(accept_loop(
+            rule.clone(),
+            listener,
+            sender,
+            task_stop,
+            observer,
+        ));
+        accept_tasks.insert(name, (rule, task));
     }
-    drop(open_tx);
 
     let mut tunnels = HashMap::<u16, Tunnel>::new();
+    let mut retired_ids = HashSet::new();
     let mut next_id = 1_u16;
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
@@ -301,6 +483,68 @@ async fn run_tunnels_to_url(
                     break Ok(());
                 }
             }
+            changed = rules.changed(), if dynamic => {
+                if changed.is_err() {
+                    break Ok(());
+                }
+                let desired = rules
+                    .borrow_and_update()
+                    .clone()
+                    .into_iter()
+                    .map(|rule| (rule.name.clone(), rule))
+                    .collect::<HashMap<_, _>>();
+                let remove = accept_tasks
+                    .iter()
+                    .filter(|(name, (active, _))| desired.get(*name) != Some(active))
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>();
+                for name in remove {
+                    if let Some((_, task)) = accept_tasks.remove(&name) {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    close_named(
+                        &name,
+                        &writer,
+                        &observer,
+                        &mut tunnels,
+                        &mut retired_ids,
+                    )
+                    .await?;
+                    observer.tunnel_status(&name, "disabled");
+                }
+                for (name, rule) in desired {
+                    if accept_tasks.contains_key(&name) {
+                        continue;
+                    }
+                    let address = match rule.listen.resolve().await {
+                        Ok(address) => address,
+                        Err(error) => {
+                            observer.tunnel_status(&name, &format!("enable failed: {error:#}"));
+                            continue;
+                        }
+                    };
+                    let listener = match TcpListener::bind(address).await {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            observer.tunnel_status(&name, &format!("enable failed: could not listen on {}: {error}", rule.listen));
+                            continue;
+                        }
+                    };
+                    observer.tunnel_status(
+                        &name,
+                        &format!("ready: {} -> {} -> {}", rule.listen, server, rule.target),
+                    );
+                    let task = tokio::spawn(accept_loop(
+                        rule.clone(),
+                        listener,
+                        open_tx.clone(),
+                        stop.clone(),
+                        Arc::clone(&observer),
+                    ));
+                    accept_tasks.insert(name, (rule, task));
+                }
+            }
             _ = heartbeat.tick() => {
                 writer.send(Frame::new(FrameType::Ping, 0, Vec::new())?).await?;
             }
@@ -310,7 +554,7 @@ async fn run_tunnels_to_url(
                     observer.tunnel_status(&local.name, "connection rejected: 64 concurrent streams are already open");
                     continue;
                 }
-                let id = allocate_id(&tunnels, &mut next_id)?;
+                let id = allocate_id(&tunnels, &retired_ids, &mut next_id)?;
                 writer.send(Frame::new(FrameType::Open, id, local.target.to_string().into_bytes())?).await?;
                 observer.tunnel_status(&local.name, &format!("opening stream {id}"));
                 tunnels.insert(id, Tunnel::Opening(OpeningTunnel {
@@ -326,7 +570,14 @@ async fn run_tunnels_to_url(
             message = source.next() => {
                 match message {
                     Some(Ok(message)) => {
-                        if let Err(error) = handle_ws_message(message, &writer, &event_tx, &observer, &mut tunnels).await {
+                        if let Err(error) = handle_ws_message(
+                            message,
+                            &writer,
+                            &event_tx,
+                            &observer,
+                            &mut tunnels,
+                            &mut retired_ids,
+                        ).await {
                             writer.protocol_close(error.to_string()).await;
                             break Err(error);
                         }
@@ -337,7 +588,14 @@ async fn run_tunnels_to_url(
             }
             event = event_rx.recv() => {
                 let Some(event) = event else { break Ok(()) };
-                if let Err(error) = handle_tunnel_event(event, &writer, &event_tx, &observer, &mut tunnels).await {
+                if let Err(error) = handle_tunnel_event(
+                    event,
+                    &writer,
+                    &event_tx,
+                    &observer,
+                    &mut tunnels,
+                    &mut retired_ids,
+                ).await {
                     break Err(error);
                 }
             }
@@ -351,10 +609,10 @@ async fn run_tunnels_to_url(
         }
     };
 
-    for task in &accept_tasks {
+    for (_, task) in accept_tasks.values() {
         task.abort();
     }
-    for task in accept_tasks {
+    for (_, task) in accept_tasks.into_values() {
         let _ = task.await;
     }
     close_all(&writer, &mut tunnels).await;
@@ -443,12 +701,13 @@ async fn handle_ws_message(
     events: &mpsc::Sender<TunnelEvent>,
     observer: &Arc<dyn ClientObserver>,
     tunnels: &mut HashMap<u16, Tunnel>,
+    retired_ids: &mut HashSet<u16>,
 ) -> Result<()> {
     match message {
         Message::Binary(bytes) => {
             let frame = Frame::decode(&bytes)?;
             frame.validate_server_to_client(true)?;
-            handle_frame(frame, writer, events, observer, tunnels).await
+            handle_frame(frame, writer, events, observer, tunnels, retired_ids).await
         }
         Message::Ping(payload) => {
             writer.raw(Message::Pong(payload)).await;
@@ -467,7 +726,23 @@ async fn handle_frame(
     events: &mpsc::Sender<TunnelEvent>,
     observer: &Arc<dyn ClientObserver>,
     tunnels: &mut HashMap<u16, Tunnel>,
+    retired_ids: &mut HashSet<u16>,
 ) -> Result<()> {
+    if retired_ids.contains(&frame.tunnel_id) {
+        match frame.kind {
+            FrameType::Close | FrameType::OpenFail => {
+                retired_ids.remove(&frame.tunnel_id);
+            }
+            FrameType::OpenOk => {
+                writer
+                    .send(Frame::new(FrameType::Close, frame.tunnel_id, Vec::new())?)
+                    .await?;
+            }
+            FrameType::Data | FrameType::Eof => {}
+            _ => bail!("server sent a disallowed {:?} frame", frame.kind),
+        }
+        return Ok(());
+    }
     match frame.kind {
         FrameType::OpenOk => {
             let Some(Tunnel::Opening(opening)) = tunnels.get_mut(&frame.tunnel_id) else {
@@ -530,7 +805,7 @@ async fn handle_frame(
                     frame.tunnel_id
                 )
             })?;
-            maybe_finish(frame.tunnel_id, writer, observer, tunnels).await
+            maybe_finish(frame.tunnel_id, writer, observer, tunnels, retired_ids).await
         }
         FrameType::Close => {
             if tunnels.contains_key(&frame.tunnel_id) {
@@ -548,6 +823,7 @@ async fn handle_tunnel_event(
     _events: &mpsc::Sender<TunnelEvent>,
     observer: &Arc<dyn ClientObserver>,
     tunnels: &mut HashMap<u16, Tunnel>,
+    retired_ids: &mut HashSet<u16>,
 ) -> Result<()> {
     match event {
         TunnelEvent::OpenTimeout(id) => {
@@ -556,18 +832,19 @@ async fn handle_tunnel_event(
                 writer
                     .send(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
+                retired_ids.insert(id);
             }
         }
         TunnelEvent::LocalEof(id) => {
             if let Some(Tunnel::Open(tunnel)) = tunnels.get_mut(&id) {
                 tunnel.local_eof_sent = true;
-                maybe_finish(id, writer, observer, tunnels).await?;
+                maybe_finish(id, writer, observer, tunnels, retired_ids).await?;
             }
         }
         TunnelEvent::TcpWriterDone(id) => {
             if let Some(Tunnel::Open(tunnel)) = tunnels.get_mut(&id) {
                 tunnel.tcp_writer_done = true;
-                maybe_finish(id, writer, observer, tunnels).await?;
+                maybe_finish(id, writer, observer, tunnels, retired_ids).await?;
             }
         }
         TunnelEvent::TcpError(id, reason) => {
@@ -575,6 +852,7 @@ async fn handle_tunnel_event(
                 writer
                     .send(Frame::new(FrameType::Close, id, Vec::new())?)
                     .await?;
+                retired_ids.insert(id);
                 remove_tunnel(
                     id,
                     writer,
@@ -697,6 +975,7 @@ async fn maybe_finish(
     writer: &WsWriter,
     observer: &Arc<dyn ClientObserver>,
     tunnels: &mut HashMap<u16, Tunnel>,
+    retired_ids: &mut HashSet<u16>,
 ) -> Result<()> {
     let finished = matches!(
         tunnels.get(&id),
@@ -707,6 +986,7 @@ async fn maybe_finish(
         writer
             .send(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
+        retired_ids.insert(id);
         remove_tunnel(id, writer, observer, tunnels, "bidirectional EOF").await;
     }
     Ok(())
@@ -732,6 +1012,33 @@ async fn remove_tunnel(
     writer.remove(id).await;
 }
 
+async fn close_named(
+    name: &str,
+    writer: &WsWriter,
+    observer: &Arc<dyn ClientObserver>,
+    tunnels: &mut HashMap<u16, Tunnel>,
+    retired_ids: &mut HashSet<u16>,
+) -> Result<()> {
+    let ids = tunnels
+        .iter()
+        .filter_map(|(id, tunnel)| {
+            let tunnel_name = match tunnel {
+                Tunnel::Opening(opening) => &opening.name,
+                Tunnel::Open(open) => &open.name,
+            };
+            (tunnel_name == name).then_some(*id)
+        })
+        .collect::<Vec<_>>();
+    for id in ids {
+        writer
+            .send(Frame::new(FrameType::Close, id, Vec::new())?)
+            .await?;
+        retired_ids.insert(id);
+        remove_tunnel(id, writer, observer, tunnels, "disabled").await;
+    }
+    Ok(())
+}
+
 async fn close_all(writer: &WsWriter, tunnels: &mut HashMap<u16, Tunnel>) {
     let ids: Vec<u16> = tunnels.keys().copied().collect();
     for (_, tunnel) in tunnels.drain() {
@@ -745,14 +1052,18 @@ async fn close_all(writer: &WsWriter, tunnels: &mut HashMap<u16, Tunnel>) {
     }
 }
 
-fn allocate_id(tunnels: &HashMap<u16, Tunnel>, next: &mut u16) -> Result<u16> {
+fn allocate_id(
+    tunnels: &HashMap<u16, Tunnel>,
+    retired_ids: &HashSet<u16>,
+    next: &mut u16,
+) -> Result<u16> {
     for _ in 0..u16::MAX - 1 {
         if *next == 0 || *next == u16::MAX {
             *next = 1;
         }
         let candidate = *next;
         *next = next.saturating_add(1);
-        if !tunnels.contains_key(&candidate) {
+        if !tunnels.contains_key(&candidate) && !retired_ids.contains(&candidate) {
             return Ok(candidate);
         }
     }
@@ -813,10 +1124,11 @@ mod tests {
                 name: "test".to_string(),
             }),
         );
+        let retired_ids = HashSet::new();
         let mut next = 1;
-        assert_eq!(allocate_id(&tunnels, &mut next).unwrap(), 2);
+        assert_eq!(allocate_id(&tunnels, &retired_ids, &mut next).unwrap(), 2);
         next = u16::MAX;
-        assert_eq!(allocate_id(&tunnels, &mut next).unwrap(), 2);
+        assert_eq!(allocate_id(&tunnels, &retired_ids, &mut next).unwrap(), 2);
     }
 
     #[test]
@@ -974,5 +1286,121 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tunnel_can_be_disabled_and_enabled_without_reconnecting_websocket() {
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_address = ws_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = ws_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            crate::network::server_handshake(&mut websocket, "dynamic-tows")
+                .await
+                .unwrap();
+            while let Some(message) = websocket.next().await {
+                match message.unwrap() {
+                    Message::Binary(bytes) => {
+                        let frame = Frame::decode(&bytes).unwrap();
+                        if frame.kind == FrameType::Close && frame.tunnel_id != 0 {
+                            websocket
+                                .send(Message::Binary(
+                                    Frame::new(FrameType::OpenOk, frame.tunnel_id, Vec::new())
+                                        .unwrap()
+                                        .encode()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            websocket
+                                .send(Message::Binary(
+                                    Frame::new(FrameType::Close, frame.tunnel_id, Vec::new())
+                                        .unwrap()
+                                        .encode()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    Message::Close(_) => return,
+                    _ => {}
+                }
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let server = crate::address::parse_tows("127.0.0.1").unwrap();
+        let rule = ForwardRule {
+            name: "dynamic".to_string(),
+            target: crate::address::parse_target("22").unwrap(),
+            listen: crate::address::parse_listen(&local_port.to_string()).unwrap(),
+        };
+        let cookie = SessionCookie(Arc::new(Mutex::new(format!(
+            "wengine_vpn_ticketwebvpn_szut_edu_cn=wrdvpn1-{}",
+            "0".repeat(32)
+        ))));
+        let groups = vec![ConnectionGroup {
+            url: format!("ws://{ws_address}/"),
+            server: server.clone(),
+            rules: vec![rule.clone()],
+        }];
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let coordinator = tokio::spawn(run_dynamic_connection_groups(
+            groups,
+            cookie,
+            stop_rx,
+            updates_rx,
+            Arc::new(ChannelObserver { events: event_tx }),
+        ));
+
+        wait_for_tunnel_status(&mut event_rx, "dynamic", "ready:").await;
+        assert!(TcpStream::connect(("127.0.0.1", local_port)).await.is_ok());
+
+        updates_tx
+            .send(vec![ServerGroup {
+                server: server.clone(),
+                rules: Vec::new(),
+            }])
+            .unwrap();
+        wait_for_tunnel_status(&mut event_rx, "dynamic", "disabled").await;
+        assert!(TcpStream::connect(("127.0.0.1", local_port)).await.is_err());
+
+        updates_tx
+            .send(vec![ServerGroup {
+                server,
+                rules: vec![rule],
+            }])
+            .unwrap();
+        wait_for_tunnel_status(&mut event_rx, "dynamic", "ready:").await;
+        assert!(TcpStream::connect(("127.0.0.1", local_port)).await.is_ok());
+
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), coordinator)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn wait_for_tunnel_status(
+        events: &mut mpsc::UnboundedReceiver<(String, String)>,
+        name: &str,
+        prefix: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (event_name, message) = events.recv().await.unwrap();
+                if event_name == name && message.starts_with(prefix) {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -9,6 +9,8 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::address::Endpoint;
+use crate::network::{build_webvpn_ws_url, connect_websocket};
 use crate::storage::{atomic_write, data_file};
 
 const WEBVPN_ROOT: &str = "https://webvpn.szut.edu.cn/";
@@ -73,11 +75,30 @@ pub async fn login_or_restore(
     prompt: Arc<dyn AuthPrompt>,
     preference: LoginPreference,
 ) -> Result<SessionCookie> {
-    if let Some(cookie) = read_cached_ticket()
-        && validate_cached_ticket(&cookie).await.unwrap_or(false)
+    login_or_restore_inner(prompt, preference, None).await
+}
+
+pub async fn login_or_restore_for_server(
+    prompt: Arc<dyn AuthPrompt>,
+    preference: LoginPreference,
+    server: &Endpoint,
+) -> Result<SessionCookie> {
+    login_or_restore_inner(prompt, preference, Some(server)).await
+}
+
+async fn login_or_restore_inner(
+    prompt: Arc<dyn AuthPrompt>,
+    preference: LoginPreference,
+    server: Option<&Endpoint>,
+) -> Result<SessionCookie> {
+    if let Some(session) = restore_cached_ticket().await
+        && match server {
+            Some(server) => validate_websocket_ticket(&session, server).await,
+            None => true,
+        }
     {
         prompt.status("reusing a valid WebVPN login cache");
-        return Ok(SessionCookie(Arc::new(Mutex::new(cookie))));
+        return Ok(session);
     }
 
     prompt.status("WebVPN login required");
@@ -92,6 +113,17 @@ pub async fn login_or_restore(
     };
     write_cached_ticket(&cookie);
     Ok(SessionCookie(Arc::new(Mutex::new(cookie))))
+}
+
+async fn validate_websocket_ticket(cookie: &SessionCookie, server: &Endpoint) -> bool {
+    let Ok(url) = build_webvpn_ws_url(server) else {
+        return false;
+    };
+    let Ok(mut websocket) = connect_websocket(&url, &cookie.snapshot()).await else {
+        return false;
+    };
+    let _ = websocket.close(None).await;
+    true
 }
 
 fn login_client(jar: Arc<reqwest::cookie::Jar>) -> Result<Client> {
@@ -338,12 +370,14 @@ pub(crate) async fn refresh_ticket(cookie: &SessionCookie) -> Result<()> {
     Ok(())
 }
 
-async fn validate_cached_ticket(cookie: &str) -> Result<bool> {
-    if !valid_ticket_format(cookie) {
-        return Ok(false);
+async fn restore_cached_ticket() -> Option<SessionCookie> {
+    let cookie = read_cached_ticket()?;
+    if !valid_ticket_format(&cookie) {
+        return None;
     }
-    let session = SessionCookie(Arc::new(Mutex::new(cookie.to_string())));
-    Ok(refresh_ticket(&session).await.is_ok())
+    let session = SessionCookie(Arc::new(Mutex::new(cookie)));
+    refresh_ticket(&session).await.ok()?;
+    Some(session)
 }
 
 fn ticket_from_jar(jar: &reqwest::cookie::Jar) -> Option<String> {
