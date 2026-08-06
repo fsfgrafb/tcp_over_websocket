@@ -131,7 +131,8 @@ Key = IV = "wrdvpnisthebest!"（16字节 ASCII）
    GET /set-fingerprint?fingerprint=5a0b00fe6ae8277a4bfadd4e103f6e1c   （硬编码 MD5 即可）
    → 302 /login → 302 → 回 CAS 登录页
 3. 微信扫码（推荐直连，不用走代理）：
-   - 二维码页: https://open.weixin.qq.com/connect/qrconnect?appid=wx16c67d169e7a9290&redirect_uri={urlencode(https://cas.szut.edu.cn/cas/login?client_name=WeiXinClient)}&response_type=code&scope=snsapi_login&state=...
+   - 二维码页: https://open.weixin.qq.com/connect/qrconnect?appid=wx16c67d169e7a9290&redirect_uri={urlencode(https://cas.szut.edu.cn/cas/login?service={SERVICE}&client_name=WeiXinClient)}&response_type=code&scope=snsapi_login&state=...
+   - ⚠️ redirect_uri **必须带 service**（微信回调 CAS 后 CAS 靠它发 ST）；SERVICE = `https://webvpn.szut.edu.cn/login?cas_login=true`，与步骤 1/4 一致
    - 注意 redirect_uri 必须直连 CAS（微信注册域名），不能用 webvpn 代理 URL
    - 解析 uuid → 下载二维码 https://open.weixin.qq.com/connect/qrcode/{uuid}
    - 轮询 https://lp.open.weixin.qq.com/connect/l/qrconnect?uuid={uuid}&_={ms}
@@ -189,7 +190,7 @@ RSA 加密（提交前）：
 - **只支持多路复用协议**（towc/towc_gui 统一使用）：1 条 WS 连接承载多个隧道（towc 单隧道 = 1 个 tunnel_id），帧头带 tunnel_id，tows 按包路由（见 §3.1/3.2）
 - **版本协商（2026-08-06 用户确认）**：客户端建 WS 后**第一帧发 HELLO**（0x00，带协议版本+程序版本）→ tows 校验后回 HELLO_ACK（0x07）
 - **客户端**：收到 HELLO_ACK 且协议版本一致 → 正常复用；收到 `"连接成功"` 文本（仅旧 tows 会发）/ **5s 超时** / 版本不一致 → **打印警告并退出**（提示升级 tows），**不降级、不重试**
-- **tows**：收到 HELLO → 回 HELLO_ACK；收到**非 HELLO**（旧客户端）或 **5s 超时** → **关闭连接拒绝**（不兼容旧客户端，需升级）
+- **tows**：收到 HELLO → **回 HELLO_ACK**（带**自己的**协议版本+程序版本，**即使版本不匹配也回**，由客户端比较后决定退出）；收到**非 HELLO**（旧客户端）或 **5s 超时** → **关闭连接拒绝**（不兼容旧客户端，需升级）
 - ⚠️ 判别可靠性：新版 tows **绝不发** `"连接成功"` 文本（就绪确认 = HELLO_ACK），因此客户端收到该文本即判定为旧版
 
 ### 3.1 多路复用帧格式（建议设计，可调整）
@@ -207,16 +208,18 @@ WS **二进制帧**：
 | 0x05 OPEN_OK | tows→towc 建隧成功 | 空 |
 | 0x06 OPEN_FAIL | tows→towc 建隧失败 | 错误原因 UTF-8 |
 | 0x07 HELLO_ACK | tows→towc 版本协商应答 | `[2B 协议版本大端] + 程序版本字符串`（如 `2` + `tows 0.6.0`） |
+| 0x08 EOF | 双向，单方向 TCP 结束 | 空（对端对该流执行 `shutdown(Write)`，**保留读方向**） |
 
 - **协议版本常量：PROTOCOL_VERSION = 2**（v1 = 旧路径解析无握手）；HELLO 中协议版本不匹配 → 客户端提示并**退出**（不降级）
-- **HELLO / HELLO_ACK 帧的 tunnel_id 固定填 0x0000**（两端忽略）；仅 OPEN/DATA/CLOSE 使用 0x0001~0xFFFE（动态分配；0xFFFF 保留）
+- **tunnel_id 归属**：HELLO/HELLO_ACK/PING 为**连接级**，固定填 0x0000（忽略）；OPEN/DATA/CLOSE/EOF/OPEN_OK/OPEN_FAIL 关联**具体隧道**（OPEN 分配新 id，其余帧用对应隧道 id）；0x0001~0xFFFE 动态分配（隧道关闭后 id 可复用）；0xFFFF 保留
 - ⚠️ **payload_len 为 2B（上限 65535）**：DATA 帧单帧 ≤64KB，TCP 数据超过需发送端分片（按 ≤64KB 切块发多个 DATA 帧）
 - **心跳**：每 60s 一条 PING（1 条连接一个心跳即可，所有隧道共享）
-- **EOF 处理**：单隧道内 TCP EOF → 发 CLOSE（tunnel_id）并关闭该流；所有隧道关闭且无新连接 → 可关 WS
+- **EOF / 半关闭（重要，SSH 等依赖）**：某方向 TCP EOF → 发 **EOF 帧**（tunnel_id），对端对该流执行 `shutdown(Write)`（保留读方向）；**双向都 EOF**（双方各收到过对方 EOF）→ 发 CLOSE 并移除该流；所有隧道关闭且无新连接 → 可关 WS
+- ⚠️ **不要用 CLOSE 直接替代 EOF**：CLOSE 表示整个流结束，直接 CLOSE 会丢失半关闭语义，破坏 SSH 等交互协议
 
 ### 3.2 tows 路由（多路复用）
 - 维护 `HashMap<tunnel_id, TcpStream>`
-- OPEN：解析目标 → 连接 TCP → 成功回 OPEN_OK / 失败回 OPEN_FAIL（含原因）
+- OPEN：解析目标 → 连接 TCP → 成功回 OPEN_OK / 失败回 OPEN_FAIL（含原因）；**单隧道 OPEN_FAIL 只影响该隧道，其余隧道不受影响**
 - DATA：按 tunnel_id 查表转发
 - CLOSE：关闭对应 TcpStream 并从表移除
 - ⚠️ 背压：单连接多流需注意一个慢目标拖累整条连接；tows 每个流用独立 async 任务
@@ -267,13 +270,13 @@ WS **二进制帧**：
 
 ## 5. 重构要求（用户指定）
 
-1. **从最简形态开始**：先做出能用的最小闭环（登录 + 单隧道 + 转发），再逐步加功能；**初版优先**
+1. **从最简形态开始**：先做出能用的最小闭环（登录 + 单隧道 + 转发），再逐步加功能；**初版优先**；**开发顺序：tows → towc → towc_gui**（先用 towc 验证协议，最后包 GUI）
 2. **优先最低延迟 + 最高转发效率**：核心指标，任何功能不能损害转发性能
 3. **三个可执行文件**：tows（可选启动参数，**只支持多路复用协议**）+ towc（**带参模式 + 无参交互模式**，交互行为 v0.4 兼容）+ towc_gui（**Windows 专属 GUI，单进程多隧道，自包含不依赖 towc.exe**）
 4. **登录三种方式**：微信扫码 / 手机验证码 / 邮箱验证码（见 §2.6/2.7）
 5. **多路复用协议 + 版本协商**：towc/towc_gui 与 tows 之间单 WS 多路复用（见 §3.1/3.2），**建连第一帧发 HELLO 握手**（0x00/0x07，§3.0），**不兼容旧版**（版本不符即报错退出），帧格式以简洁为准
 6. 保持"学生在外网连内网 TCP"的目标场景（SSH / MC / RDP）
-7. 代码语言：Rust（原项目为 Rust，edition 2024，依赖 tokio/tokio-tungstenite/reqwest/rustls）
+7. 代码语言：Rust（原项目为 Rust，edition 2024，依赖 tokio/tokio-tungstenite/reqwest/rustls）；**towc_gui 推荐 egui/eframe**（纯 Rust 轻量工具类 GUI，无 WebView 依赖，仅 Windows 编译）
 8. 完成后需与 10.18.47.77 上的环境配合实测（见 §6）；带宽基线：账号总带宽 ~5.3MB/s（已实测，见 §2.5/§3.4）
 
 ---
@@ -318,5 +321,6 @@ WS **二进制帧**：
 - **已补充（2026-08-06）**：
   - 发布矩阵（§1.2）、命名保持 towc/tows/towc_gui、towc 保持单隧道
   - 版本协商 + 不兼容旧版（HELLO/HELLO_ACK，§3.0/§3.1）
+  - EOF 半关闭帧 0x08（SSH 依赖，§3.1）；towc_gui 推荐 egui/eframe；开发顺序 tows→towc→towc_gui（§5）
 - 用户表示还会提供更多信息，收到后请更新本文档
 - 若有疑问，优先查阅 `C:\Development\test\docs\` 的详细记录
