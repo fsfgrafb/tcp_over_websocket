@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::address::Endpoint;
@@ -31,6 +31,12 @@ pub struct ForwardRule {
     pub name: String,
     pub target: Endpoint,
     pub listen: Endpoint,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerGroup {
+    pub server: Endpoint,
+    pub rules: Vec<ForwardRule>,
 }
 
 pub trait ClientObserver: Send + Sync {
@@ -108,14 +114,130 @@ pub async fn run_tunnels(
     stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
 ) -> Result<()> {
-    if rules.is_empty() {
-        bail!("no tunnels are enabled");
+    run_server_groups(vec![ServerGroup { server, rules }], cookie, stop, observer).await
+}
+
+pub async fn run_server_groups(
+    groups: Vec<ServerGroup>,
+    cookie: SessionCookie,
+    stop: watch::Receiver<bool>,
+    observer: Arc<dyn ClientObserver>,
+) -> Result<()> {
+    let groups = groups
+        .into_iter()
+        .map(|group| {
+            Ok(ConnectionGroup {
+                url: build_webvpn_ws_url(&group.server)?,
+                server: group.server,
+                rules: group.rules,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    run_connection_groups(groups, cookie, stop, observer).await
+}
+
+struct ConnectionGroup {
+    url: String,
+    server: Endpoint,
+    rules: Vec<ForwardRule>,
+}
+
+async fn run_connection_groups(
+    groups: Vec<ConnectionGroup>,
+    cookie: SessionCookie,
+    mut stop: watch::Receiver<bool>,
+    observer: Arc<dyn ClientObserver>,
+) -> Result<()> {
+    if groups.is_empty() {
+        bail!("no tows server groups are enabled");
     }
-    if rules.len() > MAX_TUNNELS {
-        bail!("one WebSocket supports at most {MAX_TUNNELS} tunnels");
+
+    let mut servers = HashSet::new();
+    for group in &groups {
+        if group.rules.is_empty() {
+            bail!("tows {} has no enabled tunnels", group.server);
+        }
+        if group.rules.len() > MAX_TUNNELS {
+            bail!("tows {} has more than {MAX_TUNNELS} tunnels", group.server);
+        }
+        if !servers.insert(group.server.clone()) {
+            bail!("duplicate tows server group: {}", group.server);
+        }
     }
-    let url = build_webvpn_ws_url(&server)?;
-    run_tunnels_to_url(url, server, rules, cookie, stop, observer).await
+
+    let total = groups.len();
+    let (session_stop_tx, session_stop_rx) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    for group in groups {
+        let server = group.server;
+        let names: Vec<String> = group.rules.iter().map(|rule| rule.name.clone()).collect();
+        let cookie = cookie.clone();
+        let group_stop = session_stop_rx.clone();
+        let group_observer = Arc::clone(&observer);
+        tasks.spawn(async move {
+            let result = run_tunnels_to_url(
+                group.url,
+                server.clone(),
+                group.rules,
+                cookie,
+                group_stop,
+                group_observer,
+            )
+            .await;
+            (server, names, result)
+        });
+    }
+
+    let mut refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + COOKIE_REFRESH_INTERVAL,
+        COOKIE_REFRESH_INTERVAL,
+    );
+    let mut failures = Vec::new();
+
+    while !tasks.is_empty() {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    let _ = session_stop_tx.send(true);
+                    while tasks.join_next().await.is_some() {}
+                    return Ok(());
+                }
+            }
+            _ = refresh.tick() => {
+                if let Err(error) = refresh_ticket(&cookie).await {
+                    let _ = session_stop_tx.send(true);
+                    while tasks.join_next().await.is_some() {}
+                    return Err(error.context("WebVPN cookie refresh failed"));
+                }
+                observer.status("WebVPN cookie refreshed");
+            }
+            joined = tasks.join_next() => {
+                let Some(joined) = joined else { break };
+                match joined {
+                    Ok((server, names, Ok(()))) => {
+                        for name in names {
+                            observer.tunnel_status(&name, &format!("tows {server} stopped"));
+                        }
+                    }
+                    Ok((server, names, Err(error))) => {
+                        let reason = format!("tows {server} failed: {error:#}");
+                        for name in names {
+                            observer.tunnel_status(&name, &reason);
+                        }
+                        failures.push(reason);
+                    }
+                    Err(error) => failures.push(format!("tows task failed: {error}")),
+                }
+                observer.status(&format!("{}/{} tows connections active", tasks.len(), total));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("all tows connections stopped: {}", failures.join("; "))
+    }
 }
 
 async fn run_tunnels_to_url(
@@ -139,7 +261,7 @@ async fn run_tunnels_to_url(
         listeners.push((rule, listener));
     }
 
-    observer.status("connecting to WebVPN WebSocket");
+    observer.status(&format!("connecting to tows {server} through WebVPN"));
     let mut websocket = connect_websocket(&url, &cookie.snapshot())
         .await
         .map_err(|error| anyhow!(error))?;
@@ -164,26 +286,6 @@ async fn run_tunnels_to_url(
         )));
     }
     drop(open_tx);
-
-    let keepalive_events = event_tx.clone();
-    let keepalive_cookie = cookie.clone();
-    let cookie_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + COOKIE_REFRESH_INTERVAL,
-            COOKIE_REFRESH_INTERVAL,
-        );
-        loop {
-            interval.tick().await;
-            if let Err(error) = refresh_ticket(&keepalive_cookie).await {
-                let _ = keepalive_events
-                    .send(TunnelEvent::SessionError(format!(
-                        "WebVPN cookie refresh failed: {error:#}"
-                    )))
-                    .await;
-                return;
-            }
-        }
-    });
 
     let mut tunnels = HashMap::<u16, Tunnel>::new();
     let mut next_id = 1_u16;
@@ -255,7 +357,6 @@ async fn run_tunnels_to_url(
     for task in accept_tasks {
         let _ = task.await;
     }
-    cookie_task.abort();
     close_all(&writer, &mut tunnels).await;
     writer.normal_close().await;
     if !writer_task.is_finished() {
@@ -300,7 +401,6 @@ enum TunnelEvent {
     LocalEof(u16),
     TcpWriterDone(u16),
     TcpError(u16, String),
-    SessionError(String),
 }
 
 async fn accept_loop(
@@ -485,7 +585,6 @@ async fn handle_tunnel_event(
                 .await;
             }
         }
-        TunnelEvent::SessionError(reason) => return Err(anyhow!(reason)),
     }
     Ok(())
 }
@@ -680,8 +779,9 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::SinkExt;
+    use futures_util::{SinkExt, StreamExt};
     use std::sync::Mutex;
+    use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message;
 
     struct TestObserver;
@@ -689,6 +789,18 @@ mod tests {
     impl ClientObserver for TestObserver {
         fn status(&self, _message: &str) {}
         fn tunnel_status(&self, _name: &str, _message: &str) {}
+    }
+
+    struct ChannelObserver {
+        events: mpsc::UnboundedSender<(String, String)>,
+    }
+
+    impl ClientObserver for ChannelObserver {
+        fn status(&self, _message: &str) {}
+
+        fn tunnel_status(&self, name: &str, message: &str) {
+            let _ = self.events.send((name.to_string(), message.to_string()));
+        }
     }
 
     #[test]
@@ -756,5 +868,111 @@ mod tests {
             assert!(result.is_err());
             assert!(TcpStream::connect(("127.0.0.1", local_port)).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn one_server_failure_does_not_stop_another_server_group() {
+        let good_ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_ws_address = good_ws.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = good_ws.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            crate::network::server_handshake(&mut websocket, "good-tows")
+                .await
+                .unwrap();
+            while let Some(message) = websocket.next().await {
+                if matches!(message, Ok(Message::Close(_))) {
+                    return;
+                }
+            }
+        });
+
+        let bad_ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_ws_address = bad_ws.local_addr().unwrap();
+        let (close_bad_tx, close_bad_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = bad_ws.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            crate::network::server_handshake(&mut websocket, "bad-tows")
+                .await
+                .unwrap();
+            close_bad_rx.await.unwrap();
+            websocket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let good_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_port = good_probe.local_addr().unwrap().port();
+        let bad_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_port = bad_probe.local_addr().unwrap().port();
+        drop(good_probe);
+        drop(bad_probe);
+
+        let cookie = SessionCookie(Arc::new(Mutex::new(format!(
+            "wengine_vpn_ticketwebvpn_szut_edu_cn=wrdvpn1-{}",
+            "0".repeat(32)
+        ))));
+        let groups = vec![
+            ConnectionGroup {
+                url: format!("ws://{good_ws_address}/"),
+                server: crate::address::parse_tows("127.0.0.1").unwrap(),
+                rules: vec![ForwardRule {
+                    name: "good".to_string(),
+                    target: crate::address::parse_target("22").unwrap(),
+                    listen: crate::address::parse_listen(&good_port.to_string()).unwrap(),
+                }],
+            },
+            ConnectionGroup {
+                url: format!("ws://{bad_ws_address}/"),
+                server: crate::address::parse_tows("127.0.0.2").unwrap(),
+                rules: vec![ForwardRule {
+                    name: "bad".to_string(),
+                    target: crate::address::parse_target("22").unwrap(),
+                    listen: crate::address::parse_listen(&bad_port.to_string()).unwrap(),
+                }],
+            },
+        ];
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let coordinator = tokio::spawn(run_connection_groups(
+            groups,
+            cookie,
+            stop_rx,
+            Arc::new(ChannelObserver { events: event_tx }),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut ready = HashSet::new();
+            while ready.len() < 2 {
+                let (name, message) = event_rx.recv().await.unwrap();
+                if message.starts_with("ready:") {
+                    ready.insert(name);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(TcpStream::connect(("127.0.0.1", good_port)).await.is_ok());
+        assert!(TcpStream::connect(("127.0.0.1", bad_port)).await.is_ok());
+
+        close_bad_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (name, message) = event_rx.recv().await.unwrap();
+                if name == "bad" && message.contains("failed:") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(TcpStream::connect(("127.0.0.1", bad_port)).await.is_err());
+        assert!(TcpStream::connect(("127.0.0.1", good_port)).await.is_ok());
+
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), coordinator)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

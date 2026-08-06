@@ -52,7 +52,9 @@ HELLO 或 HELLO_ACK 的 payload 为：
 
 ## 心跳与背压
 
-客户端每 60 秒发送一条 PING。PING 只维持空闲连接，不要求响应；断线由 WebSocket close 或读写错误判定。
+客户端在每条 WebSocket 上每 60 秒独立发送一条 PING。PING 只维持空闲连接，不要求响应；断线由 WebSocket close 或读写错误判定。同一客户端可以同时连接多个 tows，每条连接的握手、PING、流编号空间、背压和故障范围互相独立。
+
+WebVPN Cookie 刷新不属于本协议。客户端会话共享一个 Cookie，并每 10 分钟执行一次刷新；单条 WebSocket 断开只终止它承载的隧道，Cookie 刷新失败则终止使用该会话的全部连接。
 
 - 每条 WebSocket 最多 64 条正在打开或已打开的 TCP 流；
 - 每流发送队列最多 16 个 DATA 帧；

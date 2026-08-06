@@ -6,9 +6,10 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::address::{Endpoint, parse_listen, parse_target, parse_tows};
+use crate::address::{parse_listen, parse_target, parse_tows};
 use crate::client::{
-    AuthPrompt, ClientObserver, ForwardRule, LoginPreference, login_or_restore, run_tunnels,
+    AuthPrompt, ClientObserver, ForwardRule, LoginPreference, ServerGroup, login_or_restore,
+    run_server_groups,
 };
 
 use super::config::{
@@ -19,8 +20,8 @@ use super::config::{
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 720.0])
-            .with_min_inner_size([720.0, 520.0])
+            .with_inner_size([1120.0, 720.0])
+            .with_min_inner_size([900.0, 520.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -177,7 +178,7 @@ impl TowcApp {
         if self.running {
             return;
         }
-        let (preference, server, rules) = match self.session_config() {
+        let (preference, groups) = match self.session_config() {
             Ok(session) => session,
             Err(error) => {
                 self.log(format!("无法启动: {error:#}"));
@@ -221,7 +222,7 @@ impl TowcApp {
                     .context("无法创建 GUI 异步运行时")?
                     .block_on(async move {
                         let cookie = login_or_restore(auth, preference).await?;
-                        run_tunnels(server, rules, cookie, stop_rx, observer).await
+                        run_server_groups(groups, cookie, stop_rx, observer).await
                     })
             });
             let _ = event_tx.send(WorkerEvent::Finished(
@@ -230,7 +231,7 @@ impl TowcApp {
         });
     }
 
-    fn session_config(&self) -> Result<(LoginPreference, Endpoint, Vec<ForwardRule>)> {
+    fn session_config(&self) -> Result<(LoginPreference, Vec<ServerGroup>)> {
         if self.save_blocked {
             bail!("原配置处于保护状态；请先确认使用当前界面配置");
         }
@@ -240,24 +241,27 @@ impl TowcApp {
         }
 
         let preference = self.login_kind.preference(self.identity.trim())?;
-        let server = parse_tows(&self.config.tows).context("tows 地址无效")?;
-        let rules = self
-            .config
-            .tunnels
-            .iter()
-            .filter(|tunnel| tunnel.enabled)
-            .map(|tunnel| {
-                Ok(ForwardRule {
-                    name: tunnel.name.clone(),
-                    target: parse_target(&tunnel.target)?,
-                    listen: parse_listen(&tunnel.listen)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if rules.is_empty() {
+        let mut groups = Vec::<ServerGroup>::new();
+        for tunnel in self.config.tunnels.iter().filter(|tunnel| tunnel.enabled) {
+            let server = parse_tows(&tunnel.tows)?;
+            let rule = ForwardRule {
+                name: tunnel.name.clone(),
+                target: parse_target(&tunnel.target)?,
+                listen: parse_listen(&tunnel.listen)?,
+            };
+            if let Some(group) = groups.iter_mut().find(|group| group.server == server) {
+                group.rules.push(rule);
+            } else {
+                groups.push(ServerGroup {
+                    server,
+                    rules: vec![rule],
+                });
+            }
+        }
+        if groups.is_empty() {
             bail!("至少需要启用一条隧道");
         }
-        Ok((preference, server, rules))
+        Ok((preference, groups))
     }
 
     fn stop(&mut self) {
@@ -282,7 +286,7 @@ impl TowcApp {
                 }
                 WorkerEvent::Tunnel(name, message) => {
                     self.tunnel_status.insert(name.clone(), message.clone());
-                    self.log(format!("[{name}] {message}"));
+                    self.log(format!("[tunnel] [{name}] {message}"));
                 }
                 WorkerEvent::Qr(bytes) => match qr_texture(context, &bytes) {
                     Ok(texture) => self.qr_texture = Some(texture),
@@ -320,6 +324,14 @@ impl TowcApp {
     }
 
     fn log(&mut self, message: String) {
+        let message = if message.starts_with("[towc] ")
+            || message.starts_with("[tunnel] ")
+            || message.starts_with("[tows] ")
+        {
+            message
+        } else {
+            format!("[towc] {message}")
+        };
         self.logs.push(message);
         if self.logs.len() > 500 {
             self.logs.drain(..self.logs.len() - 500);
@@ -379,10 +391,6 @@ impl eframe::App for TowcApp {
         egui::CentralPanel::default().show(context, |ui| {
             ui.add_enabled_ui(!self.running, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("tows 地址");
-                    ui.text_edit_singleline(&mut self.config.tows);
-                });
-                ui.horizontal(|ui| {
                     ui.label("登录方式");
                     ui.selectable_value(&mut self.login_kind, LoginKind::Wechat, "微信扫码");
                     ui.selectable_value(&mut self.login_kind, LoginKind::Mobile, "手机验证码");
@@ -400,6 +408,7 @@ impl eframe::App for TowcApp {
             egui::Grid::new("tunnels").striped(true).show(ui, |ui| {
                 ui.label("启用");
                 ui.label("名称");
+                ui.label("tows");
                 ui.label("目标");
                 ui.label("本地监听");
                 ui.label("状态");
@@ -412,6 +421,10 @@ impl eframe::App for TowcApp {
                     ui.add_enabled(
                         !self.running,
                         egui::TextEdit::singleline(&mut tunnel.name).desired_width(110.0),
+                    );
+                    ui.add_enabled(
+                        !self.running,
+                        egui::TextEdit::singleline(&mut tunnel.tows).desired_width(160.0),
                     );
                     ui.add_enabled(
                         !self.running,
@@ -451,8 +464,15 @@ impl eframe::App for TowcApp {
                 .clicked()
             {
                 let number = self.config.tunnels.len() + 1;
+                let tows = self
+                    .config
+                    .tunnels
+                    .last()
+                    .map(|tunnel| tunnel.tows.clone())
+                    .unwrap_or_else(|| "10.18.47.77:4489".to_string());
                 self.config.tunnels.push(TunnelConfig {
                     name: format!("隧道 {number}"),
+                    tows,
                     target: "127.0.0.1:22".to_string(),
                     listen: format!("127.0.0.1:{}", 14489_u32 + number as u32),
                     enabled: true,

@@ -6,25 +6,26 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::address::{parse_listen, parse_target, parse_tows};
+use crate::protocol::MAX_TUNNELS;
 use crate::storage::{data_file, write_json};
 
-pub const CONFIG_VERSION: u32 = 1;
-pub const DEFAULT_TOWS: &str = "10.18.47.77:4489";
 const CONFIG_FILE: &str = "config.json";
+const DEFAULT_TOWS_77: &str = "10.18.47.77:4489";
+const DEFAULT_TOWS_66: &str = "10.18.47.66:4489";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GuiConfig {
-    pub version: u32,
-    #[serde(default = "default_tows")]
-    pub tows: String,
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     #[serde(default)]
     pub name: String,
+    pub tows: String,
     pub target: String,
     pub listen: String,
     #[serde(default = "enabled_by_default")]
@@ -34,7 +35,6 @@ pub struct TunnelConfig {
 #[derive(Debug)]
 pub struct LoadedConfig {
     pub config: GuiConfig,
-    /// 配置损坏或来自更高版本时，用户确认前禁止保存。
     pub save_blocked: bool,
     pub warning: Option<String>,
 }
@@ -48,7 +48,6 @@ pub enum MergePolicy {
 
 #[derive(Debug)]
 pub struct ImportBundle {
-    pub tows: Option<String>,
     pub tunnels: Vec<TunnelConfig>,
     pub messages: Vec<String>,
     pub files_read: usize,
@@ -57,23 +56,23 @@ pub struct ImportBundle {
 impl Default for GuiConfig {
     fn default() -> Self {
         Self {
-            version: CONFIG_VERSION,
-            tows: default_tows(),
             tunnels: vec![
-                TunnelConfig {
-                    name: "SSH".to_string(),
-                    target: "127.0.0.1:22".to_string(),
-                    listen: "127.0.0.1:14489".to_string(),
-                    enabled: true,
-                },
-                TunnelConfig {
-                    name: "Minecraft".to_string(),
-                    target: "127.0.0.1:25565".to_string(),
-                    listen: "127.0.0.1:25565".to_string(),
-                    enabled: true,
-                },
+                default_tunnel("77 SSH", DEFAULT_TOWS_77, "22", "14489"),
+                default_tunnel("77 Minecraft", DEFAULT_TOWS_77, "25565", "25565"),
+                default_tunnel("66 SSH", DEFAULT_TOWS_66, "22", "14490"),
+                default_tunnel("66 Minecraft", DEFAULT_TOWS_66, "25565", "25566"),
             ],
         }
+    }
+}
+
+fn default_tunnel(name: &str, tows: &str, target: &str, listen: &str) -> TunnelConfig {
+    TunnelConfig {
+        name: name.to_string(),
+        tows: tows.to_string(),
+        target: format!("127.0.0.1:{target}"),
+        listen: format!("127.0.0.1:{listen}"),
+        enabled: true,
     }
 }
 
@@ -100,19 +99,14 @@ fn load_config_at(path: &Path) -> LoadedConfig {
                 save_blocked: false,
                 warning: None,
             },
-            Err(error) => {
-                let readable_newer = serde_json::from_slice::<GuiConfig>(&contents)
-                    .ok()
-                    .filter(|config| config.version > CONFIG_VERSION);
-                LoadedConfig {
-                    config: readable_newer.unwrap_or_default(),
-                    save_blocked: true,
-                    warning: Some(format!(
-                        "配置 {} 无法写入，已按只读方式打开且不会覆盖原文件：{error:#}",
-                        path.display()
-                    )),
-                }
-            }
+            Err(error) => LoadedConfig {
+                config: GuiConfig::default(),
+                save_blocked: true,
+                warning: Some(format!(
+                    "配置 {} 无法读取，已加载默认值且不会覆盖原文件：{error:#}",
+                    path.display()
+                )),
+            },
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => LoadedConfig {
             config: GuiConfig::default(),
@@ -135,27 +129,14 @@ pub fn save_default_config(config: &GuiConfig) -> Result<()> {
 
 pub fn parse_config(contents: &[u8]) -> Result<GuiConfig> {
     let mut config: GuiConfig = serde_json::from_slice(contents).context("JSON 格式错误")?;
-    if config.version > CONFIG_VERSION {
-        bail!(
-            "配置版本 {} 高于本程序支持的版本 {}，只能只读查看",
-            config.version,
-            CONFIG_VERSION
-        );
-    }
-    if config.version != CONFIG_VERSION {
-        bail!("不支持的配置版本 {}", config.version);
-    }
     assign_missing_names(&mut config.tunnels);
     validate_config(&config)?;
     Ok(config)
 }
 
 pub fn validate_config(config: &GuiConfig) -> Result<()> {
-    if config.version != CONFIG_VERSION {
-        bail!("配置 version 必须为 {CONFIG_VERSION}");
-    }
-    parse_tows(&config.tows).context("无效 tows 地址")?;
     let mut names = HashSet::new();
+    let mut group_sizes = HashMap::<String, usize>::new();
     for (index, tunnel) in config.tunnels.iter().enumerate() {
         let name = tunnel.name.trim();
         if name.is_empty() {
@@ -164,8 +145,19 @@ pub fn validate_config(config: &GuiConfig) -> Result<()> {
         if !names.insert(name.to_string()) {
             bail!("隧道名称重复: {name}");
         }
+        let server =
+            parse_tows(&tunnel.tows).with_context(|| format!("隧道 {name} 的 tows 地址无效"))?;
         parse_target(&tunnel.target).with_context(|| format!("隧道 {name} 的 target 无效"))?;
         parse_listen(&tunnel.listen).with_context(|| format!("隧道 {name} 的 listen 无效"))?;
+        if tunnel.enabled {
+            *group_sizes.entry(server.to_string()).or_default() += 1;
+        }
+    }
+    if let Some((server, count)) = group_sizes
+        .into_iter()
+        .find(|(_, count)| *count > MAX_TUNNELS)
+    {
+        bail!("tows {server} 启用了 {count} 条隧道，最多允许 {MAX_TUNNELS} 条");
     }
     Ok(())
 }
@@ -197,7 +189,6 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
     files.dedup();
 
     let mut tunnels = Vec::new();
-    let mut tows = None;
     let mut files_read = 0;
     for path in files {
         match fs::read(&path)
@@ -206,7 +197,6 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
         {
             Ok(config) => {
                 files_read += 1;
-                tows = Some(config.tows);
                 tunnels.extend(config.tunnels);
             }
             Err(error) => messages.push(format!("跳过 {}：{error:#}", path.display())),
@@ -214,7 +204,6 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
     }
     assign_missing_names(&mut tunnels);
     ImportBundle {
-        tows,
         tunnels,
         messages,
         files_read,
@@ -224,9 +213,6 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
 pub fn merge_import(config: &mut GuiConfig, bundle: ImportBundle, policy: MergePolicy) {
     if policy == MergePolicy::ReplaceAll {
         config.tunnels = bundle.tunnels;
-        if let Some(tows) = bundle.tows {
-            config.tows = tows;
-        }
         return;
     }
 
@@ -283,7 +269,8 @@ fn assign_missing_names(tunnels: &mut [TunnelConfig]) {
         if !tunnel.name.is_empty() {
             continue;
         }
-        let hash = fnv1a(format!("{}\0{}", tunnel.target, tunnel.listen).as_bytes());
+        let hash =
+            fnv1a(format!("{}\0{}\0{}", tunnel.tows, tunnel.target, tunnel.listen).as_bytes());
         let base = format!("隧道-{hash:08x}");
         let mut candidate = base.clone();
         let mut suffix = 2;
@@ -305,10 +292,6 @@ fn fnv1a(bytes: &[u8]) -> u32 {
     hash
 }
 
-fn default_tows() -> String {
-    DEFAULT_TOWS.to_string()
-}
-
 const fn enabled_by_default() -> bool {
     true
 }
@@ -318,11 +301,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn defaults_group_two_tunnels_per_server() {
+        let config = GuiConfig::default();
+        let mut counts = HashMap::new();
+        for tunnel in config.tunnels {
+            *counts.entry(tunnel.tows).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 2);
+        assert!(counts.into_values().all(|count| count == 2));
+    }
+
+    #[test]
     fn missing_names_are_deterministic_and_written_on_save() {
         let source = br#"{
-            "version": 1,
-            "tows": "example.test",
-            "tunnels": [{"target":"22","listen":"14489"}]
+            "tunnels": [{"tows":"example.test","target":"22","listen":"14489"}]
         }"#;
         let first = parse_config(source).unwrap();
         let second = parse_config(source).unwrap();
@@ -334,7 +326,8 @@ mod tests {
     fn merge_supports_skip_overwrite_and_replace() {
         let mut config = GuiConfig::default();
         let incoming = TunnelConfig {
-            name: "SSH".to_string(),
+            name: "77 SSH".to_string(),
+            tows: DEFAULT_TOWS_77.to_string(),
             target: "127.0.0.1:2222".to_string(),
             listen: "127.0.0.1:12222".to_string(),
             enabled: true,
@@ -342,7 +335,6 @@ mod tests {
         merge_import(
             &mut config,
             ImportBundle {
-                tows: None,
                 tunnels: vec![incoming.clone()],
                 messages: vec![],
                 files_read: 1,
@@ -353,7 +345,6 @@ mod tests {
         merge_import(
             &mut config,
             ImportBundle {
-                tows: None,
                 tunnels: vec![incoming],
                 messages: vec![],
                 files_read: 1,
@@ -364,8 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn higher_version_is_rejected_without_rewriting() {
-        assert!(parse_config(br#"{"version":2,"tunnels":[]}"#).is_err());
+    fn unknown_fields_are_rejected() {
+        assert!(parse_config(br#"{"unexpected":true,"tunnels":[]}"#).is_err());
     }
 
     #[test]
@@ -373,8 +364,8 @@ mod tests {
         let mut config = GuiConfig::default();
         config.tunnels[1].listen = config.tunnels[0].listen.clone();
         let conflicts = listen_conflicts(&config);
-        assert!(conflicts.contains("SSH"));
-        assert!(conflicts.contains("Minecraft"));
+        assert!(conflicts.contains("77 SSH"));
+        assert!(conflicts.contains("77 Minecraft"));
     }
 
     #[test]
