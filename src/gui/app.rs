@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use eframe::egui;
 use std::collections::HashMap;
 use std::io::Write;
@@ -6,7 +6,7 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::address::{parse_listen, parse_target, parse_tows};
+use crate::address::{Endpoint, parse_listen, parse_target, parse_tows};
 use crate::client::{
     AuthPrompt, ClientObserver, ForwardRule, LoginPreference, login_or_restore, run_tunnels,
 };
@@ -42,6 +42,30 @@ enum WorkerEvent {
     },
     Log(String),
     Finished(std::result::Result<(), String>),
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum LoginKind {
+    #[default]
+    Wechat,
+    Mobile,
+    Email,
+}
+
+impl LoginKind {
+    fn preference(self, identity: &str) -> Result<LoginPreference> {
+        match self {
+            Self::Wechat => Ok(LoginPreference::Wechat),
+            Self::Mobile => match LoginPreference::from_identity(identity) {
+                Ok(LoginPreference::Mobile(value)) => Ok(LoginPreference::Mobile(value)),
+                _ => bail!("手机登录需要填写纯数字手机号"),
+            },
+            Self::Email => match LoginPreference::from_identity(identity) {
+                Ok(LoginPreference::Email(value)) => Ok(LoginPreference::Email(value)),
+                _ => bail!("邮箱登录需要填写有效邮箱"),
+            },
+        }
+    }
 }
 
 struct GuiBridge {
@@ -108,7 +132,7 @@ struct TowcApp {
     config: GuiConfig,
     save_blocked: bool,
     warning: Option<String>,
-    login_kind: usize,
+    login_kind: LoginKind,
     identity: String,
     running: bool,
     status: String,
@@ -130,7 +154,7 @@ impl TowcApp {
             config: loaded.config,
             save_blocked: loaded.save_blocked,
             warning: loaded.warning,
-            login_kind: 0,
+            login_kind: LoginKind::default(),
             identity: String::new(),
             running: false,
             status: "未启动".to_string(),
@@ -153,63 +177,10 @@ impl TowcApp {
         if self.running {
             return;
         }
-        if self.save_blocked {
-            self.log("原配置处于保护状态；请先确认使用当前界面配置".to_string());
-            return;
-        }
-        if let Err(error) = validate_config(&self.config) {
-            self.log(format!("配置校验失败: {error:#}"));
-            return;
-        }
-        if !listen_conflicts(&self.config).is_empty() {
-            self.log("存在启用隧道的监听端口冲突，无法启动".to_string());
-            return;
-        }
-        let preference = match self.login_kind {
-            0 => LoginPreference::Wechat,
-            1 => match LoginPreference::from_identity(self.identity.trim()) {
-                Ok(LoginPreference::Mobile(value)) => LoginPreference::Mobile(value),
-                _ => {
-                    self.log("手机登录需要填写纯数字手机号".to_string());
-                    return;
-                }
-            },
-            _ => match LoginPreference::from_identity(self.identity.trim()) {
-                Ok(LoginPreference::Email(value)) => LoginPreference::Email(value),
-                _ => {
-                    self.log("邮箱登录需要填写有效邮箱".to_string());
-                    return;
-                }
-            },
-        };
-        let server = match parse_tows(&self.config.tows) {
-            Ok(server) => server,
+        let (preference, server, rules) = match self.session_config() {
+            Ok(session) => session,
             Err(error) => {
-                self.log(format!("tows 地址无效: {error}"));
-                return;
-            }
-        };
-        let rules: Result<Vec<_>> = self
-            .config
-            .tunnels
-            .iter()
-            .filter(|tunnel| tunnel.enabled)
-            .map(|tunnel| {
-                Ok(ForwardRule {
-                    name: tunnel.name.clone(),
-                    target: parse_target(&tunnel.target)?,
-                    listen: parse_listen(&tunnel.listen)?,
-                })
-            })
-            .collect();
-        let rules = match rules {
-            Ok(rules) if !rules.is_empty() => rules,
-            Ok(_) => {
-                self.log("至少需要启用一条隧道".to_string());
-                return;
-            }
-            Err(error) => {
-                self.log(format!("隧道地址无效: {error:#}"));
+                self.log(format!("无法启动: {error:#}"));
                 return;
             }
         };
@@ -257,6 +228,36 @@ impl TowcApp {
                 result.map_err(|error: anyhow::Error| format!("{error:#}")),
             ));
         });
+    }
+
+    fn session_config(&self) -> Result<(LoginPreference, Endpoint, Vec<ForwardRule>)> {
+        if self.save_blocked {
+            bail!("原配置处于保护状态；请先确认使用当前界面配置");
+        }
+        validate_config(&self.config).context("配置校验失败")?;
+        if !listen_conflicts(&self.config).is_empty() {
+            bail!("存在启用隧道的监听端口冲突");
+        }
+
+        let preference = self.login_kind.preference(self.identity.trim())?;
+        let server = parse_tows(&self.config.tows).context("tows 地址无效")?;
+        let rules = self
+            .config
+            .tunnels
+            .iter()
+            .filter(|tunnel| tunnel.enabled)
+            .map(|tunnel| {
+                Ok(ForwardRule {
+                    name: tunnel.name.clone(),
+                    target: parse_target(&tunnel.target)?,
+                    listen: parse_listen(&tunnel.listen)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if rules.is_empty() {
+            bail!("至少需要启用一条隧道");
+        }
+        Ok((preference, server, rules))
     }
 
     fn stop(&mut self) {
@@ -360,7 +361,7 @@ impl eframe::App for TowcApp {
 
         egui::TopBottomPanel::top("top").show(context, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("tcp_over_websocket v0.5.1");
+                ui.heading(format!("tcp_over_websocket v{}", crate::APP_VERSION));
                 ui.separator();
                 ui.label(&self.status);
             });
@@ -383,10 +384,10 @@ impl eframe::App for TowcApp {
                 });
                 ui.horizontal(|ui| {
                     ui.label("登录方式");
-                    ui.selectable_value(&mut self.login_kind, 0, "微信扫码");
-                    ui.selectable_value(&mut self.login_kind, 1, "手机验证码");
-                    ui.selectable_value(&mut self.login_kind, 2, "邮箱验证码");
-                    if self.login_kind != 0 {
+                    ui.selectable_value(&mut self.login_kind, LoginKind::Wechat, "微信扫码");
+                    ui.selectable_value(&mut self.login_kind, LoginKind::Mobile, "手机验证码");
+                    ui.selectable_value(&mut self.login_kind, LoginKind::Email, "邮箱验证码");
+                    if self.login_kind != LoginKind::Wechat {
                         ui.text_edit_singleline(&mut self.identity);
                     }
                 });

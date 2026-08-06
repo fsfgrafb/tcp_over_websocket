@@ -12,9 +12,9 @@
 
 ## 下载和部署
 
-从 GitHub Release 下载对应平台压缩包。每个压缩包都包含本 README 和 `docs/protocol-v2.md`。
+从 GitHub Release 下载对应平台压缩包。每个压缩包都包含本 README 和 `docs/protocol.md`。
 
-先在能访问目标服务的内网机器启动新版服务端：
+先在能访问目标服务的内网机器启动服务端：
 
 ```text
 tows
@@ -25,8 +25,6 @@ tows
 ```text
 tows 54489
 ```
-
-内网已有的 **v0.5.0 及更早版本使用旧路径协议，与 v0.5.1 不兼容**。启动新客户端前，必须先升级 `10.18.47.77` 以及实际要使用的其他 tows。协议不匹配时客户端会退出，不会降级。
 
 ## towc 最短示例
 
@@ -108,15 +106,14 @@ IPv6 必须使用 `[addr]` 或 `[addr]:port`。目标和监听可只写端口，
 - 仅支持 TCP；Minecraft 基岩版默认使用 UDP，不能直接转发。
 - 单条 WS 最多同时打开或正在打开 64 条 TCP 流。
 - 单帧数据上限 65,535 字节，较大的 TCP 读取会自动分片。
-- 不兼容 v0.5.0 及更早的 `/tcp/...` 路径协议。
 - 不自动重连或自动重新登录；网络或认证失败后需用户重新启动。
 - WebVPN ticket 绑定来源 IP，切换网络通常需要重新登录。
 
 ## 常见故障
 
-**提示旧版 tows 或等待 HELLO_ACK 超时**
+**等待 HELLO_ACK 超时或协议版本不一致**
 
-先升级内网 `tows` 到 v0.5.1 或更高版本，并确认启动的是新二进制。新版服务端不会发送“连接成功”文本。
+确认 `towc` 与 `tows` 来自同一 Release，并检查服务端是否正在配置端口监听。
 
 **WebVPN 返回 `/wengine-vpn/failed`**
 
@@ -145,4 +142,4 @@ cargo build --release --features client,server --bin towc --bin tows
 cargo build --release --all-features --bin towc_gui
 ```
 
-协议细节见 [docs/protocol-v2.md](docs/protocol-v2.md)。
+协议细节见 [docs/protocol.md](docs/protocol.md)。

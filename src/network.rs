@@ -29,8 +29,6 @@ use crate::protocol::{Frame, PROTOCOL_VERSION};
 pub const WEBVPN_HOST: &str = "webvpn.szut.edu.cn";
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const OLD_TOWS_MESSAGE: &str = "连接成功";
-
 #[cfg(feature = "client")]
 const WEBVPN_AES_KEY: &[u8; 16] = b"wrdvpnisthebest!";
 #[cfg(feature = "client")]
@@ -154,7 +152,7 @@ fn install_crypto_provider() {
     });
 }
 
-/// 客户端 HELLO/HELLO_ACK 握手。旧版文本提示会得到明确诊断。
+/// Client HELLO/HELLO_ACK handshake.
 pub async fn client_handshake<S>(websocket: &mut WebSocketStream<S>, program: &str) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -167,14 +165,9 @@ where
 
     let message = tokio::time::timeout(HANDSHAKE_TIMEOUT, websocket.next())
         .await
-        .map_err(|_| anyhow!("timed out waiting for HELLO_ACK; upgrade tows to v0.5.1 or later"))?
+        .map_err(|_| anyhow!("timed out waiting for HELLO_ACK"))?
         .context("tows closed the connection before HELLO_ACK")??;
     let Message::Binary(bytes) = message else {
-        if matches!(&message, Message::Text(text) if text.as_str() == OLD_TOWS_MESSAGE) {
-            return Err(anyhow!(
-                "legacy text-based tows protocol detected; upgrade the server"
-            ));
-        }
         return Err(anyhow!("HELLO_ACK must be a WebSocket Binary message"));
     };
     let ack = Frame::decode(&bytes)?;
@@ -182,7 +175,7 @@ where
     let (version, server_program) = ack.version()?;
     if version != PROTOCOL_VERSION {
         return Err(anyhow!(
-            "protocol version mismatch: client v{PROTOCOL_VERSION}, server v{version} ({server_program}); upgrade tows"
+            "protocol version mismatch: client v{PROTOCOL_VERSION}, server v{version} ({server_program})"
         ));
     }
     tracing::info!(target: "tunnel", "protocol handshake complete; peer={server_program}");

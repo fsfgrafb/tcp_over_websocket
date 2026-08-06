@@ -356,9 +356,6 @@ async fn handle_ws_message(
         }
         Message::Pong(_) => Ok(()),
         Message::Close(frame) => bail!("server closed the WebSocket: {frame:?}"),
-        Message::Text(text) if text.as_str() == "连接成功" => {
-            bail!("legacy text-based tows protocol detected; upgrade the server")
-        }
         Message::Text(_) => bail!("the protocol only accepts WebSocket Binary messages"),
         Message::Frame(_) => Ok(()),
     }

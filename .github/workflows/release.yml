@@ -26,7 +26,7 @@ jobs:
           Copy-Item target/x86_64-pc-windows-msvc/release/towc.exe,target/x86_64-pc-windows-msvc/release/tows.exe,target/x86_64-pc-windows-msvc/release/towc_gui.exe -Destination dist/tcp_over_websocket-v0.5.1-windows-x64
           Copy-Item README.md,LICENSE -Destination dist/tcp_over_websocket-v0.5.1-windows-x64
           New-Item -ItemType Directory -Path dist/tcp_over_websocket-v0.5.1-windows-x64/docs
-          Copy-Item docs/protocol-v2.md -Destination dist/tcp_over_websocket-v0.5.1-windows-x64/docs
+          Copy-Item docs/protocol.md -Destination dist/tcp_over_websocket-v0.5.1-windows-x64/docs
           Compress-Archive -Path dist/tcp_over_websocket-v0.5.1-windows-x64 -DestinationPath dist/tcp_over_websocket-v0.5.1-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -46,7 +46,7 @@ jobs:
         run: |
           mkdir -p dist/tcp_over_websocket-v0.5.1-linux-x64/docs
           cp target/x86_64-unknown-linux-gnu/release/towc target/x86_64-unknown-linux-gnu/release/tows README.md LICENSE dist/tcp_over_websocket-v0.5.1-linux-x64/
-          cp docs/protocol-v2.md dist/tcp_over_websocket-v0.5.1-linux-x64/docs/
+          cp docs/protocol.md dist/tcp_over_websocket-v0.5.1-linux-x64/docs/
           cd dist && zip -r tcp_over_websocket-v0.5.1-linux-x64.zip tcp_over_websocket-v0.5.1-linux-x64
       - uses: actions/upload-artifact@v4
         with:
@@ -66,7 +66,7 @@ jobs:
         run: |
           mkdir -p dist/tcp_over_websocket-v0.5.1-linux-aarch64/docs
           cp target/aarch64-unknown-linux-gnu/release/towc target/aarch64-unknown-linux-gnu/release/tows README.md LICENSE dist/tcp_over_websocket-v0.5.1-linux-aarch64/
-          cp docs/protocol-v2.md dist/tcp_over_websocket-v0.5.1-linux-aarch64/docs/
+          cp docs/protocol.md dist/tcp_over_websocket-v0.5.1-linux-aarch64/docs/
           cd dist && zip -r tcp_over_websocket-v0.5.1-linux-aarch64.zip tcp_over_websocket-v0.5.1-linux-aarch64
       - uses: actions/upload-artifact@v4
         with:

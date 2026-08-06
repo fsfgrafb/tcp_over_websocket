@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn rsa_matches_historical_cas_javascript() {
+    fn rsa_matches_cas_javascript() {
         let encrypted = rsa_encrypt(
             "654321",
             "91c28b7f794d9aa0e73078c8f9ef68270154fbecdbc455c06afb4fe922fa433218e785e1e90402c0ab120c04296472ff310da4237339e1d15c506694add53d4b",
