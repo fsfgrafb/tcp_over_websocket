@@ -25,6 +25,12 @@
 ```
 外网应用 → towc(本机) → WebVPN WebSocket隧道 → tows(内网某机器,监听端口) → 目标TCP服务
 ```
+多隧道（towc_gui 方案 2，单 WS 多路复用）：
+```
+外网应用1 ─┐
+外网应用2 ─┤→ towc_gui(本机,单进程) → 1条WS(多路复用帧) → WebVPN → tows(内网) → 目标TCP服务1/2/3
+外网应用3 ─┘
+```
 
 三个可执行文件（本仓库产出）：
 - **towc**（控制台，跨平台）：跑在用户自己电脑（外网）。单进程单隧道（1 条 WS 连接）。负责 WebVPN 登录、本地监听端口、把本地 TCP 连接封装成 WebSocket 转发。
@@ -43,6 +49,14 @@
   - 与 tows 之间仅 **1 条 WS 连接**，多路复用所有隧道 → 只需 **1 个 WS 心跳**；cookie 保活也由 GUI 统一（全局一个）
   - GUI 上配置的若干条隧道 → 进程内并发建立/维持，无子进程、无 IPC
 
+### 1.1 towc 无参交互模式（与 v0.4 行为一致）
+1. 读取 tows 地址 → 立即输出对应的 WebVPN location → 尝试缓存认证
+2. 缓存有效 → 跳过登录方式；缓存缺失 / 格式无效 / 明确过期 → 询问登录方式（输入手机号/邮箱用验证码，或直接回车用终端微信扫码）
+3. 认证完成（ticket 已激活）→ 询问目标地址和本地监听地址（新架构**无独立保活 WS**；参数确定后建立隧道并输出连接成功日志，失败则提示）
+4. 新登录取得的 Cookie 立即写入本地缓存；网络或 TLS 故障无法证明 Cookie 已失效时，保留缓存并直接报告连接错误
+5. 交互模式缓存本次实际采用的 tows / 目标 / 本地监听地址，下次启动作为新默认选项（回车即复用）
+6. 配置缓存与 WebVPN Cookie 缓存**相互独立**
+
 ### 1.2 发布矩阵（win/linux，主力 win；2026-08-06 用户确认 3 个可执行文件）
 **发布 3 个可执行文件**（逻辑程序 3 个，平台二进制共 7 个）：
 
@@ -59,14 +73,6 @@
   - `tows` / `towc`：`x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`（aarch64 为 tows 必需、towc 可选）
   - `towc_gui`：仅 `x86_64-pc-windows-msvc`
 - **不采用 busybox 单二进制**（`tcpow server|client|gui`）：GUI 依赖会打进 Linux 版、体积增大、与 aarch64 交叉编译互相拖累
-
-### 1.1 towc 无参交互模式（与 v0.4 行为一致）
-1. 读取 tows 地址 → 立即输出对应的 WebVPN location → 尝试缓存认证
-2. 缓存有效 → 跳过登录方式；缓存缺失 / 格式无效 / 明确过期 → 询问登录方式（输入手机号/邮箱用验证码，或直接回车用终端微信扫码）
-3. 认证完成 → 启动 WS 保活，等到首次保活连接成功、输出连接成功日志后，才询问目标地址和本地监听地址
-4. 新登录取得的 Cookie 立即写入本地缓存；网络或 TLS 故障无法证明 Cookie 已失效时，保留缓存并直接报告连接错误
-5. 交互模式缓存本次实际采用的 tows / 目标 / 本地监听地址，下次启动作为新默认选项（回车即复用）
-6. 配置缓存与 WebVPN Cookie 缓存**相互独立**
 
 ---
 
@@ -107,12 +113,12 @@ Key = IV = "wrdvpnisthebest!"（16字节 ASCII）
 - 心跳文本 `"连接成功"` 会被网关回显（维持连接）
 - 保活接口：`GET /wengine-vpn/cookie?method=get&host=cas.szut.edu.cn&scheme=https&path=/personal-center&vpn_timestamp={ms}` → 200
 
-### 保活架构设计（2026-08-05 用户确认；参数可配置，⚠️ 默认值为临时设定）
+### 2.5.1 保活架构设计（2026-08-05 用户确认；参数可配置，⚠️ 默认值为临时设定）
 **核心：多路复用单连接架构（方案 2，2026-08-05 选定）**
 - **towc_gui = 1 个进程 = 1 条 WS 连接**，该连接**多路复用所有隧道**（帧头 tunnel_id 路由，见 §3.1），同时承载数据与 **60s 心跳** → 网关视角到 tows 的连接始终活跃；无独立保活 WS、无静默连接概念
 - **所有隧道只需 1 个 WS 心跳**（1 条连接），心跳定时器由 GUI 单任务统一驱动
 - **Cookie 刷新 = 全局一个，间隔默认 10 分钟（600s）**：GUI 内一个任务统一执行，所有隧道共享同一 ticket
-- **towc（单隧道控制台）**：仍为 1 进程 = 1 条 WS = 1 隧道，心跳 60s；与 tows 可走路径解析（旧）或复用协议
+- **towc（单隧道控制台）**：仍为 1 进程 = 1 条 WS = 1 隧道，心跳 60s；**与 tows 走路径解析模式**（§3.3，简单、兼容旧版），多路复用协议仅 towc_gui 使用
 - **错误处理：不做 IP 变化检测、不自动重登**——IP 变化 / cookie 过期等一切失效都通过保活/连接反馈直接体现（302 `/login?logoutByIpChange=true`、WS 握手被拒、保活失败），检测到任一失败即**直接退出**并提示用户重新启动程序重新登录；不引入"检测-重登"状态机，保持简单可靠
 - ✅ **带宽实测结论（2026-08-05 纯外网，多连接分段下载 200MB）**：WebVPN 是**账号级总带宽限制 ~5.3MB/s**，非按连接限速——1 连接 4.32 / 3 连接 5.21 / 10 连接 5.27 MB/s，多连接**不能线性叠加**（最多 +20% 后饱和）。→ **方案 2 单 WS 多路复用不会损失吞吐**（单连接本身即可跑满 ~5.3MB/s），此前"共享单连接带宽受限"的担忧**排除**
 
@@ -182,6 +188,7 @@ RSA 加密（提交前）：
 - **多路复用模式（新，towc_gui 用）**：1 条 WS 连接承载多个隧道，帧头带 tunnel_id，tows 按包路由（见 §3.1/3.2）
 - **路径解析模式（旧，towc 单隧道用）**：从 WS 请求路径解析目标（见 §3.3），兼容 v0.4 行为
 - 判断方式（tows）：连接建立后收到的**第一个二进制帧**若为合法 OPEN 帧（type=0x01）→ 多路复用模式；否则按路径解析模式
+- ⚠️ 时序保证：路径解析模式下**客户端必须先等 tows 的 `"连接成功"` 文本再发数据**（tows 建连后主动发文本），故 tows 收到客户端二进制帧时模式已确定，无歧义
 
 ### 3.1 多路复用帧格式（建议设计，可调整）
 WS **二进制帧**：
@@ -193,11 +200,12 @@ WS **二进制帧**：
 | 0x01 OPEN | towc→tows 建隧道 | 目标地址 UTF-8（`host:port` 或 `port`=127.0.0.1） |
 | 0x02 DATA | 双向隧道数据 | 原始 TCP 数据 |
 | 0x03 CLOSE | 双向关隧道 | 空 |
-| 0x04 PING | towc→tows 心跳 | 空（tows 可回 0x05 或忽略；任何帧都算网关活跃流量） |
+| 0x04 PING | towc→tows 心跳 | 空（tows 可忽略或回 PING；任何帧都算网关活跃流量） |
 | 0x05 OPEN_OK | tows→towc 建隧成功 | 空 |
 | 0x06 OPEN_FAIL | tows→towc 建隧失败 | 错误原因 UTF-8 |
 
 - tunnel_id：0x0001~0xFFFE 动态分配；0x0000/0xFFFF 保留
+- ⚠️ **payload_len 为 2B（上限 65535）**：DATA 帧单帧 ≤64KB，TCP 数据超过需发送端分片（按 ≤64KB 切块发多个 DATA 帧）
 - **心跳**：每 60s 一条 PING（1 条连接一个心跳即可，所有隧道共享）
 - **EOF 处理**：单隧道内 TCP EOF → 发 CLOSE（tunnel_id）并关闭该流；所有隧道关闭且无新连接 → 可关 WS
 
@@ -272,7 +280,7 @@ WS **二进制帧**：
 ## 6. 测试环境（可用）
 
 - **内网目标机**：`10.18.47.77`（Orange Pi 5 Plus，aarch64 Debian，SSH root / 密码 fj.10.23）
-  - 已运行：tows（systemd tows.service，当前监听 4489，v0.5.0）、MC 服务器（Docker MCSManager，TCP 25565，Leaves 1.21.8）、sshd（22）
+  - 已运行：tows（systemd tows.service，当前监听 4489，v0.5.0——**内网部署版，与仓库 git 历史独立**）、MC 服务器（Docker MCSManager，TCP 25565，Leaves 1.21.8）、sshd（22）
   - ⚠️ **不要改动/干扰 MC 服务器**（25565），只可做只读探测
 - 用户本机（Windows）当前能直达 10.18.47.77（同内网）；**外网场景**需通过 WebVPN 隧道
 - 验证方法：本机运行 towc（或等价的 WS 隧道客户端），经 `/ws-{port}/{编码77}/tcp/22` 连 SSH / `/tcp/25565` 连 MC，确认端到端可用
@@ -289,7 +297,8 @@ WS **二进制帧**：
   - `2026-08-05-最简登录流程详解.md`（登录全流程）
   - `2026-08-05-tcp_over_websocket版本研究记录.md`（历史版本分析）
   - `2026-08-05-记忆恢复与项目状态记录.md`（全项目背景）
-- **测试脚本**（`C:\Development\test\`）：`verify_webvpn_encode.py`（编码/解码）、`minimal_login_test.py`（最简登录）、`tunnel_client.py`（Python 版隧道客户端参考）、`ws_probe.py`（端点探测）、`throughput_test.py`/`latency_test.py`（性能）
+  - `2026-08-05-多连接并发下载测试记录.md`（带宽实测：账号级限速 ~5.3MB/s）
+- **测试脚本**（`C:\Development\test\`）：`verify_webvpn_encode.py`（编码/解码）、`minimal_login_test.py`（最简登录）、`tunnel_client.py`（Python 版隧道客户端参考）、`ws_probe.py`（端点探测）、`throughput_test.py`/`latency_test.py`（性能）、`multi_conn_download_test.py`（多连接并发分段下载测试）
 - WebVPN 前端源码：`C:\Development\test\wengine_main.js`（网瑞达网关 JS，可分析但混淆严重）
 
 ---
@@ -304,5 +313,9 @@ WS **二进制帧**：
   - **towc 参数规格**：`towc <tows-ip[:port]> [--target ...] [--listen ...] [--login mobile|email]`，flag 任意顺序，示例顺序 `--target → --listen → --login`；无参进入交互模式（与 v0.4 一致，§1.1）
   - 保活/错误处理：1 心跳 + 全局 cookie 刷新 10min；不检测 IP、不自动重登，失败即退出（§2.5）
   - ✅ 带宽实测：WebVPN 账号级限速 ~5.3MB/s，多连接不叠加；单 WS 多路复用无吞吐损失（§2.5/§3.4）
+- **已补充（2026-08-06）**：
+  - 发布矩阵：3 个可执行文件（tows/towc/towc_gui），win+linux x64+aarch64，towc_gui 仅 win（§1.2）
+  - 命名：保持 towc/tows/towc_gui 不变（towc 的 "c" = client），不改成 towc_cli
+  - towc 保持单隧道（多隧道职责全在 towc_gui；未来可扩展配置文件多隧道模式，走进程内 N 条 WS，不做多路复用）
 - 用户表示还会提供更多信息，收到后请更新本文档
 - 若有疑问，优先查阅 `C:\Development\test\docs\` 的详细记录
