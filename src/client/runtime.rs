@@ -20,8 +20,8 @@ use crate::protocol::{Frame, FrameType, MAX_DATA_LEN, MAX_TUNNELS};
 use crate::{APP_VERSION, init_tracing};
 
 use super::auth::{
-    AuthPrompt, SessionCookie, login_or_restore_for_server, login_with_preference, refresh_ticket,
-    restore_valid_cached_ticket_for_server,
+    AuthPrompt, SessionCookie, login_or_restore, login_with_preference, refresh_ticket,
+    restore_valid_cached_ticket,
 };
 use super::config::{ParsedArgs, parse_args, prompt_interactive, prompt_login};
 
@@ -40,6 +40,7 @@ pub struct ForwardRule {
 pub struct ServerGroup {
     pub server: Endpoint,
     pub rules: Vec<ForwardRule>,
+    pub heartbeat_interval: Duration,
 }
 
 pub trait ClientObserver: Send + Sync {
@@ -74,7 +75,7 @@ impl ClientObserver for TerminalUi {
     }
 
     fn tunnel_status(&self, name: &str, message: &str) {
-        tracing::info!(target: "tunnel", "[{name}] {message}");
+        tracing::info!(target: "tunnel", "<{name}> {message}");
     }
 }
 
@@ -97,7 +98,7 @@ pub async fn run_cli() -> Result<()> {
     let auth: Arc<dyn AuthPrompt> = ui.clone();
     let observer: Arc<dyn ClientObserver> = ui;
     let cookie = if interactive {
-        if let Some(cookie) = restore_valid_cached_ticket_for_server(&config.server).await {
+        if let Some(cookie) = restore_valid_cached_ticket().await {
             auth.status("reusing a valid WebVPN login cache");
             cookie
         } else {
@@ -105,7 +106,7 @@ pub async fn run_cli() -> Result<()> {
             login_with_preference(auth, config.login).await?
         }
     } else {
-        login_or_restore_for_server(auth, config.login, &config.server).await?
+        login_or_restore(auth, config.login).await?
     };
     let rule = ForwardRule {
         name: "towc".to_string(),
@@ -127,7 +128,17 @@ pub async fn run_tunnels(
     stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
 ) -> Result<()> {
-    run_server_groups(vec![ServerGroup { server, rules }], cookie, stop, observer).await
+    run_server_groups(
+        vec![ServerGroup {
+            server,
+            rules,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+        }],
+        cookie,
+        stop,
+        observer,
+    )
+    .await
 }
 
 pub async fn run_server_groups(
@@ -143,6 +154,7 @@ pub async fn run_server_groups(
                 url: build_webvpn_ws_url(&group.server)?,
                 server: group.server,
                 rules: group.rules,
+                heartbeat_interval: group.heartbeat_interval,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -155,6 +167,7 @@ pub async fn run_dynamic_server_groups(
     stop: watch::Receiver<bool>,
     updates: mpsc::UnboundedReceiver<Vec<ServerGroup>>,
     observer: Arc<dyn ClientObserver>,
+    cookie_refresh_interval: watch::Receiver<Duration>,
 ) -> Result<()> {
     let groups = groups
         .into_iter()
@@ -163,16 +176,26 @@ pub async fn run_dynamic_server_groups(
                 url: build_webvpn_ws_url(&group.server)?,
                 server: group.server,
                 rules: group.rules,
+                heartbeat_interval: group.heartbeat_interval,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    run_dynamic_connection_groups(groups, cookie, stop, updates, observer).await
+    run_dynamic_connection_groups(
+        groups,
+        cookie,
+        stop,
+        updates,
+        observer,
+        cookie_refresh_interval,
+    )
+    .await
 }
 
 struct ConnectionGroup {
     url: String,
     server: Endpoint,
     rules: Vec<ForwardRule>,
+    heartbeat_interval: Duration,
 }
 
 async fn run_connection_groups(
@@ -212,6 +235,7 @@ async fn run_connection_groups(
                 group.url,
                 server.clone(),
                 group.rules,
+                group.heartbeat_interval,
                 cookie,
                 group_stop,
                 group_observer,
@@ -279,46 +303,48 @@ async fn run_dynamic_connection_groups(
     mut stop: watch::Receiver<bool>,
     mut updates: mpsc::UnboundedReceiver<Vec<ServerGroup>>,
     observer: Arc<dyn ClientObserver>,
+    mut cookie_refresh_interval: watch::Receiver<Duration>,
 ) -> Result<()> {
     validate_connection_groups(&groups, true)?;
+    let initial_cookie_interval = *cookie_refresh_interval.borrow();
+    if initial_cookie_interval.is_zero() {
+        bail!("cookie refresh interval cannot be zero");
+    }
 
-    let total = groups.len();
-    let (session_stop_tx, session_stop_rx) = watch::channel(false);
-    let mut controls = HashMap::new();
-    let mut tasks = JoinSet::new();
-    for group in groups {
-        let server = group.server;
-        let (rules_tx, rules_rx) = watch::channel(group.rules);
-        controls.insert(server.clone(), rules_tx);
-        let cookie = cookie.clone();
-        let group_stop = session_stop_rx.clone();
-        let group_observer = Arc::clone(&observer);
-        tasks.spawn(async move {
-            let result = run_dynamic_tunnels_to_url(
-                group.url,
-                server.clone(),
-                rules_rx,
-                cookie,
-                group_stop,
-                group_observer,
-            )
-            .await;
-            (server, result)
-        });
+    let mut known_urls = groups
+        .iter()
+        .map(|group| (group.server.clone(), group.url.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut controls = HashMap::<Endpoint, DynamicControl>::new();
+    let mut stopping = HashSet::<Endpoint>::new();
+    let mut pending = HashMap::<Endpoint, ConnectionGroup>::new();
+    let mut tasks = JoinSet::<(Endpoint, u64, Result<()>)>::new();
+    let mut next_generation = 1_u64;
+    for group in groups.into_iter().filter(|group| !group.rules.is_empty()) {
+        spawn_dynamic_group(
+            group,
+            &cookie,
+            &observer,
+            &mut controls,
+            &mut tasks,
+            &mut next_generation,
+        );
     }
 
     let mut refresh = tokio::time::interval_at(
-        tokio::time::Instant::now() + COOKIE_REFRESH_INTERVAL,
-        COOKIE_REFRESH_INTERVAL,
+        tokio::time::Instant::now() + initial_cookie_interval,
+        initial_cookie_interval,
     );
-    let mut failures = Vec::new();
     let mut updates_open = true;
+    let mut cookie_updates_open = true;
 
-    while !tasks.is_empty() {
+    loop {
         tokio::select! {
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
-                    let _ = session_stop_tx.send(true);
+                    for control in controls.values() {
+                        let _ = control.stop.send(true);
+                    }
                     while tasks.join_next().await.is_some() {}
                     return Ok(());
                 }
@@ -334,56 +360,190 @@ async fn run_dynamic_connection_groups(
                     updates_open = false;
                     continue;
                 };
-                let requested = groups
-                    .into_iter()
-                    .map(|group| (group.server, group.rules))
-                    .collect::<HashMap<_, _>>();
-                if requested.len() != controls.len()
-                    || requested.keys().any(|server| !controls.contains_key(server))
-                {
-                    observer.status("tunnel update rejected: tows addresses cannot change while running");
+                let mut requested = HashMap::new();
+                let mut request_valid = true;
+                for group in groups {
+                    let url = if let Some(url) = known_urls.get(&group.server) {
+                        url.clone()
+                    } else {
+                        let Ok(url) = build_webvpn_ws_url(&group.server) else {
+                            observer.status("tunnel update rejected: invalid tows address");
+                            request_valid = false;
+                            break;
+                        };
+                        known_urls.insert(group.server.clone(), url.clone());
+                        url
+                    };
+                    requested.insert(group.server.clone(), ConnectionGroup {
+                        url,
+                        server: group.server,
+                        rules: group.rules,
+                        heartbeat_interval: group.heartbeat_interval,
+                    });
+                }
+                if !request_valid {
                     continue;
                 }
-                for (server, sender) in &controls {
-                    let rules = requested.get(server).cloned().unwrap_or_default();
-                    if rules.len() > MAX_TUNNELS {
-                        observer.status(&format!("tunnel update rejected: tows {server} exceeds {MAX_TUNNELS} rules"));
+                if requested.values().any(|group| group.rules.len() > MAX_TUNNELS) {
+                    observer.status("tunnel update rejected: a tows connection exceeds the rule limit");
+                    continue;
+                }
+
+                let removed = controls.keys().filter(|server| {
+                    requested.get(*server).is_none_or(|group| group.rules.is_empty())
+                }).cloned().collect::<Vec<_>>();
+                for server in removed {
+                    pending.remove(&server);
+                    if let Some(control) = controls.remove(&server) {
+                        let _ = control.stop.send(true);
+                        stopping.insert(server.clone());
+                        observer.status(&format!("tows {server} keepalive stopped"));
+                    }
+                }
+
+                for (server, group) in requested.drain() {
+                    if group.rules.is_empty() {
                         continue;
                     }
-                    let _ = sender.send(rules);
+                    let restart = controls.get(&server).is_some_and(|control| {
+                        control.heartbeat_interval != group.heartbeat_interval
+                    });
+                    if restart && let Some(control) = controls.remove(&server) {
+                        let _ = control.stop.send(true);
+                        stopping.insert(server.clone());
+                        pending.insert(server, group);
+                        continue;
+                    }
+                    if let Some(control) = controls.get(&server) {
+                        let _ = control.rules.send(group.rules);
+                    } else if stopping.contains(&server) {
+                        pending.insert(server, group);
+                    } else {
+                        spawn_dynamic_group(
+                            group,
+                            &cookie,
+                            &observer,
+                            &mut controls,
+                            &mut tasks,
+                            &mut next_generation,
+                        );
+                    }
                 }
             }
             _ = refresh.tick() => {
                 if let Err(error) = refresh_ticket(&cookie).await {
-                    let _ = session_stop_tx.send(true);
+                    for control in controls.values() {
+                        let _ = control.stop.send(true);
+                    }
                     while tasks.join_next().await.is_some() {}
                     return Err(error.context("WebVPN cookie refresh failed"));
                 }
                 observer.status("WebVPN cookie refreshed");
             }
-            joined = tasks.join_next() => {
-                let Some(joined) = joined else { break };
-                match joined {
-                    Ok((_server, Ok(()))) => {}
-                    Ok((server, Err(error))) => {
-                        failures.push(format!("tows {server} failed: {error:#}"));
+            changed = cookie_refresh_interval.changed(), if cookie_updates_open => {
+                if changed.is_ok() {
+                    let interval = *cookie_refresh_interval.borrow_and_update();
+                    if !interval.is_zero() {
+                        refresh = tokio::time::interval_at(
+                            tokio::time::Instant::now() + interval,
+                            interval,
+                        );
+                        observer.status(&format!("Cookie keepalive interval updated to {} seconds", interval.as_secs()));
                     }
-                    Err(error) => failures.push(format!("tows task failed: {error}")),
+                } else {
+                    cookie_updates_open = false;
                 }
-                observer.status(&format!("{}/{} tows connections active", tasks.len(), total));
+            }
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                let Some(joined) = joined else { continue };
+                match joined {
+                    Ok((server, generation, result)) => {
+                        stopping.remove(&server);
+                        if controls.get(&server).is_some_and(|control| control.generation == generation) {
+                            controls.remove(&server);
+                        }
+                        if let Err(error) = result {
+                            observer.status(&format!("tows {server} failed: {error:#}"));
+                        }
+                        if let Some(group) = pending.remove(&server) {
+                            spawn_dynamic_group(
+                                group,
+                                &cookie,
+                                &observer,
+                                &mut controls,
+                                &mut tasks,
+                                &mut next_generation,
+                            );
+                        }
+                    }
+                    Err(error) => observer.status(&format!("tows task failed: {error}")),
+                }
+                observer.status(&format!("{} tows connections active", controls.len()));
             }
         }
     }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!("all tows connections stopped: {}", failures.join("; "))
-    }
 }
 
+struct DynamicControl {
+    generation: u64,
+    rules: watch::Sender<Vec<ForwardRule>>,
+    stop: watch::Sender<bool>,
+    heartbeat_interval: Duration,
+}
+
+fn spawn_dynamic_group(
+    group: ConnectionGroup,
+    cookie: &SessionCookie,
+    observer: &Arc<dyn ClientObserver>,
+    controls: &mut HashMap<Endpoint, DynamicControl>,
+    tasks: &mut JoinSet<(Endpoint, u64, Result<()>)>,
+    next_generation: &mut u64,
+) {
+    let generation = *next_generation;
+    *next_generation = next_generation.wrapping_add(1);
+    let server = group.server.clone();
+    let heartbeat_interval = group.heartbeat_interval;
+    let (rules_tx, rules_rx) = watch::channel(group.rules);
+    let (stop_tx, stop_rx) = watch::channel(false);
+    controls.insert(
+        server.clone(),
+        DynamicControl {
+            generation,
+            rules: rules_tx,
+            stop: stop_tx,
+            heartbeat_interval,
+        },
+    );
+    let cookie = cookie.clone();
+    let group_observer = Arc::clone(observer);
+    tasks.spawn(async move {
+        let status_rules = rules_rx.clone();
+        let result = run_dynamic_tunnels_to_url(
+            group.url,
+            server.clone(),
+            rules_rx,
+            heartbeat_interval,
+            cookie,
+            stop_rx,
+            Arc::clone(&group_observer),
+        )
+        .await;
+        if let Err(error) = &result {
+            let names = status_rules
+                .borrow()
+                .iter()
+                .map(|rule| rule.name.clone())
+                .collect::<Vec<_>>();
+            let reason = format!("tows {server} failed: {error:#}");
+            for name in names {
+                group_observer.tunnel_status(&name, &reason);
+            }
+        }
+        (server, generation, result)
+    });
+}
 fn validate_connection_groups(groups: &[ConnectionGroup], allow_empty: bool) -> Result<()> {
-    if groups.is_empty() {
+    if groups.is_empty() && !allow_empty {
         bail!("no tows server groups are configured");
     }
     let mut servers = HashSet::new();
@@ -405,13 +565,23 @@ async fn run_tunnels_to_url(
     url: String,
     server: Endpoint,
     rules: Vec<ForwardRule>,
+    heartbeat_interval: Duration,
     cookie: SessionCookie,
     stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
 ) -> Result<()> {
     let (rules_tx, rules_rx) = watch::channel(rules);
-    let result =
-        run_controlled_tunnels_to_url(url, server, rules_rx, false, cookie, stop, observer).await;
+    let result = run_controlled_tunnels_to_url(
+        url,
+        server,
+        rules_rx,
+        false,
+        heartbeat_interval,
+        cookie,
+        stop,
+        observer,
+    )
+    .await;
     drop(rules_tx);
     result
 }
@@ -420,11 +590,22 @@ async fn run_dynamic_tunnels_to_url(
     url: String,
     server: Endpoint,
     rules: watch::Receiver<Vec<ForwardRule>>,
+    heartbeat_interval: Duration,
     cookie: SessionCookie,
     stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
 ) -> Result<()> {
-    run_controlled_tunnels_to_url(url, server, rules, true, cookie, stop, observer).await
+    run_controlled_tunnels_to_url(
+        url,
+        server,
+        rules,
+        true,
+        heartbeat_interval,
+        cookie,
+        stop,
+        observer,
+    )
+    .await
 }
 
 async fn run_controlled_tunnels_to_url(
@@ -432,6 +613,7 @@ async fn run_controlled_tunnels_to_url(
     server: Endpoint,
     mut rules: watch::Receiver<Vec<ForwardRule>>,
     dynamic: bool,
+    heartbeat_interval: Duration,
     cookie: SessionCookie,
     mut stop: watch::Receiver<bool>,
     observer: Arc<dyn ClientObserver>,
@@ -485,9 +667,10 @@ async fn run_controlled_tunnels_to_url(
     let mut retired_ids = HashSet::new();
     let mut next_id = 1_u16;
     let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
-        HEARTBEAT_INTERVAL,
+        tokio::time::Instant::now() + heartbeat_interval,
+        heartbeat_interval,
     );
+    let mut heartbeat_waiting_for_pong = false;
 
     let result = loop {
         tokio::select! {
@@ -559,7 +742,11 @@ async fn run_controlled_tunnels_to_url(
                 }
             }
             _ = heartbeat.tick() => {
-                writer.send(Frame::new(FrameType::Ping, 0, Vec::new())?).await?;
+                if heartbeat_waiting_for_pong {
+                    break Err(anyhow!("WebSocket keepalive timed out waiting for Pong"));
+                }
+                writer.raw(Message::Ping(Vec::new().into())).await;
+                heartbeat_waiting_for_pong = true;
             }
             local = open_rx.recv() => {
                 let Some(local) = local else { break Ok(()) };
@@ -583,6 +770,9 @@ async fn run_controlled_tunnels_to_url(
             message = source.next() => {
                 match message {
                     Some(Ok(message)) => {
+                        if matches!(message, Message::Pong(_)) {
+                            heartbeat_waiting_for_pong = false;
+                        }
                         if let Err(error) = handle_ws_message(
                             message,
                             &writer,
@@ -622,11 +812,17 @@ async fn run_controlled_tunnels_to_url(
         }
     };
 
+    let disabled_names = accept_tasks.keys().cloned().collect::<Vec<_>>();
     for (_, task) in accept_tasks.values() {
         task.abort();
     }
     for (_, task) in accept_tasks.into_values() {
         let _ = task.await;
+    }
+    if result.is_ok() {
+        for name in disabled_names {
+            observer.tunnel_status(&name, "disabled");
+        }
     }
     close_all(&writer, &mut tunnels).await;
     writer.normal_close().await;
@@ -1014,11 +1210,17 @@ async fn remove_tunnel(
 ) {
     if let Some(tunnel) = tunnels.remove(&id) {
         match tunnel {
-            Tunnel::Opening(opening) => observer.tunnel_status(&opening.name, reason),
+            Tunnel::Opening(opening) => {
+                if !reason.is_empty() {
+                    observer.tunnel_status(&opening.name, reason);
+                }
+            }
             Tunnel::Open(open) => {
                 open.reader_task.abort();
                 open.writer_task.abort();
-                observer.tunnel_status(&open.name, reason);
+                if !reason.is_empty() {
+                    observer.tunnel_status(&open.name, reason);
+                }
             }
         }
     }
@@ -1047,7 +1249,7 @@ async fn close_named(
             .send(Frame::new(FrameType::Close, id, Vec::new())?)
             .await?;
         retired_ids.insert(id);
-        remove_tunnel(id, writer, observer, tunnels, "disabled").await;
+        remove_tunnel(id, writer, observer, tunnels, "").await;
     }
     Ok(())
 }
@@ -1185,6 +1387,7 @@ mod tests {
                 format!("ws://{ws_address}/"),
                 crate::address::parse_tows("127.0.0.1").unwrap(),
                 vec![rule],
+                HEARTBEAT_INTERVAL,
                 cookie,
                 stop_rx,
                 Arc::new(TestObserver),
@@ -1245,6 +1448,7 @@ mod tests {
                     target: crate::address::parse_target("22").unwrap(),
                     listen: crate::address::parse_listen(&good_port.to_string()).unwrap(),
                 }],
+                heartbeat_interval: HEARTBEAT_INTERVAL,
             },
             ConnectionGroup {
                 url: format!("ws://{bad_ws_address}/"),
@@ -1254,6 +1458,7 @@ mod tests {
                     target: crate::address::parse_target("22").unwrap(),
                     listen: crate::address::parse_listen(&bad_port.to_string()).unwrap(),
                 }],
+                heartbeat_interval: HEARTBEAT_INTERVAL,
             },
         ];
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -1302,42 +1507,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnel_can_be_disabled_and_enabled_without_reconnecting_websocket() {
+    async fn empty_configuration_keeps_cookie_session_running_without_ws() {
+        let cookie = SessionCookie(Arc::new(Mutex::new(format!(
+            "wengine_vpn_ticketwebvpn_szut_edu_cn=wrdvpn1-{}",
+            "0".repeat(32)
+        ))));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (_updates_tx, updates_rx) = mpsc::unbounded_channel();
+        let (_interval_tx, interval_rx) = watch::channel(COOKIE_REFRESH_INTERVAL);
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let coordinator = tokio::spawn(run_dynamic_connection_groups(
+            Vec::new(),
+            cookie,
+            stop_rx,
+            updates_rx,
+            Arc::new(ChannelObserver { events: event_tx }),
+            interval_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!coordinator.is_finished());
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), coordinator)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn last_tunnel_stops_ws_and_reenable_starts_a_new_ws() {
         let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ws_address = ws_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (stream, _) = ws_listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            crate::network::server_handshake(&mut websocket, "dynamic-tows")
-                .await
-                .unwrap();
-            while let Some(message) = websocket.next().await {
-                match message.unwrap() {
-                    Message::Binary(bytes) => {
-                        let frame = Frame::decode(&bytes).unwrap();
-                        if frame.kind == FrameType::Open && frame.tunnel_id != 0 {
-                            websocket
-                                .send(Message::Binary(
-                                    Frame::new(FrameType::OpenOk, frame.tunnel_id, Vec::new())
-                                        .unwrap()
-                                        .encode()
-                                        .into(),
-                                ))
-                                .await
-                                .unwrap();
-                            websocket
-                                .send(Message::Binary(
-                                    Frame::new(FrameType::Close, frame.tunnel_id, Vec::new())
-                                        .unwrap()
-                                        .encode()
-                                        .into(),
-                                ))
-                                .await
-                                .unwrap();
+            for _ in 0..2 {
+                let (stream, _) = ws_listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                crate::network::server_handshake(&mut websocket, "dynamic-tows")
+                    .await
+                    .unwrap();
+                while let Some(message) = websocket.next().await {
+                    match message.unwrap() {
+                        Message::Binary(bytes) => {
+                            let frame = Frame::decode(&bytes).unwrap();
+                            if frame.kind == FrameType::Open && frame.tunnel_id != 0 {
+                                websocket
+                                    .send(Message::Binary(
+                                        Frame::new(FrameType::OpenOk, frame.tunnel_id, Vec::new())
+                                            .unwrap()
+                                            .encode()
+                                            .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                            }
                         }
+                        Message::Close(_) => break,
+                        _ => {}
                     }
-                    Message::Close(_) => return,
-                    _ => {}
                 }
             }
         });
@@ -1359,9 +1586,11 @@ mod tests {
             url: format!("ws://{ws_address}/"),
             server: server.clone(),
             rules: vec![rule.clone()],
+            heartbeat_interval: HEARTBEAT_INTERVAL,
         }];
         let (stop_tx, stop_rx) = watch::channel(false);
         let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+        let (_interval_tx, interval_rx) = watch::channel(COOKIE_REFRESH_INTERVAL);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let coordinator = tokio::spawn(run_dynamic_connection_groups(
             groups,
@@ -1369,6 +1598,7 @@ mod tests {
             stop_rx,
             updates_rx,
             Arc::new(ChannelObserver { events: event_tx }),
+            interval_rx,
         ));
 
         wait_for_tunnel_status(&mut event_rx, "dynamic", "ready:").await;
@@ -1378,6 +1608,7 @@ mod tests {
             .send(vec![ServerGroup {
                 server: server.clone(),
                 rules: Vec::new(),
+                heartbeat_interval: HEARTBEAT_INTERVAL,
             }])
             .unwrap();
         wait_for_tunnel_status(&mut event_rx, "dynamic", "disabled").await;
@@ -1387,6 +1618,7 @@ mod tests {
             .send(vec![ServerGroup {
                 server,
                 rules: vec![rule],
+                heartbeat_interval: HEARTBEAT_INTERVAL,
             }])
             .unwrap();
         wait_for_tunnel_status(&mut event_rx, "dynamic", "ready:").await;
@@ -1414,6 +1646,6 @@ mod tests {
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("timed out waiting for {name} status {prefix}"));
     }
 }

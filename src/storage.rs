@@ -3,11 +3,15 @@ use anyhow::bail;
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const APP_DIRECTORY: &str = "tcp_over_websocket";
+pub const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
+static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// 返回配置与认证缓存共用的数据目录。
 pub fn data_dir() -> Option<PathBuf> {
@@ -30,6 +34,64 @@ fn platform_cache_root() -> Option<PathBuf> {
 
 pub fn data_file(name: &str) -> Option<PathBuf> {
     data_dir().map(|directory| directory.join(name))
+}
+
+#[derive(Clone)]
+pub struct BoundedLogWriter {
+    path: PathBuf,
+}
+
+impl BoundedLogWriter {
+    pub fn for_program(program: &str) -> Option<Self> {
+        data_file(&format!("{program}.log")).map(|path| Self { path })
+    }
+
+    fn append(&self, bytes: &[u8]) -> Result<()> {
+        let _guard = LOG_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("log mutex poisoned");
+        let parent = self.path.parent().context("log path has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+
+        let current_len = fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
+        if current_len.saturating_add(bytes.len() as u64) > MAX_LOG_BYTES {
+            let existing = fs::read(&self.path).unwrap_or_default();
+            let room = (MAX_LOG_BYTES as usize).saturating_sub(bytes.len());
+            let start = existing.len().saturating_sub(room);
+            let start = existing[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(existing.len(), |offset| start + offset + 1);
+            atomic_write(&self.path, &existing[start..])?;
+        }
+
+        let bytes = if bytes.len() as u64 > MAX_LOG_BYTES {
+            &bytes[bytes.len() - MAX_LOG_BYTES as usize..]
+        } else {
+            bytes
+        };
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open log file {}", self.path.display()))?
+            .write_all(bytes)
+            .context("failed to append program log")
+    }
+}
+
+impl Write for BoundedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.append(bytes)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 同目录写临时文件后原子替换，避免中途退出留下半份 JSON。
@@ -120,4 +182,28 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let contents = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_log_keeps_only_the_newest_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "tow-bounded-log-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let writer = BoundedLogWriter { path: path.clone() };
+        writer.append(&vec![b'a'; MAX_LOG_BYTES as usize]).unwrap();
+        writer.append(b"\nnewest-line\n").unwrap();
+        let contents = fs::read(&path).unwrap();
+        assert!(contents.len() as u64 <= MAX_LOG_BYTES);
+        assert!(contents.ends_with(b"newest-line\n"));
+        fs::remove_file(path).unwrap();
+    }
 }

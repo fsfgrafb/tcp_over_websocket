@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use num_bigint::BigUint;
 use reqwest::cookie::CookieStore;
-use reqwest::header::{ORIGIN, REFERER};
+use reqwest::header::{LOCATION, ORIGIN, REFERER};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use std::fs;
@@ -9,11 +9,12 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::address::Endpoint;
-use crate::network::{build_webvpn_ws_url, connect_websocket};
 use crate::storage::{atomic_write, data_file};
 
 const WEBVPN_ROOT: &str = "https://webvpn.szut.edu.cn/";
+const WEBVPN_SESSION_PROBE: &str =
+    "https://webvpn.szut.edu.cn/http/77726476706e69737468656265737421a1a70fcd7f7e3b02305adbf5/";
+const WEBVPN_SESSION_REDIRECT: &str = "/indexcs/simple.jsp?loginErr=0";
 const TICKET_NAME: &str = "wengine_vpn_ticketwebvpn_szut_edu_cn";
 const CAS_HASH: &str = "77726476706e69737468656265737421f3f652d2342a7d44300d8db9d6562d";
 const SERVICE: &str = "https://webvpn.szut.edu.cn/login?cas_login=true";
@@ -75,27 +76,14 @@ pub async fn login_or_restore(
     prompt: Arc<dyn AuthPrompt>,
     preference: LoginPreference,
 ) -> Result<SessionCookie> {
-    login_or_restore_inner(prompt, preference, None).await
-}
-
-pub async fn login_or_restore_for_server(
-    prompt: Arc<dyn AuthPrompt>,
-    preference: LoginPreference,
-    server: &Endpoint,
-) -> Result<SessionCookie> {
-    login_or_restore_inner(prompt, preference, Some(server)).await
+    login_or_restore_inner(prompt, preference).await
 }
 
 async fn login_or_restore_inner(
     prompt: Arc<dyn AuthPrompt>,
     preference: LoginPreference,
-    server: Option<&Endpoint>,
 ) -> Result<SessionCookie> {
-    let restored = match server {
-        Some(server) => restore_valid_cached_ticket_for_server(server).await,
-        None => restore_cached_ticket().await,
-    };
-    if let Some(session) = restored {
+    if let Some(session) = restore_valid_cached_ticket().await {
         prompt.status("reusing a valid WebVPN login cache");
         return Ok(session);
     }
@@ -103,11 +91,10 @@ async fn login_or_restore_inner(
     login_with_preference(prompt, preference).await
 }
 
-pub async fn restore_valid_cached_ticket_for_server(server: &Endpoint) -> Option<SessionCookie> {
+pub async fn restore_valid_cached_ticket() -> Option<SessionCookie> {
     let session = restore_cached_ticket().await?;
-    validate_websocket_ticket(&session, server)
-        .await
-        .then_some(session)
+    refresh_ticket(&session).await.ok()?;
+    Some(session)
 }
 
 pub async fn login_with_preference(
@@ -125,18 +112,8 @@ pub async fn login_with_preference(
         }
     };
     write_cached_ticket(&cookie);
+    prompt.status("WebVPN login completed");
     Ok(SessionCookie(Arc::new(Mutex::new(cookie))))
-}
-
-async fn validate_websocket_ticket(cookie: &SessionCookie, server: &Endpoint) -> bool {
-    let Ok(url) = build_webvpn_ws_url(server) else {
-        return false;
-    };
-    let Ok(mut websocket) = connect_websocket(&url, &cookie.snapshot()).await else {
-        return false;
-    };
-    let _ = websocket.close(None).await;
-    true
 }
 
 fn login_client(jar: Arc<reqwest::cookie::Jar>) -> Result<Client> {
@@ -182,59 +159,73 @@ async fn fresh_login_client() -> Result<(Client, Arc<reqwest::cookie::Jar>, Stri
 
 async fn login_wechat(prompt: Arc<dyn AuthPrompt>) -> Result<String> {
     let (client, jar, _) = fresh_login_client().await?;
-    prompt.status("requesting WeChat QR code");
-    let state = format!("towc{}", unix_millis());
     let redirect = format!(
         "https://cas.szut.edu.cn/cas/login?service={}&client_name=WeiXinClient",
         url_encode(SERVICE)
     );
-    let mut qr_page_url = Url::parse("https://open.weixin.qq.com/connect/qrconnect")?;
-    qr_page_url
-        .query_pairs_mut()
-        .append_pair("appid", WECHAT_APP_ID)
-        .append_pair("redirect_uri", &redirect)
-        .append_pair("response_type", "code")
-        .append_pair("scope", "snsapi_login")
-        .append_pair("state", &state);
-    let page = client
-        .get(qr_page_url)
-        .send()
-        .await
-        .context("failed to access WeChat QR page")?
-        .error_for_status()?
-        .text()
-        .await?;
-    let uuid = extract_wechat_uuid(&page).context("WeChat page did not contain a QR UUID")?;
-    let image = client
-        .get(format!("https://open.weixin.qq.com/connect/qrcode/{uuid}"))
-        .send()
-        .await
-        .context("failed to download WeChat QR code")?
-        .error_for_status()?
-        .bytes()
-        .await?
-        .to_vec();
-    prompt.show_qr(image)?;
-    prompt.status("scan the WeChat QR code and confirm on your phone");
+    loop {
+        prompt.status("requesting WeChat QR code");
+        let state = format!("towc{}", unix_millis());
+        let mut qr_page_url = Url::parse("https://open.weixin.qq.com/connect/qrconnect")?;
+        qr_page_url
+            .query_pairs_mut()
+            .append_pair("appid", WECHAT_APP_ID)
+            .append_pair("redirect_uri", &redirect)
+            .append_pair("response_type", "code")
+            .append_pair("scope", "snsapi_login")
+            .append_pair("state", &state);
+        let page = client
+            .get(qr_page_url)
+            .send()
+            .await
+            .context("failed to access WeChat QR page")?
+            .error_for_status()?
+            .text()
+            .await?;
+        let uuid = extract_wechat_uuid(&page).context("WeChat page did not contain a QR UUID")?;
+        let image = client
+            .get(format!("https://open.weixin.qq.com/connect/qrcode/{uuid}"))
+            .send()
+            .await
+            .context("failed to download WeChat QR code")?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec();
+        prompt.show_qr(image)?;
+        prompt.status("scan the WeChat QR code and confirm on your phone");
 
-    let code = poll_wechat(&client, &uuid, &prompt).await?;
-    prompt.status("WeChat confirmed; activating WebVPN ticket");
-    let mut callback = Url::parse(&redirect)?;
-    callback
-        .query_pairs_mut()
-        .append_pair("code", &code)
-        .append_pair("state", &state);
-    let response = client
-        .get(callback)
-        .send()
-        .await
-        .context("CAS WeChat callback failed")?
-        .error_for_status()?;
-    ensure_not_login_page(response.url().as_str())?;
-    ticket_from_jar(&jar).context("WeChat login completed without a WebVPN ticket")
+        let WechatPoll::Code(code) = poll_wechat(&client, &uuid, &prompt).await? else {
+            prompt.status("WeChat QR code expired; requesting a new code");
+            continue;
+        };
+        prompt.status("WeChat confirmed; activating WebVPN ticket");
+        let mut callback = Url::parse(&redirect)?;
+        callback
+            .query_pairs_mut()
+            .append_pair("code", &code)
+            .append_pair("state", &state);
+        let response = client
+            .get(callback)
+            .send()
+            .await
+            .context("CAS WeChat callback failed")?
+            .error_for_status()?;
+        ensure_not_login_page(response.url().as_str())?;
+        return ticket_from_jar(&jar).context("WeChat login completed without a WebVPN ticket");
+    }
 }
 
-async fn poll_wechat(client: &Client, uuid: &str, prompt: &Arc<dyn AuthPrompt>) -> Result<String> {
+enum WechatPoll {
+    Code(String),
+    Expired,
+}
+
+async fn poll_wechat(
+    client: &Client,
+    uuid: &str,
+    prompt: &Arc<dyn AuthPrompt>,
+) -> Result<WechatPoll> {
     let mut last = None::<u16>;
     for _ in 0..180 {
         let mut url = Url::parse("https://lp.open.weixin.qq.com/connect/l/qrconnect")?;
@@ -258,9 +249,10 @@ async fn poll_wechat(client: &Client, uuid: &str, prompt: &Arc<dyn AuthPrompt>) 
         last = Some(status);
         match status {
             405 => {
-                return extract_js_string(&body, "wx_code")
+                let code = extract_js_string(&body, "wx_code")
                     .filter(|code| !code.is_empty())
-                    .context("WeChat confirmation did not return a callback code");
+                    .context("WeChat confirmation did not return a callback code")?;
+                return Ok(WechatPoll::Code(code));
             }
             404 => {
                 prompt.status("QR code scanned; waiting for phone confirmation");
@@ -268,11 +260,11 @@ async fn poll_wechat(client: &Client, uuid: &str, prompt: &Arc<dyn AuthPrompt>) 
             }
             408 | 500 => tokio::time::sleep(Duration::from_millis(1800)).await,
             403 => bail!("WeChat QR login was cancelled"),
-            402 => bail!("WeChat QR code expired; sign in again"),
+            402 => return Ok(WechatPoll::Expired),
             _ => tokio::time::sleep(Duration::from_millis(1800)).await,
         }
     }
-    bail!("timed out waiting for WeChat QR login")
+    Ok(WechatPoll::Expired)
 }
 
 async fn login_verification(
@@ -355,6 +347,9 @@ async fn login_verification(
 }
 
 pub(crate) async fn refresh_ticket(cookie: &SessionCookie) -> Result<()> {
+    if !validate_protected_session(cookie).await {
+        bail!("WebVPN login is no longer valid; sign in again");
+    }
     let jar = Arc::new(reqwest::cookie::Jar::default());
     seed_jar(&jar, &cookie.snapshot());
     let client = login_client(Arc::clone(&jar))?;
@@ -383,14 +378,45 @@ pub(crate) async fn refresh_ticket(cookie: &SessionCookie) -> Result<()> {
     Ok(())
 }
 
+async fn validate_protected_session(cookie: &SessionCookie) -> bool {
+    let jar = Arc::new(reqwest::cookie::Jar::default());
+    seed_jar(&jar, &cookie.snapshot());
+    let Ok(client) = Client::builder()
+        .cookie_provider(jar)
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client
+        .get(WEBVPN_SESSION_PROBE)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_redirection() {
+        return false;
+    }
+    response
+        .headers()
+        .get(LOCATION)
+        .and_then(|location| location.to_str().ok())
+        .is_some_and(protected_probe_redirect_is_authenticated)
+}
+
+fn protected_probe_redirect_is_authenticated(location: &str) -> bool {
+    location.contains(WEBVPN_SESSION_REDIRECT)
+}
+
 async fn restore_cached_ticket() -> Option<SessionCookie> {
     let cookie = read_cached_ticket()?;
     if !valid_ticket_format(&cookie) {
         return None;
     }
-    let session = SessionCookie(Arc::new(Mutex::new(cookie)));
-    refresh_ticket(&session).await.ok()?;
-    Some(session)
+    Some(SessionCookie(Arc::new(Mutex::new(cookie))))
 }
 
 fn ticket_from_jar(jar: &reqwest::cookie::Jar) -> Option<String> {
@@ -593,6 +619,19 @@ mod tests {
         let value = format!("wrdvpn1-{}", "0".repeat(32));
         assert!(valid_ticket_format(&format!("{TICKET_NAME}={value}")));
         assert!(!valid_ticket_format(&format!("other={value}")));
+    }
+
+    #[test]
+    fn protected_probe_requires_the_information_portal_redirect() {
+        assert!(protected_probe_redirect_is_authenticated(
+            "/indexcs/simple.jsp?loginErr=0"
+        ));
+        assert!(protected_probe_redirect_is_authenticated(
+            "https://webvpn.szut.edu.cn/http/encoded/indexcs/simple.jsp?loginErr=0"
+        ));
+        assert!(!protected_probe_redirect_is_authenticated(
+            "https://webvpn.szut.edu.cn/login"
+        ));
     }
 
     #[test]

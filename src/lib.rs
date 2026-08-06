@@ -18,6 +18,29 @@ pub mod server;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+struct ConsoleAndLogWriter {
+    console: std::io::Stdout,
+    log: Option<storage::BoundedLogWriter>,
+}
+
+impl std::io::Write for ConsoleAndLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.console.write_all(bytes)?;
+        if let Some(log) = &mut self.log {
+            log.write_all(bytes)?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.console.flush()?;
+        if let Some(log) = &mut self.log {
+            log.flush()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TaggedEventFormatter {
     default_tag: &'static str,
@@ -62,9 +85,14 @@ where
 pub fn init_tracing(default_tag: &'static str) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let log = storage::BoundedLogWriter::for_program(default_tag);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(true)
         .event_format(TaggedEventFormatter { default_tag })
+        .with_writer(move || ConsoleAndLogWriter {
+            console: std::io::stdout(),
+            log: log.clone(),
+        })
         .try_init();
 }

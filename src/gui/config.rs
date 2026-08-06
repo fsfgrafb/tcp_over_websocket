@@ -11,12 +11,28 @@ use crate::storage::{data_file, write_json};
 
 const CONFIG_FILE: &str = "config.json";
 const GUI_STATE_FILE: &str = "gui-state.json";
+pub const DEFAULT_COOKIE_REFRESH_SECS: u64 = 600;
+pub const MIN_COOKIE_REFRESH_SECS: u64 = 60;
+pub const MAX_COOKIE_REFRESH_SECS: u64 = 840;
+pub const DEFAULT_WS_KEEPALIVE_SECS: u64 = 60;
+pub const MIN_WS_KEEPALIVE_SECS: u64 = 10;
+pub const MAX_WS_KEEPALIVE_SECS: u64 = 600;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuiConfig {
     #[serde(default)]
+    pub connections: Vec<ConnectionConfig>,
+    #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionConfig {
+    pub tows: String,
+    #[serde(default = "default_ws_keepalive_secs")]
+    pub ws_keepalive_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,11 +44,24 @@ pub enum ThemeSetting {
     Light,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GuiState {
     pub theme: ThemeSetting,
+    #[serde(default, skip_serializing)]
     pub selected_tunnels: HashSet<String>,
+    #[serde(default = "default_cookie_refresh_secs")]
+    pub cookie_refresh_secs: u64,
+}
+
+impl Default for GuiState {
+    fn default() -> Self {
+        Self {
+            theme: ThemeSetting::System,
+            selected_tunnels: HashSet::new(),
+            cookie_refresh_secs: DEFAULT_COOKIE_REFRESH_SECS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,11 +87,11 @@ pub struct LoadedConfig {
 pub enum MergePolicy {
     SkipExisting,
     OverwriteExisting,
-    ReplaceAll,
 }
 
 #[derive(Debug)]
 pub struct ImportBundle {
+    pub connections: Vec<ConnectionConfig>,
     pub tunnels: Vec<TunnelConfig>,
     pub messages: Vec<String>,
     pub files_read: usize,
@@ -79,10 +108,15 @@ pub fn load_gui_state() -> GuiState {
 }
 
 fn load_gui_state_at(path: &Path) -> GuiState {
-    fs::read(path)
+    let mut state: GuiState = fs::read(path)
         .ok()
         .and_then(|contents| serde_json::from_slice(&contents).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    state.cookie_refresh_secs = state
+        .cookie_refresh_secs
+        .clamp(MIN_COOKIE_REFRESH_SECS, MAX_COOKIE_REFRESH_SECS);
+    state.selected_tunnels.clear();
+    state
 }
 
 pub fn save_gui_state(state: &GuiState) -> Result<()> {
@@ -91,6 +125,11 @@ pub fn save_gui_state(state: &GuiState) -> Result<()> {
 }
 
 fn save_gui_state_at(path: &Path, state: &GuiState) -> Result<()> {
+    if !(MIN_COOKIE_REFRESH_SECS..=MAX_COOKIE_REFRESH_SECS).contains(&state.cookie_refresh_secs) {
+        bail!(
+            "cookie refresh interval must be between {MIN_COOKIE_REFRESH_SECS} and {MAX_COOKIE_REFRESH_SECS} seconds"
+        );
+    }
     write_json(path, state)
 }
 
@@ -143,11 +182,18 @@ pub fn save_default_config(config: &GuiConfig) -> Result<()> {
     write_json(&path, config)
 }
 
-pub fn export_tunnels(path: &Path, tunnels: Vec<TunnelConfig>) -> Result<()> {
+pub fn export_tunnels(
+    path: &Path,
+    connections: Vec<ConnectionConfig>,
+    tunnels: Vec<TunnelConfig>,
+) -> Result<()> {
     if tunnels.is_empty() {
         bail!("select at least one tunnel to export");
     }
-    let config = GuiConfig { tunnels };
+    let config = GuiConfig {
+        connections,
+        tunnels,
+    };
     validate_config(&config)?;
     write_json(path, &config)
 }
@@ -155,6 +201,7 @@ pub fn export_tunnels(path: &Path, tunnels: Vec<TunnelConfig>) -> Result<()> {
 pub fn parse_config(contents: &[u8]) -> Result<GuiConfig> {
     let mut config: GuiConfig = serde_json::from_slice(contents).context("invalid JSON")?;
     assign_missing_names(&mut config.tunnels);
+    add_missing_connections(&mut config);
     validate_config(&config)?;
     Ok(config)
 }
@@ -162,6 +209,20 @@ pub fn parse_config(contents: &[u8]) -> Result<GuiConfig> {
 pub fn validate_config(config: &GuiConfig) -> Result<()> {
     let mut names = HashSet::new();
     let mut group_sizes = HashMap::<String, usize>::new();
+    let mut servers = HashSet::new();
+    for connection in &config.connections {
+        let server =
+            parse_tows(&connection.tows).context("connection has an invalid tows address")?;
+        if !servers.insert(server.to_string()) {
+            bail!("duplicate tows connection: {server}");
+        }
+        if !(MIN_WS_KEEPALIVE_SECS..=MAX_WS_KEEPALIVE_SECS).contains(&connection.ws_keepalive_secs)
+        {
+            bail!(
+                "tows {server} keepalive interval must be between {MIN_WS_KEEPALIVE_SECS} and {MAX_WS_KEEPALIVE_SECS} seconds"
+            );
+        }
+    }
     for (index, tunnel) in config.tunnels.iter().enumerate() {
         let name = tunnel.name.trim();
         if name.is_empty() {
@@ -172,6 +233,9 @@ pub fn validate_config(config: &GuiConfig) -> Result<()> {
         }
         let server = parse_tows(&tunnel.tows)
             .with_context(|| format!("tunnel {name} has an invalid tows address"))?;
+        if !servers.contains(&server.to_string()) {
+            bail!("tunnel {name} references an unknown tows connection: {server}");
+        }
         parse_target(&tunnel.target)
             .with_context(|| format!("tunnel {name} has an invalid target"))?;
         parse_listen(&tunnel.listen)
@@ -187,6 +251,26 @@ pub fn validate_config(config: &GuiConfig) -> Result<()> {
         bail!("tows {server} has {count} enabled tunnels; maximum is {MAX_TUNNELS}");
     }
     Ok(())
+}
+
+fn add_missing_connections(config: &mut GuiConfig) {
+    let mut known = config
+        .connections
+        .iter()
+        .filter_map(|connection| parse_tows(&connection.tows).ok())
+        .map(|server| server.to_string())
+        .collect::<HashSet<_>>();
+    for tunnel in &config.tunnels {
+        let Ok(server) = parse_tows(&tunnel.tows) else {
+            continue;
+        };
+        if known.insert(server.to_string()) {
+            config.connections.push(ConnectionConfig {
+                tows: server.to_string(),
+                ws_keepalive_secs: DEFAULT_WS_KEEPALIVE_SECS,
+            });
+        }
+    }
 }
 
 pub fn listen_conflicts(config: &GuiConfig) -> HashSet<String> {
@@ -215,6 +299,7 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
     files.sort();
     files.dedup();
 
+    let mut connections = Vec::new();
     let mut tunnels = Vec::new();
     let mut files_read = 0;
     for path in files {
@@ -224,6 +309,7 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
         {
             Ok(config) => {
                 files_read += 1;
+                connections.extend(config.connections);
                 tunnels.extend(config.tunnels);
             }
             Err(error) => messages.push(format!("skipped {}: {error:#}", path.display())),
@@ -231,6 +317,7 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
     }
     assign_missing_names(&mut tunnels);
     ImportBundle {
+        connections,
         tunnels,
         messages,
         files_read,
@@ -238,18 +325,26 @@ pub fn read_import_paths(paths: &[PathBuf]) -> ImportBundle {
 }
 
 pub fn merge_import(config: &mut GuiConfig, bundle: ImportBundle, policy: MergePolicy) {
-    let policy = if policy == MergePolicy::ReplaceAll {
-        config.tunnels.clear();
-        MergePolicy::OverwriteExisting
-    } else {
-        policy
-    };
+    for incoming in bundle.connections {
+        let normalized = parse_tows(&incoming.tows)
+            .map(|server| server.to_string())
+            .unwrap_or_else(|_| incoming.tows.clone());
+        if let Some(index) = config.connections.iter().position(|existing| {
+            parse_tows(&existing.tows).is_ok_and(|server| server.to_string() == normalized)
+        }) {
+            if policy == MergePolicy::OverwriteExisting {
+                config.connections[index] = incoming;
+            }
+        } else {
+            config.connections.push(incoming);
+        }
+    }
 
     for incoming in bundle.tunnels {
         if let Some(index) = config
             .tunnels
             .iter()
-            .position(|existing| existing.name == incoming.name)
+            .position(|existing| existing.name.trim() == incoming.name.trim())
         {
             if policy == MergePolicy::OverwriteExisting {
                 config.tunnels[index] = incoming;
@@ -264,13 +359,14 @@ pub fn import_conflicts(config: &GuiConfig, bundle: &ImportBundle) -> Vec<String
     let existing = config
         .tunnels
         .iter()
-        .map(|tunnel| tunnel.name.as_str())
+        .map(|tunnel| tunnel.name.trim())
         .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     let mut conflicts = Vec::new();
     for tunnel in &bundle.tunnels {
-        if !seen.insert(tunnel.name.as_str()) || existing.contains(tunnel.name.as_str()) {
-            conflicts.push(tunnel.name.clone());
+        let name = tunnel.name.trim();
+        if !seen.insert(name) || existing.contains(name) {
+            conflicts.push(name.to_string());
         }
     }
     conflicts.sort();
@@ -345,12 +441,24 @@ const fn enabled_by_default() -> bool {
     true
 }
 
+const fn default_cookie_refresh_secs() -> u64 {
+    DEFAULT_COOKIE_REFRESH_SECS
+}
+
+const fn default_ws_keepalive_secs() -> u64 {
+    DEFAULT_WS_KEEPALIVE_SECS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sample_config() -> GuiConfig {
         GuiConfig {
+            connections: vec![ConnectionConfig {
+                tows: "10.18.47.77:4489".to_string(),
+                ws_keepalive_secs: DEFAULT_WS_KEEPALIVE_SECS,
+            }],
             tunnels: vec![
                 TunnelConfig {
                     name: "77 SSH".to_string(),
@@ -373,14 +481,16 @@ mod tests {
     #[test]
     fn defaults_do_not_create_tunnels() {
         let config = GuiConfig::default();
+        assert!(config.connections.is_empty());
         assert!(config.tunnels.is_empty());
     }
 
     #[test]
-    fn gui_state_persists_theme_and_selection() {
+    fn gui_state_persists_settings_but_not_tunnel_selection() {
         let state = GuiState {
             theme: ThemeSetting::Light,
             selected_tunnels: HashSet::from(["77 SSH".to_string(), "66 SSH".to_string()]),
+            cookie_refresh_secs: DEFAULT_COOKIE_REFRESH_SECS,
         };
         let path = std::env::temp_dir().join(format!(
             "towc-gui-state-{}-{}.json",
@@ -388,7 +498,12 @@ mod tests {
             fnv1a(b"gui-state-persistence")
         ));
         save_gui_state_at(&path, &state).unwrap();
-        assert_eq!(load_gui_state_at(&path), state);
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains("selected_tunnels"));
+        let loaded = load_gui_state_at(&path);
+        assert_eq!(loaded.theme, ThemeSetting::Light);
+        assert_eq!(loaded.cookie_refresh_secs, DEFAULT_COOKIE_REFRESH_SECS);
+        assert!(loaded.selected_tunnels.is_empty());
         fs::remove_file(path).unwrap();
     }
 
@@ -401,10 +516,15 @@ mod tests {
         let second = parse_config(source).unwrap();
         assert!(!first.tunnels[0].name.is_empty());
         assert_eq!(first.tunnels[0].name, second.tunnels[0].name);
+        assert_eq!(first.connections.len(), 1);
+        assert_eq!(
+            first.connections[0].ws_keepalive_secs,
+            DEFAULT_WS_KEEPALIVE_SECS
+        );
     }
 
     #[test]
-    fn merge_supports_skip_overwrite_and_replace() {
+    fn merge_supports_skip_and_overwrite() {
         let mut config = sample_config();
         let incoming = TunnelConfig {
             name: "77 SSH".to_string(),
@@ -416,6 +536,7 @@ mod tests {
         merge_import(
             &mut config,
             ImportBundle {
+                connections: vec![],
                 tunnels: vec![incoming.clone()],
                 messages: vec![],
                 files_read: 1,
@@ -426,6 +547,7 @@ mod tests {
         merge_import(
             &mut config,
             ImportBundle {
+                connections: vec![],
                 tunnels: vec![incoming],
                 messages: vec![],
                 files_read: 1,
@@ -433,23 +555,6 @@ mod tests {
             MergePolicy::OverwriteExisting,
         );
         assert_eq!(config.tunnels[0].target, "127.0.0.1:2222");
-        merge_import(
-            &mut config,
-            ImportBundle {
-                tunnels: vec![TunnelConfig {
-                    name: "only".to_string(),
-                    tows: "10.18.47.66:4489".to_string(),
-                    target: "127.0.0.1:22".to_string(),
-                    listen: "127.0.0.1:15555".to_string(),
-                    enabled: true,
-                }],
-                messages: vec![],
-                files_read: 1,
-            },
-            MergePolicy::ReplaceAll,
-        );
-        assert_eq!(config.tunnels.len(), 1);
-        assert_eq!(config.tunnels[0].name, "only");
     }
 
     #[test]
@@ -457,11 +562,33 @@ mod tests {
         let config = sample_config();
         let duplicate = config.tunnels[0].clone();
         let bundle = ImportBundle {
+            connections: vec![],
             tunnels: vec![duplicate.clone(), duplicate],
             messages: vec![],
             files_read: 2,
         };
         assert_eq!(import_conflicts(&config, &bundle), vec!["77 SSH"]);
+    }
+
+    #[test]
+    fn import_conflict_count_is_not_the_total_tunnel_count() {
+        let mut config = sample_config();
+        config.tunnels[0].name = " SSH ".to_string();
+        let mut ssh = config.tunnels[0].clone();
+        ssh.name = "SSH".to_string();
+        let mut first_new = ssh.clone();
+        first_new.name = "77 SSH".to_string();
+        let mut second_new = ssh.clone();
+        second_new.name = "隧道 4".to_string();
+        let bundle = ImportBundle {
+            connections: vec![],
+            tunnels: vec![first_new, ssh, second_new],
+            messages: vec![],
+            files_read: 1,
+        };
+
+        assert_eq!(bundle.tunnels.len(), 3);
+        assert_eq!(import_conflicts(&config, &bundle), vec!["SSH"]);
     }
 
     #[test]
@@ -474,8 +601,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let selected = sample_config().tunnels;
-        export_tunnels(&path, selected).unwrap();
+        let config = sample_config();
+        export_tunnels(&path, config.connections, config.tunnels).unwrap();
         let exported = parse_config(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(exported.tunnels.len(), 2);
         fs::remove_file(path).unwrap();
