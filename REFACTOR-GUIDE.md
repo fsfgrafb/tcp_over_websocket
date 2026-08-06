@@ -4,10 +4,13 @@
 
 ## 0. 仓库状态说明
 
-- 本仓库所有旧代码**已删除并 commit**，全部历史版本保存在 git 中：
-  - `git log --oneline` 可查看：`v0.1.0` → `v0.3.x` → `v0.4.0` → `acca315`（新版快照）→ `da69f60`（清空）
-  - 查看任意版本：`git show <commit>:<path>`
-  - 旧版结构参考：`v0.3.0`（src/bin/towc.rs + src/bin/tows.rs + src/lib.rs）、`v0.4.0`（+保活）、`acca315`（新版拆分为 src/client/ + src/server/ + src/network.rs）
+- **⚠️ 必须完整阅读 git 仓库历史版本**（重构开始前第一件事）：
+  - `git log --oneline` 查看全部提交：`v0.1.0` → `v0.3.x` → `v0.4.0` → `acca315`（新版快照）→ `da69f60`（清空）→ 之后是本文档修订提交
+  - **逐个 `git show <commit>` 通读关键版本源码**，重点：
+    - `v0.3.0`：src/bin/towc.rs + src/bin/tows.rs + src/lib.rs（最简可读版，理解核心转发）
+    - `v0.4.0`：+保活 + 登录（最接近生产，参考登录/缓存/交互）
+    - `acca315`：src/client/ + src/server/ + src/network.rs（新版模块拆分）
+  - 历史代码是**最佳参考实现**：重构时大量逻辑（AES 编码、URL 构建、转发、登录、交互、缓存）可直接借鉴或迁移
 - **当前仓库仅含本文档**（REFACTOR-GUIDE.md，无任何代码）；本文档是重构的唯一输入依据，请先完整阅读。
 
 ---
@@ -315,6 +318,7 @@ WS **二进制帧**：
 7. 代码语言：Rust（edition 2024）；依赖：tokio / tokio-tungstenite / reqwest / rustls、**serde / serde_json**（JSON 配置与缓存必需）、**egui/eframe**（仅 Windows GUI）；日志推荐 `tracing`（towc_gui 需把日志转发到 GUI 日志面板）
 8. **推荐模块结构**（参考 acca315）：`src/client/`（登录+会话）、`src/server/`（tows 路由）、`src/network.rs`（WS URL/AES 编码/转发）、`src/protocol.rs`（多路复用帧编解码，**新增**）；三个 bin 共享同一 lib
 9. 完成后需与 10.18.47.77 上的环境配合实测（见 §6）；带宽基线：账号总带宽 ~5.3MB/s（已实测，见 §2.5/§3.4）
+10. **Rust 最佳实践 + 面向学习者**（用户明确要求）：本项目同时作为 Rust 最佳实践示例——代码要**尽量简洁、命名清晰、结构直白**，让人类学者能看懂；宁可牺牲少量"花哨技巧"也要保证可读性；**注释用中文**；模块保持单一职责；避免过度抽象/宏魔法/晦涩泛型
 
 ---
 
@@ -362,5 +366,6 @@ WS **二进制帧**：
   - towc_gui JSON 配置文件 + 拖拽/批量导入（§1.3）
   - towc 无参交互模式完善（v0.3 参数收集顺序 + v0.4 缓存/登录机制，§1.1）
   - 工程化：serde/serde_json 依赖、tracing 日志、src/protocol.rs 帧编解码模块、GUI 内嵌登录、断线由 WS 层判定（§5）
+  - **必须完整阅读 git 历史版本**（§0）；**Rust 最佳实践 + 面向学习者**：代码简洁可读、中文注释、避免花哨技巧（§5 第 10 条）
 - 用户表示还会提供更多信息，收到后请更新本文档
 - 若有疑问，优先查阅 `C:\Development\test\docs\` 的详细记录
