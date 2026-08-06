@@ -1,6 +1,6 @@
 # tcp_over_websocket 重构指引（给接手的 AI）
 
-> **本文档是重构的唯一输入依据**。仓库当前已清空（历史在 git 中）。请先阅读本文档，再决定如何从最简形态重构。
+> **本文档是重构的唯一输入依据**。仓库当前已清空（历史在 git 中）。**请先阅读本文档**，再决定如何从最简形态重构。
 
 ## 0. 仓库状态说明
 
@@ -42,6 +42,23 @@
   - **编译产物自包含，不依赖同目录 towc.exe 等**（完整 towc 逻辑内嵌）
   - 与 tows 之间仅 **1 条 WS 连接**，多路复用所有隧道 → 只需 **1 个 WS 心跳**；cookie 保活也由 GUI 统一（全局一个）
   - GUI 上配置的若干条隧道 → 进程内并发建立/维持，无子进程、无 IPC
+
+### 1.2 发布矩阵（win/linux，主力 win；2026-08-06 用户确认 3 个可执行文件）
+**发布 3 个可执行文件**（逻辑程序 3 个，平台二进制共 7 个）：
+
+| 程序 | 角色 | Windows x64 | Linux x64 | Linux aarch64 |
+|------|------|:-----------:|:---------:|:-------------:|
+| tows | 内网服务端（路由转发） | ✅ | ✅ | ✅ **必须**（内网 Orange Pi = aarch64）|
+| towc | 控制台客户端（单隧道） | ✅ | ✅ | ✅ 顺手编译 |
+| towc_gui | **主力** GUI 客户端（多隧道，自包含） | ✅ | — | — |
+
+- **主力**：Windows 用户用 `towc_gui`（多隧道图形管理）；`towc.exe` 提供命令行/脚本场景
+- **Linux**：用 `towc`（控制台）；`tows` 部署内网（10.18.47.77 = Orange Pi 5 Plus aarch64）
+- 三程序共享同一版本号，一起发布（GitHub Release 打包 zip）
+- 交叉编译目标：
+  - `tows` / `towc`：`x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`（aarch64 为 tows 必需、towc 可选）
+  - `towc_gui`：仅 `x86_64-pc-windows-msvc`
+- **不采用 busybox 单二进制**（`tcpow server|client|gui`）：GUI 依赖会打进 Linux 版、体积增大、与 aarch64 交叉编译互相拖累
 
 ### 1.1 towc 无参交互模式（与 v0.4 行为一致）
 1. 读取 tows 地址 → 立即输出对应的 WebVPN location → 尝试缓存认证
