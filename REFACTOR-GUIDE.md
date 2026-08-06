@@ -48,6 +48,7 @@
   - **编译产物自包含，不依赖同目录 towc.exe 等**（完整 towc 逻辑内嵌）
   - 与 tows 之间仅 **1 条 WS 连接**，多路复用所有隧道 → 只需 **1 个 WS 心跳**；cookie 保活也由 GUI 统一（全局一个）
   - GUI 上配置的若干条隧道 → 进程内并发建立/维持，无子进程、无 IPC
+  - **登录交互（GUI 内）**：微信扫码 → 二维码内嵌显示在 GUI 窗口（或弹窗）；手机/邮箱验证码 → GUI 输入框；ticket 状态显示在界面
 
 ### 1.1 towc 无参交互模式（参考 v0.3 参数收集顺序 + v0.4 缓存/登录机制）
 **流程**（先收集全部参数 → 校验写缓存 → 登录 → 启动）：
@@ -65,7 +66,7 @@
 
 **实现要点**：
 - **prompt 行为**：带默认 → 空回车用默认；必填 → 空输入校验后重新提示（可参考 v0.3 的 `prompt_required` / `prompt_optional` / `prompt_line`）
-- **缓存文件** `interactive.defaults`：JSON `{version, server, target, listen_addr}`，`version` 字段便于将来迁移
+- **缓存文件** `interactive.defaults`（**exe 同目录**，与 towc_gui `config.json` 位置一致、便携）：JSON `{version, server, target, listen_addr}`，`version` 字段便于将来迁移；WebVPN cookie 缓存同样存 exe 同目录
 - **错误处理**：ticket 过期 / 隧道失败 → 退出并提示重启重新登录（§2.5.1）；不自动重登
 - 参数收集在登录之前（v0.3 顺序）——用户一次性输完参数后专注扫码，登录成功后即可启动；ticket 与参数收集无关
 
@@ -155,6 +156,7 @@ Key = IV = "wrdvpnisthebest!"（16字节 ASCII）
 - **Cookie 刷新 = 全局一个，间隔默认 10 分钟（600s）**：GUI 内一个任务统一执行，所有隧道共享同一 ticket
 - **towc（单隧道控制台）**：仍为 1 进程 = 1 条 WS = 1 隧道，心跳 60s；**与 towc_gui 统一走多路复用协议**（单隧道 = 1 个 tunnel_id，§3.1/3.2），与 towc_gui **共享同一套协议层**；**不兼容旧版 tows**（版本不符即报错退出，见 §3.0）
 - **错误处理：不做 IP 变化检测、不自动重登**——IP 变化 / cookie 过期等一切失效都通过保活/连接反馈直接体现（302 `/login?logoutByIpChange=true`、WS 握手被拒、保活失败），检测到任一失败即**直接退出**并提示用户重新启动程序重新登录；不引入"检测-重登"状态机，保持简单可靠
+- **断线判定**：由 WS 层检测（TCP 断开 / WS close 帧 / 读错误）；应用层 PING 仅用于维持网关活跃、**不用于断线判定**（tows 对 PING 可忽略），连接断开即按失败退出
 - ✅ **带宽实测结论（2026-08-05 纯外网，多连接分段下载 200MB）**：WebVPN 是**账号级总带宽限制 ~5.3MB/s**，非按连接限速——1 连接 4.32 / 3 连接 5.21 / 10 连接 5.27 MB/s，多连接**不能线性叠加**（最多 +20% 后饱和）。→ **方案 2 单 WS 多路复用不会损失吞吐**（单连接本身即可跑满 ~5.3MB/s），此前"共享单连接带宽受限"的担忧**排除**
 
 ### 2.6 登录（最简流程，已实测）
@@ -310,8 +312,9 @@ WS **二进制帧**：
 4. **登录三种方式**：微信扫码 / 手机验证码 / 邮箱验证码（见 §2.6/2.7）
 5. **多路复用协议 + 版本协商**：towc/towc_gui 与 tows 之间单 WS 多路复用（见 §3.1/3.2），**建连第一帧发 HELLO 握手**（0x00/0x07，§3.0），**不兼容旧版**（版本不符即报错退出），帧格式以简洁为准
 6. 保持"学生在外网连内网 TCP"的目标场景（SSH / MC / RDP）
-7. 代码语言：Rust（原项目为 Rust，edition 2024，依赖 tokio/tokio-tungstenite/reqwest/rustls）；**towc_gui 推荐 egui/eframe**（纯 Rust 轻量工具类 GUI，无 WebView 依赖，仅 Windows 编译）
-8. 完成后需与 10.18.47.77 上的环境配合实测（见 §6）；带宽基线：账号总带宽 ~5.3MB/s（已实测，见 §2.5/§3.4）
+7. 代码语言：Rust（edition 2024）；依赖：tokio / tokio-tungstenite / reqwest / rustls、**serde / serde_json**（JSON 配置与缓存必需）、**egui/eframe**（仅 Windows GUI）；日志推荐 `tracing`（towc_gui 需把日志转发到 GUI 日志面板）
+8. **推荐模块结构**（参考 acca315）：`src/client/`（登录+会话）、`src/server/`（tows 路由）、`src/network.rs`（WS URL/AES 编码/转发）、`src/protocol.rs`（多路复用帧编解码，**新增**）；三个 bin 共享同一 lib
+9. 完成后需与 10.18.47.77 上的环境配合实测（见 §6）；带宽基线：账号总带宽 ~5.3MB/s（已实测，见 §2.5/§3.4）
 
 ---
 
@@ -358,5 +361,6 @@ WS **二进制帧**：
   - EOF 半关闭帧 0x08（SSH 依赖，§3.1）；towc_gui 推荐 egui/eframe；开发顺序 tows→towc→towc_gui（§5）
   - towc_gui JSON 配置文件 + 拖拽/批量导入（§1.3）
   - towc 无参交互模式完善（v0.3 参数收集顺序 + v0.4 缓存/登录机制，§1.1）
+  - 工程化：serde/serde_json 依赖、tracing 日志、src/protocol.rs 帧编解码模块、GUI 内嵌登录、断线由 WS 层判定（§5）
 - 用户表示还会提供更多信息，收到后请更新本文档
 - 若有疑问，优先查阅 `C:\Development\test\docs\` 的详细记录
