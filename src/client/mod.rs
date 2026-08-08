@@ -12,6 +12,7 @@ pub use auth::{
 pub use config::{
     ClientConfig, InteractiveDefaults, ParsedArgs, parse_args, prompt_interactive, prompt_login,
 };
+#[cfg(all(feature = "gui", windows))]
 pub(crate) use runtime::authentication_expired;
 pub use runtime::{
     ClientObserver, ForwardRule, ServerGroup, run_cli, run_dynamic_server_groups,

@@ -3,3 +3,8 @@
 *.pdb
 *.log
 *.cookie
+
+# JetBrains / RustRover
+.idea/
+.fleet/
+*.iml
